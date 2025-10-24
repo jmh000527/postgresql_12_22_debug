@@ -1,3 +1,0 @@
-conftest.c:120:1: warning: no previous prototype for 'call__builtin_frame_address' [-Wmissing-prototypes]
-  120 | call__builtin_frame_address(void)
-      | ^~~~~~~~~~~~~~~~~~~~~~~~~~~
