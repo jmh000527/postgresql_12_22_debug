@@ -67,7 +67,7 @@ static void build_child_join_reltarget(PlannerInfo *root,
 
 /*
  * setup_simple_rel_arrays
- *	  Prepare the arrays we use for quickly accessing base relations.
+ *	  准备用于快速访问基表的数组
  */
 void
 setup_simple_rel_arrays(PlannerInfo *root)
@@ -75,14 +75,14 @@ setup_simple_rel_arrays(PlannerInfo *root)
 	Index		rti;
 	ListCell   *lc;
 
-	/* Arrays are accessed using RT indexes (1..N) */
+	/* 数组使用 RT 索引访问（1..N） */
 	root->simple_rel_array_size = list_length(root->parse->rtable) + 1;
 
-	/* simple_rel_array is initialized to all NULLs */
+	/* simple_rel_array 初始化为全 NULL */
 	root->simple_rel_array = (RelOptInfo **)
 		palloc0(root->simple_rel_array_size * sizeof(RelOptInfo *));
 
-	/* simple_rte_array is an array equivalent of the rtable list */
+	/* simple_rte_array 是 rtable 列表的数组等价物 */
 	root->simple_rte_array = (RangeTblEntry **)
 		palloc0(root->simple_rel_array_size * sizeof(RangeTblEntry *));
 	rti = 1;
@@ -417,26 +417,21 @@ build_join_rel_hash(PlannerInfo *root)
 
 /*
  * find_join_rel
- *	  Returns relation entry corresponding to 'relids' (a set of RT indexes),
- *	  or NULL if none exists.  This is for join relations.
+ *	  返回与 'relids'（一组 RT 索引）对应的关系条目（RelOptInfo），如果不存在则返回 NULL。仅用于连接关系。
  */
 RelOptInfo *
 find_join_rel(PlannerInfo *root, Relids relids)
 {
 	/*
-	 * Switch to using hash lookup when list grows "too long".  The threshold
-	 * is arbitrary and is known only here.
+	 * 当列表变得“太长”时，切换为哈希查找。阈值是任意的，仅在此处已知。
 	 */
 	if (!root->join_rel_hash && list_length(root->join_rel_list) > 32)
 		build_join_rel_hash(root);
 
 	/*
-	 * Use either hashtable lookup or linear search, as appropriate.
+	 * 根据情况使用哈希表查找或线性搜索。
 	 *
-	 * Note: the seemingly redundant hashkey variable is used to avoid taking
-	 * the address of relids; unless the compiler is exceedingly smart, doing
-	 * so would force relids out of a register and thus probably slow down the
-	 * list-search case.
+	 * 注意：看似多余的 hashkey 变量用于避免直接取 relids 的地址；除非编译器非常智能，否则这样做会导致 relids 被移出寄存器，从而可能降低列表搜索的速度。
 	 */
 	if (root->join_rel_hash)
 	{
@@ -544,19 +539,15 @@ add_join_rel(PlannerInfo *root, RelOptInfo *joinrel)
 
 /*
  * build_join_rel
- *	  Returns relation entry corresponding to the union of two given rels,
- *	  creating a new relation entry if none already exists.
+ *	  返回由两个给定关系的并集对应的关系条目，如果不存在则创建一个新的关系条目。
  *
- * 'joinrelids' is the Relids set that uniquely identifies the join
- * 'outer_rel' and 'inner_rel' are relation nodes for the relations to be
- *		joined
- * 'sjinfo': join context info
- * 'restrictlist_ptr': result variable.  If not NULL, *restrictlist_ptr
- *		receives the list of RestrictInfo nodes that apply to this
- *		particular pair of joinable relations.
+ * 'joinrelids' 是唯一标识该连接的 Relids 集合
+ * 'outer_rel' 和 'inner_rel' 是要连接的关系节点
+ * 'sjinfo': 连接上下文信息
+ * 'restrictlist_ptr': 结果变量。如果不为 NULL，*restrictlist_ptr
+ *		将接收适用于该对可连接关系的 RestrictInfo 节点列表。
  *
- * restrictlist_ptr makes the routine's API a little grotty, but it saves
- * duplicated calculation of the restrictlist...
+ * restrictlist_ptr 让该函数的 API 有些不优雅，但它避免了重复计算 restrictlist...
  */
 RelOptInfo *
 build_join_rel(PlannerInfo *root,
@@ -569,19 +560,18 @@ build_join_rel(PlannerInfo *root,
 	RelOptInfo *joinrel;
 	List	   *restrictlist;
 
-	/* This function should be used only for join between parents. */
+	/* 该函数只应用于父关系之间的连接。 */
 	Assert(!IS_OTHER_REL(outer_rel) && !IS_OTHER_REL(inner_rel));
 
 	/*
-	 * See if we already have a joinrel for this set of base rels.
+	 * 检查是否已经有该组基表的 joinrel，从 PlannerInfo->join_rel_list 或 PlannerInfo->join_rel_hash 中查找。
 	 */
 	joinrel = find_join_rel(root, joinrelids);
 
 	if (joinrel)
 	{
 		/*
-		 * Yes, so we only need to figure the restrictlist for this particular
-		 * pair of component relations.
+		 * 已存在，只需为该对组件关系计算 restrictlist，对约束条件进行筛选。
 		 */
 		if (restrictlist_ptr)
 			*restrictlist_ptr = build_joinrel_restrictlist(root,
@@ -592,13 +582,13 @@ build_join_rel(PlannerInfo *root,
 	}
 
 	/*
-	 * Nope, so make one.
+	 * 如果目标 RelOptInfo 在 PlannerInfo->join_rel_list 或 PlannerInfo->join_rel_hash 中不存在，则创建一个新的。
 	 */
 	joinrel = makeNode(RelOptInfo);
 	joinrel->reloptkind = RELOPT_JOINREL;
 	joinrel->relids = bms_copy(joinrelids);
 	joinrel->rows = 0;
-	/* cheap startup cost is interesting iff not all tuples to be retrieved */
+	/* 仅当不是检索所有元组时，才关注低启动成本 */
 	joinrel->consider_startup = (root->tuple_fraction > 0);
 	joinrel->consider_param_startup = false;
 	joinrel->consider_parallel = false;
@@ -610,13 +600,13 @@ build_join_rel(PlannerInfo *root,
 	joinrel->cheapest_total_path = NULL;
 	joinrel->cheapest_unique_path = NULL;
 	joinrel->cheapest_parameterized_paths = NIL;
-	/* init direct_lateral_relids from children; we'll finish it up below */
+	/* 从子节点初始化 direct_lateral_relids，稍后完善 */
 	joinrel->direct_lateral_relids =
 		bms_union(outer_rel->direct_lateral_relids,
 				  inner_rel->direct_lateral_relids);
 	joinrel->lateral_relids = min_join_parameterization(root, joinrel->relids,
 														outer_rel, inner_rel);
-	joinrel->relid = 0;			/* indicates not a baserel */
+	joinrel->relid = 0;			/* 表示不是 baserel */
 	joinrel->rtekind = RTE_JOIN;
 	joinrel->min_attr = 0;
 	joinrel->max_attr = 0;
@@ -645,7 +635,7 @@ build_join_rel(PlannerInfo *root,
 	joinrel->baserestrict_min_security = UINT_MAX;
 	joinrel->joininfo = NIL;
 	joinrel->has_eclass_joins = false;
-	joinrel->consider_partitionwise_join = false;	/* might get changed later */
+	joinrel->consider_partitionwise_join = false;	/* 可能稍后更改 */
 	joinrel->top_parent_relids = NULL;
 	joinrel->part_scheme = NULL;
 	joinrel->nparts = 0;
@@ -656,27 +646,22 @@ build_join_rel(PlannerInfo *root,
 	joinrel->nullable_partexprs = NULL;
 	joinrel->partitioned_child_rels = NIL;
 
-	/* Compute information relevant to the foreign relations. */
+	/* 计算与外部表相关的信息。 */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
 
 	/*
-	 * Create a new tlist containing just the vars that need to be output from
-	 * this join (ie, are needed for higher joinclauses or final output).
+	 * 创建一个新的 tlist，仅包含需要从该连接输出的 vars（即用于更高层连接条件或最终输出）。
 	 *
-	 * NOTE: the tlist order for a join rel will depend on which pair of outer
-	 * and inner rels we first try to build it from.  But the contents should
-	 * be the same regardless.
+	 * 注意：连接关系的 tlist 顺序取决于首次尝试构建它的外部和内部关系对。但内容应始终一致。
 	 */
 	build_joinrel_tlist(root, joinrel, outer_rel);
 	build_joinrel_tlist(root, joinrel, inner_rel);
 	add_placeholders_to_joinrel(root, joinrel, outer_rel, inner_rel);
 
 	/*
-	 * add_placeholders_to_joinrel also took care of adding the ph_lateral
-	 * sets of any PlaceHolderVars computed here to direct_lateral_relids, so
-	 * now we can finish computing that.  This is much like the computation of
-	 * the transitively-closed lateral_relids in min_join_parameterization,
-	 * except that here we *do* have to consider the added PHVs.
+	 * add_placeholders_to_joinrel 也会处理在此处计算的 PlaceHolderVars 的 ph_lateral 集，
+	 * 因此现在可以完善 direct_lateral_relids。类似于 min_join_parameterization 中
+	 * 闭包 lateral_relids 的计算，但这里必须考虑新增的 PHV。
 	 */
 	joinrel->direct_lateral_relids =
 		bms_del_members(joinrel->direct_lateral_relids, joinrel->relids);
@@ -684,9 +669,8 @@ build_join_rel(PlannerInfo *root,
 		joinrel->direct_lateral_relids = NULL;
 
 	/*
-	 * Construct restrict and join clause lists for the new joinrel. (The
-	 * caller might or might not need the restrictlist, but I need it anyway
-	 * for set_joinrel_size_estimates().)
+	 * 为新 joinrel 构建 restrict 和 join 条件列表。（调用者可能需要 restrictlist，
+	 * 但我无论如何都需要它用于 set_joinrel_size_estimates。）
 	 */
 	restrictlist = build_joinrel_restrictlist(root, joinrel,
 											  outer_rel, inner_rel);
@@ -695,48 +679,41 @@ build_join_rel(PlannerInfo *root,
 	build_joinrel_joinlist(joinrel, outer_rel, inner_rel);
 
 	/*
-	 * This is also the right place to check whether the joinrel has any
-	 * pending EquivalenceClass joins.
+	 * 此处也应检查 joinrel 是否有待处理的 EquivalenceClass 连接。
 	 */
 	joinrel->has_eclass_joins = has_relevant_eclass_joinclause(root, joinrel);
 
-	/* Store the partition information. */
+	/* 存储分区信息。 */
 	build_joinrel_partition_info(joinrel, outer_rel, inner_rel, restrictlist,
 								 sjinfo->jointype);
 
 	/*
-	 * Set estimates of the joinrel's size.
+	 * 设置 joinrel 的大小估算。
 	 */
 	set_joinrel_size_estimates(root, joinrel, outer_rel, inner_rel,
 							   sjinfo, restrictlist);
 
 	/*
-	 * Set the consider_parallel flag if this joinrel could potentially be
-	 * scanned within a parallel worker.  If this flag is false for either
-	 * inner_rel or outer_rel, then it must be false for the joinrel also.
-	 * Even if both are true, there might be parallel-restricted expressions
-	 * in the targetlist or quals.
+	 * 如果该 joinrel 可以在并行 worker 中扫描，则设置 consider_parallel 标志。
+	 * 如果 inner_rel 或 outer_rel 的该标志为 false，则 joinrel 也必须为 false。
+	 * 即使两者都为 true，targetlist 或 quals 中可能有并行受限表达式。
 	 *
-	 * Note that if there are more than two rels in this relation, they could
-	 * be divided between inner_rel and outer_rel in any arbitrary way.  We
-	 * assume this doesn't matter, because we should hit all the same baserels
-	 * and joinclauses while building up to this joinrel no matter which we
-	 * take; therefore, we should make the same decision here however we get
-	 * here.
+	 * 注意：如果该关系中有超过两个表，它们可能以任意方式分布在 inner_rel 和 outer_rel 中。
+	 * 假设这无关紧要，因为无论如何构建到该 joinrel 都会遍历所有 baserel 和 join 条件；
+	 * 因此，无论如何到达这里，决策应一致。
 	 */
 	if (inner_rel->consider_parallel && outer_rel->consider_parallel &&
 		is_parallel_safe(root, (Node *) restrictlist) &&
 		is_parallel_safe(root, (Node *) joinrel->reltarget->exprs))
 		joinrel->consider_parallel = true;
 
-	/* Add the joinrel to the PlannerInfo. */
+	/* 将 joinrel 添加到 PlannerInfo。 */
 	add_join_rel(root, joinrel);
 
 	/*
-	 * Also, if dynamic-programming join search is active, add the new joinrel
-	 * to the appropriate sublist.  Note: you might think the Assert on number
-	 * of members should be for equality, but some of the level 1 rels might
-	 * have been joinrels already, so we can only assert <=.
+	 * 如果启用动态规划连接搜索，则将新 joinrel 添加到相应的子列表。
+	 * 注意：你可能认为成员数量应该相等，但某些 level 1 的关系可能已经是 joinrel，
+	 * 所以只能断言 <=。
 	 */
 	if (root->join_rel_level)
 	{
@@ -997,44 +974,33 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 /*
  * build_joinrel_restrictlist
  * build_joinrel_joinlist
- *	  These routines build lists of restriction and join clauses for a
- *	  join relation from the joininfo lists of the relations it joins.
+ *	  这些例程根据被连接关系的 joininfo 列表，为连接关系构建限制和连接子句列表。
  *
- *	  These routines are separate because the restriction list must be
- *	  built afresh for each pair of input sub-relations we consider, whereas
- *	  the join list need only be computed once for any join RelOptInfo.
- *	  The join list is fully determined by the set of rels making up the
- *	  joinrel, so we should get the same results (up to ordering) from any
- *	  candidate pair of sub-relations.  But the restriction list is whatever
- *	  is not handled in the sub-relations, so it depends on which
- *	  sub-relations are considered.
+ *	  这两个例程是分开的，因为限制列表必须针对每一对输入子关系重新构建，
+ *	  而连接列表只需为每个连接关系 RelOptInfo 计算一次。
+ *	  连接列表完全由组成 joinrel 的关系集合决定，因此无论选择哪一对候选子关系，
+ *	  都应该得到相同的结果（顺序可能不同）。但限制列表取决于哪些子关系被考虑，
+ *	  因为它包含未在子关系中处理的部分。
  *
- *	  If a join clause from an input relation refers to base rels still not
- *	  present in the joinrel, then it is still a join clause for the joinrel;
- *	  we put it into the joininfo list for the joinrel.  Otherwise,
- *	  the clause is now a restrict clause for the joined relation, and we
- *	  return it to the caller of build_joinrel_restrictlist() to be stored in
- *	  join paths made from this pair of sub-relations.  (It will not need to
- *	  be considered further up the join tree.)
+ *	  如果输入关系的连接子句引用了在 joinrel 中尚未出现的基表，
+ *	  那么它仍然是 joinrel 的连接子句；我们将其放入 joinrel 的 joininfo 列表。
+ *	  否则，该子句现在成为连接关系的限制子句，我们将其返回给 build_joinrel_restrictlist() 的调用者，
+ *	  以存储在由这对子关系组成的连接路径中。（它不需要在连接树的更高层继续考虑。）
  *
- *	  In many cases we will find the same RestrictInfos in both input
- *	  relations' joinlists, so be careful to eliminate duplicates.
- *	  Pointer equality should be a sufficient test for dups, since all
- *	  the various joinlist entries ultimately refer to RestrictInfos
- *	  pushed into them by distribute_restrictinfo_to_rels().
+ *	  在许多情况下，我们会在两个输入关系的 joinlists 中发现相同的 RestrictInfo，
+ *	  因此要注意去除重复项。指针相等性应足以判断重复，因为所有不同的 joinlist 条目最终都引用了
+ *	  distribute_restrictinfo_to_rels() 推送进去的 RestrictInfo。
  *
- * 'joinrel' is a join relation node
- * 'outer_rel' and 'inner_rel' are a pair of relations that can be joined
- *		to form joinrel.
+ * 'joinrel' 是连接关系节点
+ * 'outer_rel' 和 'inner_rel' 是可以连接形成 joinrel 的一对关系。
  *
- * build_joinrel_restrictlist() returns a list of relevant restrictinfos,
- * whereas build_joinrel_joinlist() stores its results in the joinrel's
- * joininfo list.  One or the other must accept each given clause!
+ * build_joinrel_restrictlist() 返回相关的 restrictinfo 列表，
+ * 而 build_joinrel_joinlist() 将结果存储在 joinrel 的 joininfo 列表中。
+ * 每个子句必须被其中一个接受！
  *
- * NB: Formerly, we made deep(!) copies of each input RestrictInfo to pass
- * up to the join relation.  I believe this is no longer necessary, because
- * RestrictInfo nodes are no longer context-dependent.  Instead, just include
- * the original nodes in the lists made for the join relation.
+ * 注意：以前我们会对每个输入 RestrictInfo 进行深度复制以传递到连接关系。
+ * 我认为现在不再需要这样做，因为 RestrictInfo 节点不再依赖于上下文。
+ * 现在只需将原始节点包含在为连接关系构建的列表中即可。
  */
 static List *
 build_joinrel_restrictlist(PlannerInfo *root,
@@ -1045,17 +1011,13 @@ build_joinrel_restrictlist(PlannerInfo *root,
 	List	   *result;
 
 	/*
-	 * Collect all the clauses that syntactically belong at this level,
-	 * eliminating any duplicates (important since we will see many of the
-	 * same clauses arriving from both input relations).
+	 * 收集所有在语法上属于该层级的子句，并去除重复项（很重要，因为我们会在两个输入关系中看到许多相同的子句）。
 	 */
 	result = subbuild_joinrel_restrictlist(joinrel, outer_rel->joininfo, NIL);
 	result = subbuild_joinrel_restrictlist(joinrel, inner_rel->joininfo, result);
 
 	/*
-	 * Add on any clauses derived from EquivalenceClasses.  These cannot be
-	 * redundant with the clauses in the joininfo lists, so don't bother
-	 * checking.
+	 * 添加由等价类（EquivalenceClasses）推导出的子句。这些子句不会与 joininfo 列表中的子句重复，因此无需检查。
 	 */
 	result = list_concat(result,
 						 generate_join_implied_equalities(root,
@@ -1066,6 +1028,13 @@ build_joinrel_restrictlist(PlannerInfo *root,
 	return result;
 }
 
+/*
+ * build_joinrel_joinlist
+ *	  为连接关系构建 joininfo 列表。
+ *
+ *	  收集所有在语法上属于该层级的连接子句，并去除重复项（很重要，因为我们会在两个输入关系中看到许多相同的子句）。
+ *	  只保留那些在当前 joinrel 层级仍然是连接子句的 RestrictInfo。
+ */
 static void
 build_joinrel_joinlist(RelOptInfo *joinrel,
 					   RelOptInfo *outer_rel,
@@ -1074,13 +1043,12 @@ build_joinrel_joinlist(RelOptInfo *joinrel,
 	List	   *result;
 
 	/*
-	 * Collect all the clauses that syntactically belong above this level,
-	 * eliminating any duplicates (important since we will see many of the
-	 * same clauses arriving from both input relations).
+	 * 收集所有在语法上属于该层级的连接子句，并去除重复项（很重要，因为我们会在两个输入关系中看到许多相同的子句）。
 	 */
 	result = subbuild_joinrel_joinlist(joinrel, outer_rel->joininfo, NIL);
 	result = subbuild_joinrel_joinlist(joinrel, inner_rel->joininfo, result);
 
+	/* 将结果存储到 joinrel 的 joininfo 列表中 */
 	joinrel->joininfo = result;
 }
 

@@ -93,26 +93,22 @@ static void generate_mergejoin_paths(PlannerInfo *root,
 
 /*
  * add_paths_to_joinrel
- *	  Given a join relation and two component rels from which it can be made,
- *	  consider all possible paths that use the two component rels as outer
- *	  and inner rel respectively.  Add these paths to the join rel's pathlist
- *	  if they survive comparison with other paths (and remove any existing
- *	  paths that are dominated by these paths).
+ *	  给定一个连接关系和两个组成关系（可用于构建该连接关系），
+ *	  考虑所有可能的路径，这些路径使用两个组成关系分别作为外部和内部关系。
+ *	  如果这些路径在与其他路径比较后存活，则将这些路径添加到连接关系的路径列表中
+ *	  （并移除任何被这些路径支配的现有路径）。
  *
- * Modifies the pathlist field of the joinrel node to contain the best
- * paths found so far.
+ * 修改 joinrel 节点的 pathlist 字段，使其包含目前为止找到的最佳路径。
  *
- * jointype is not necessarily the same as sjinfo->jointype; it might be
- * "flipped around" if we are considering joining the rels in the opposite
- * direction from what's indicated in sjinfo.
+ * jointype 不一定与 sjinfo->jointype 相同；如果我们考虑以与 sjinfo 指示的方向相反的方式连接关系，
+ * 它可能会“翻转”。
  *
- * Also, this routine and others in this module accept the special JoinTypes
- * JOIN_UNIQUE_OUTER and JOIN_UNIQUE_INNER to indicate that we should
- * unique-ify the outer or inner relation and then apply a regular inner
- * join.  These values are not allowed to propagate outside this module,
- * however.  Path cost estimation code may need to recognize that it's
- * dealing with such a case --- the combination of nominal jointype INNER
- * with sjinfo->jointype == JOIN_SEMI indicates that.
+ * 此外，本例程和本模块中的其他例程接受特殊的 JoinTypes
+ * JOIN_UNIQUE_OUTER 和 JOIN_UNIQUE_INNER，表示我们应该
+ * 对外部或内部关系进行唯一化，然后应用常规的内部连接。
+ * 但是，这些值不允许在本模块之外传播。
+ * 路径成本估算代码可能需要识别它正在处理这种情况——
+ * 名义 jointype 为 INNER 且 sjinfo->jointype == JOIN_SEMI 的组合表示这种情况。
  */
 void
 add_paths_to_joinrel(PlannerInfo *root,
@@ -130,11 +126,9 @@ add_paths_to_joinrel(PlannerInfo *root,
 	Relids		joinrelids;
 
 	/*
-	 * PlannerInfo doesn't contain the SpecialJoinInfos created for joins
-	 * between child relations, even if there is a SpecialJoinInfo node for
-	 * the join between the topmost parents. So, while calculating Relids set
-	 * representing the restriction, consider relids of topmost parent of
-	 * partitions.
+	 * PlannerInfo 不包含为子关系之间的连接创建的 SpecialJoinInfos，
+	 * 即使对于顶层父关系之间的连接有 SpecialJoinInfo 节点。
+	 * 因此，在计算表示限制的 Relids 集时，要考虑分区顶层父的 relids。
 	 */
 	if (joinrel->reloptkind == RELOPT_OTHER_JOINREL)
 		joinrelids = joinrel->top_parent_relids;
@@ -147,25 +141,22 @@ add_paths_to_joinrel(PlannerInfo *root,
 	extra.param_source_rels = NULL;
 
 	/*
-	 * See if the inner relation is provably unique for this outer rel.
+	 * 查看对于此外部关系，内部关系是否被证明是唯一的。
 	 *
-	 * We have some special cases: for JOIN_SEMI and JOIN_ANTI, it doesn't
-	 * matter since the executor can make the equivalent optimization anyway;
-	 * we need not expend planner cycles on proofs.  For JOIN_UNIQUE_INNER, we
-	 * must be considering a semijoin whose inner side is not provably unique
-	 * (else reduce_unique_semijoins would've simplified it), so there's no
-	 * point in calling innerrel_is_unique.  However, if the LHS covers all of
-	 * the semijoin's min_lefthand, then it's appropriate to set inner_unique
-	 * because the path produced by create_unique_path will be unique relative
-	 * to the LHS.  (If we have an LHS that's only part of the min_lefthand,
-	 * that is *not* true.)  For JOIN_UNIQUE_OUTER, pass JOIN_INNER to avoid
-	 * letting that value escape this module.
+	 * 有一些特殊情况：对于 JOIN_SEMI 和 JOIN_ANTI，没关系，
+	 * 因为执行器可以做等效的优化；我们不需要在证明上花费规划器的周期。
+	 * 对于 JOIN_UNIQUE_INNER，我们必须考虑一个内侧不是唯一的半连接
+	 * （否则 reduce_unique_semijoins 会简化它），因此调用 innerrel_is_unique 没有意义。
+	 * 但是，如果 LHS 覆盖了所有的 semijoin 的 min_lefthand，
+	 * 那么设置 inner_unique 是合适的，因为 create_unique_path 产生的路径
+	 * 对于 LHS 是唯一的。（如果我们的 LHS 只是 min_lefthand 的一部分，则不成立。）
+	 * 对于 JOIN_UNIQUE_OUTER，传递 JOIN_INNER 以避免该值泄露到本模块之外。
 	 */
 	switch (jointype)
 	{
 		case JOIN_SEMI:
 		case JOIN_ANTI:
-			extra.inner_unique = false; /* well, unproven */
+			extra.inner_unique = false; /* 未证明唯一 */
 			break;
 		case JOIN_UNIQUE_INNER:
 			extra.inner_unique = bms_is_subset(sjinfo->min_lefthand,
@@ -192,10 +183,8 @@ add_paths_to_joinrel(PlannerInfo *root,
 	}
 
 	/*
-	 * Find potential mergejoin clauses.  We can skip this if we are not
-	 * interested in doing a mergejoin.  However, mergejoin may be our only
-	 * way of implementing a full outer join, so override enable_mergejoin if
-	 * it's a full join.
+	 * 查找潜在的合并连接（mergejoin）子句。如果我们不打算做合并连接，可以跳过这一步。
+	 * 但是，合并连接可能是实现全外连接的唯一方式，因此如果是全连接则覆盖 enable_mergejoin。
 	 */
 	if (enable_mergejoin || jointype == JOIN_FULL)
 		extra.mergeclause_list = select_mergejoin_clauses(root,
@@ -207,8 +196,8 @@ add_paths_to_joinrel(PlannerInfo *root,
 														  &mergejoin_allowed);
 
 	/*
-	 * If it's SEMI, ANTI, or inner_unique join, compute correction factors
-	 * for cost estimation.  These will be the same for all paths.
+	 * 如果是 SEMI、ANTI 或 inner_unique 连接，则为成本估算计算修正因子。
+	 * 这些因子对于所有路径都是一样的。
 	 */
 	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI || extra.inner_unique)
 		compute_semi_anti_join_factors(root, joinrel, outerrel, innerrel,
@@ -216,27 +205,22 @@ add_paths_to_joinrel(PlannerInfo *root,
 									   &extra.semifactors);
 
 	/*
-	 * Decide whether it's sensible to generate parameterized paths for this
-	 * joinrel, and if so, which relations such paths should require.  There
-	 * is usually no need to create a parameterized result path unless there
-	 * is a join order restriction that prevents joining one of our input rels
-	 * directly to the parameter source rel instead of joining to the other
-	 * input rel.  (But see allow_star_schema_join().)	This restriction
-	 * reduces the number of parameterized paths we have to deal with at
-	 * higher join levels, without compromising the quality of the resulting
-	 * plan.  We express the restriction as a Relids set that must overlap the
-	 * parameterization of any proposed join path.
+	 * 决定是否有必要为此连接关系生成参数化路径，如果需要，哪些关系应作为参数源。
+	 * 通常，除非有连接顺序限制，阻止将我们的输入关系之一直接连接到参数源关系，
+	 * 而不是连接到另一个输入关系，否则没有必要创建参数化结果路径。
+	 * （但见 allow_star_schema_join()。）
+	 * 这种限制减少了我们在更高连接层级需要处理的参数化路径数量，
+	 * 而不会影响结果计划的质量。
+	 * 我们用一个 Relids 集来表达这种限制，任何建议的连接路径的参数化都必须与该集有重叠。
 	 */
 	foreach(lc, root->join_info_list)
 	{
 		SpecialJoinInfo *sjinfo2 = (SpecialJoinInfo *) lfirst(lc);
 
 		/*
-		 * SJ is relevant to this join if we have some part of its RHS
-		 * (possibly not all of it), and haven't yet joined to its LHS.  (This
-		 * test is pretty simplistic, but should be sufficient considering the
-		 * join has already been proven legal.)  If the SJ is relevant, it
-		 * presents constraints for joining to anything not in its RHS.
+		 * 如果我们有它 RHS 的某部分（可能不是全部），并且还没有连接到它的 LHS，
+		 * 则 SJ 与此连接相关。（这个测试很简单，但考虑到连接已经被证明是合法的，应该足够了。）
+		 * 如果 SJ 相关，则它对连接到 RHS 之外的任何东西提出约束。
 		 */
 		if (bms_overlap(joinrelids, sjinfo2->min_righthand) &&
 			!bms_overlap(joinrelids, sjinfo2->min_lefthand))
@@ -244,7 +228,7 @@ add_paths_to_joinrel(PlannerInfo *root,
 											   bms_difference(root->all_baserels,
 															  sjinfo2->min_righthand));
 
-		/* full joins constrain both sides symmetrically */
+		/* 全连接对两边都对称约束 */
 		if (sjinfo2->jointype == JOIN_FULL &&
 			bms_overlap(joinrelids, sjinfo2->min_lefthand) &&
 			!bms_overlap(joinrelids, sjinfo2->min_righthand))
@@ -254,29 +238,24 @@ add_paths_to_joinrel(PlannerInfo *root,
 	}
 
 	/*
-	 * However, when a LATERAL subquery is involved, there will simply not be
-	 * any paths for the joinrel that aren't parameterized by whatever the
-	 * subquery is parameterized by, unless its parameterization is resolved
-	 * within the joinrel.  So we might as well allow additional dependencies
-	 * on whatever residual lateral dependencies the joinrel will have.
+	 * 然而，当涉及 LATERAL 子查询时，除非其参数化在连接关系内被解决，
+	 * 否则 joinrel 不会有不被参数化的路径。
+	 * 因此我们不妨允许 joinrel 的剩余 lateral 依赖作为额外的参数源。
 	 */
 	extra.param_source_rels = bms_add_members(extra.param_source_rels,
 											  joinrel->lateral_relids);
 
 	/*
-	 * 1. Consider mergejoin paths where both relations must be explicitly
-	 * sorted.  Skip this if we can't mergejoin.
+	 * 1. 考虑需要对两个关系都显式排序的合并连接路径。如果不能合并连接则跳过。
 	 */
 	if (mergejoin_allowed)
 		sort_inner_and_outer(root, joinrel, outerrel, innerrel,
 							 jointype, &extra);
 
 	/*
-	 * 2. Consider paths where the outer relation need not be explicitly
-	 * sorted. This includes both nestloops and mergejoins where the outer
-	 * path is already ordered.  Again, skip this if we can't mergejoin.
-	 * (That's okay because we know that nestloop can't handle right/full
-	 * joins at all, so it wouldn't work in the prohibited cases either.)
+	 * 2. 考虑外部关系不需要显式排序的路径。这包括外部路径已经有序的嵌套循环和合并连接。
+	 * 同样，如果不能合并连接则跳过。（这是可以的，因为我们知道嵌套循环无法处理右/全连接，
+	 * 所以在禁止的情况下也不会工作。）
 	 */
 	if (mergejoin_allowed)
 		match_unsorted_outer(root, joinrel, outerrel, innerrel,
@@ -285,15 +264,10 @@ add_paths_to_joinrel(PlannerInfo *root,
 #ifdef NOT_USED
 
 	/*
-	 * 3. Consider paths where the inner relation need not be explicitly
-	 * sorted.  This includes mergejoins only (nestloops were already built in
-	 * match_unsorted_outer).
+	 * 3. 考虑内部关系不需要显式排序的路径。这只包括合并连接（嵌套循环已在 match_unsorted_outer 中构建）。
 	 *
-	 * Diked out as redundant 2/13/2000 -- tgl.  There isn't any really
-	 * significant difference between the inner and outer side of a mergejoin,
-	 * so match_unsorted_inner creates no paths that aren't equivalent to
-	 * those made by match_unsorted_outer when add_paths_to_joinrel() is
-	 * invoked with the two rels given in the other order.
+	 * 2000-02-13 tgl：认为是冗余的而移除。合并连接的内外两侧没有本质区别，
+	 * 所以当以相反顺序调用 add_paths_to_joinrel() 时，match_unsorted_inner 不会创建新的路径。
 	 */
 	if (mergejoin_allowed)
 		match_unsorted_inner(root, joinrel, outerrel, innerrel,
@@ -301,19 +275,16 @@ add_paths_to_joinrel(PlannerInfo *root,
 #endif
 
 	/*
-	 * 4. Consider paths where both outer and inner relations must be hashed
-	 * before being joined.  As above, disregard enable_hashjoin for full
-	 * joins, because there may be no other alternative.
+	 * 4. 考虑在连接前需要对外部和内部关系都进行哈希的路径。同上，对于全连接忽略 enable_hashjoin，
+	 * 因为可能没有其他选择。
 	 */
 	if (enable_hashjoin || jointype == JOIN_FULL)
 		hash_inner_and_outer(root, joinrel, outerrel, innerrel,
 							 jointype, &extra);
 
 	/*
-	 * createplan.c does not currently support handling of pseudoconstant
-	 * clauses assigned to joins pushed down by extensions; check if the
-	 * restrictlist has such clauses, and if not, allow them to consider
-	 * pushing down joins.
+	 * createplan.c 当前不支持处理由扩展推送下来的连接分配的伪常量子句；
+	 * 检查 restrictlist 是否有这样的子句，如果没有，则允许考虑推送下来的连接。
 	 */
 	if ((joinrel->fdwroutine &&
 		 joinrel->fdwroutine->GetForeignJoinPaths) ||
@@ -322,9 +293,8 @@ add_paths_to_joinrel(PlannerInfo *root,
 															 restrictlist);
 
 	/*
-	 * 5. If inner and outer relations are foreign tables (or joins) belonging
-	 * to the same server and assigned to the same user to check access
-	 * permissions as, give the FDW a chance to push down joins.
+	 * 5. 如果内外关系都是属于同一服务器且分配给同一用户检查访问权限的外部表（或连接），
+	 * 则让 FDW 有机会推送下连接。
 	 */
 	if (joinrel->fdwroutine &&
 		joinrel->fdwroutine->GetForeignJoinPaths &&
@@ -334,10 +304,9 @@ add_paths_to_joinrel(PlannerInfo *root,
 												 jointype, &extra);
 
 	/*
-	 * 6. Finally, give extensions a chance to manipulate the path list.  They
-	 * could add new paths (such as CustomPaths) by calling add_path(), or
-	 * add_partial_path() if parallel aware.  They could also delete or modify
-	 * paths added by the core code.
+	 * 6. 最后，给扩展一个操作路径列表的机会。
+	 * 它们可以通过调用 add_path() 或 add_partial_path()（如果支持并行）添加新路径（如 CustomPaths）。
+	 * 也可以删除或修改核心代码添加的路径。
 	 */
 	if (set_join_pathlist_hook &&
 		consider_join_pushdown)

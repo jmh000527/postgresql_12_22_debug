@@ -1583,49 +1583,42 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 
 /*
  * create_unique_path
- *	  Creates a path representing elimination of distinct rows from the
- *	  input data.  Distinct-ness is defined according to the needs of the
- *	  semijoin represented by sjinfo.  If it is not possible to identify
- *	  how to make the data unique, NULL is returned.
+ *	  创建一个用于消除输入数据中重复行的路径。唯一性根据 sjinfo 所表示的半连接需求定义。
+ *	  如果无法识别如何使数据唯一，则返回 NULL。
  *
- * If used at all, this is likely to be called repeatedly on the same rel;
- * and the input subpath should always be the same (the cheapest_total path
- * for the rel).  So we cache the result.
+ * 如果使用该函数，通常会在同一个 rel 上重复调用，并且输入 subpath 应始终相同（即 rel 的 cheapest_total 路径）。
+ * 因此我们会缓存结果。
  */
 UniquePath *
 create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 				   SpecialJoinInfo *sjinfo)
 {
 	UniquePath *pathnode;
-	Path		sort_path;		/* dummy for result of cost_sort */
-	Path		agg_path;		/* dummy for result of cost_agg */
+	Path		sort_path;		/* 用于保存排序成本的临时变量 */
+	Path		agg_path;		/* 用于保存聚合成本的临时变量 */
 	MemoryContext oldcontext;
 	int			numCols;
 
-	/* Caller made a mistake if subpath isn't cheapest_total ... */
+	/* 如果 subpath 不是 cheapest_total，则调用者有误 ... */
 	Assert(subpath == rel->cheapest_total_path);
 	Assert(subpath->parent == rel);
-	/* ... or if SpecialJoinInfo is the wrong one */
+	/* ... 或者 SpecialJoinInfo 不正确 */
 	Assert(sjinfo->jointype == JOIN_SEMI);
 	Assert(bms_equal(rel->relids, sjinfo->syn_righthand));
 
-	/* If result already cached, return it */
+	/* 如果结果已缓存，则直接返回 */
 	if (rel->cheapest_unique_path)
 		return (UniquePath *) rel->cheapest_unique_path;
 
-	/* If it's not possible to unique-ify, return NULL */
+	/* 如果无法唯一化，则返回 NULL */
 	if (!(sjinfo->semi_can_btree || sjinfo->semi_can_hash))
 		return NULL;
 
 	/*
-	 * When called during GEQO join planning, we are in a short-lived memory
-	 * context.  We must make sure that the path and any subsidiary data
-	 * structures created for a baserel survive the GEQO cycle, else the
-	 * baserel is trashed for future GEQO cycles.  On the other hand, when we
-	 * are creating those for a joinrel during GEQO, we don't want them to
-	 * clutter the main planning context.  Upshot is that the best solution is
-	 * to explicitly allocate memory in the same context the given RelOptInfo
-	 * is in.
+	 * 在 GEQO 连接规划期间，当前处于短生命周期的内存上下文。
+	 * 必须确保为 baserel 创建的路径及其相关数据结构能在 GEQO 周期内存活，否则 baserel 会在后续 GEQO 周期被破坏。
+	 * 另一方面，在 GEQO 期间为 joinrel 创建的结构不应污染主规划上下文。
+	 * 最佳方案是显式地在 rel 所在的内存上下文中分配内存。
 	 */
 	oldcontext = MemoryContextSwitchTo(GetMemoryChunkContext(rel));
 
@@ -1641,25 +1634,21 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 
 	/*
-	 * Assume the output is unsorted, since we don't necessarily have pathkeys
-	 * to represent it.  (This might get overridden below.)
+	 * 假定输出是无序的，因为我们不一定有 pathkeys 来表示它。（下面可能会被覆盖。）
 	 */
 	pathnode->path.pathkeys = NIL;
 
 	pathnode->subpath = subpath;
 
 	/*
-	 * Under GEQO, the sjinfo might be short-lived, so we'd better make copies
-	 * of data structures we extract from it.
+	 * 在 GEQO 下，sjinfo 可能是短生命周期的，所以需要复制从中提取的数据结构。
 	 */
 	pathnode->in_operators = copyObject(sjinfo->semi_operators);
 	pathnode->uniq_exprs = copyObject(sjinfo->semi_rhs_exprs);
 
 	/*
-	 * If the input is a relation and it has a unique index that proves the
-	 * semi_rhs_exprs are unique, then we don't need to do anything.  Note
-	 * that relation_has_unique_index_for automatically considers restriction
-	 * clauses for the rel, as well.
+	 * 如果输入是一个关系，并且它有唯一索引能证明 semi_rhs_exprs 是唯一的，则无需做任何处理。
+	 * 注意 relation_has_unique_index_for 会自动考虑该关系的限制条件。
 	 */
 	if (rel->rtekind == RTE_RELATION && sjinfo->semi_can_btree &&
 		relation_has_unique_index_for(root, rel, NIL,
@@ -1680,13 +1669,10 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	}
 
 	/*
-	 * If the input is a subquery whose output must be unique already, then we
-	 * don't need to do anything.  The test for uniqueness has to consider
-	 * exactly which columns we are extracting; for example "SELECT DISTINCT
-	 * x,y" doesn't guarantee that x alone is distinct. So we cannot check for
-	 * this optimization unless semi_rhs_exprs consists only of simple Vars
-	 * referencing subquery outputs.  (Possibly we could do something with
-	 * expressions in the subquery outputs, too, but for now keep it simple.)
+	 * 如果输入是一个子查询且输出本身已经唯一，则无需做任何处理。
+	 * 唯一性测试必须考虑具体提取了哪些列，例如 "SELECT DISTINCT x,y" 并不保证 x 唯一。
+	 * 所以只有当 semi_rhs_exprs 仅包含引用子查询输出的简单 Var 时才能做此优化。
+	 * （理论上可以处理表达式，但目前保持简单。）
 	 */
 	if (rel->rtekind == RTE_SUBQUERY)
 	{
@@ -1719,7 +1705,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		}
 	}
 
-	/* Estimate number of output rows */
+	/* 估算输出行数 */
 	pathnode->path.rows = estimate_num_groups(root,
 											  sjinfo->semi_rhs_exprs,
 											  rel->rows,
@@ -1729,7 +1715,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	if (sjinfo->semi_can_btree)
 	{
 		/*
-		 * Estimate cost for sort+unique implementation
+		 * 估算排序+唯一实现的成本
 		 */
 		cost_sort(&sort_path, root, NIL,
 				  subpath->total_cost,
@@ -1740,10 +1726,9 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 				  -1.0);
 
 		/*
-		 * Charge one cpu_operator_cost per comparison per input tuple. We
-		 * assume all columns get compared at most of the tuples. (XXX
-		 * probably this is an overestimate.)  This should agree with
-		 * create_upper_unique_path.
+		 * 每个输入元组每列比较一次，按 cpu_operator_cost 计费。
+		 * 假定所有列都在大多数元组上被比较。（可能高估了。）
+		 * 这应与 create_upper_unique_path 保持一致。
 		 */
 		sort_path.total_cost += cpu_operator_cost * rel->rows * numCols;
 	}
@@ -1751,16 +1736,14 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	if (sjinfo->semi_can_hash)
 	{
 		/*
-		 * Estimate the overhead per hashtable entry at 64 bytes (same as in
-		 * planner.c).
+		 * 估算每个哈希表项的开销为 64 字节（与 planner.c 保持一致）。
 		 */
 		int			hashentrysize = subpath->pathtarget->width + 64;
 
 		if (hashentrysize * pathnode->path.rows > work_mem * 1024L)
 		{
 			/*
-			 * We should not try to hash.  Hack the SpecialJoinInfo to
-			 * remember this, in case we come through here again.
+			 * 不应尝试哈希。将此信息记录到 SpecialJoinInfo，以便下次调用时使用。
 			 */
 			sjinfo->semi_can_hash = false;
 		}
@@ -1787,7 +1770,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		pathnode->umethod = UNIQUE_PATH_HASH;
 	else
 	{
-		/* we can get here only if we abandoned hashing above */
+		/* 只有在上面放弃哈希时才会到这里 */
 		MemoryContextSwitchTo(oldcontext);
 		return NULL;
 	}

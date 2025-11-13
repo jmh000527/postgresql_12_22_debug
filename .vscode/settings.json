@@ -26,4 +26,7 @@
     "debug.toolBarLocation": "docked",
     "C_Cpp.default.compilerPath": "/usr/bin/gcc16",
     "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+    "editor.formatOnPaste": true,
+    "editor.formatOnSave": false,
+    "editor.formatOnType": true,
 }

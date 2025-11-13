@@ -24,7 +24,7 @@
 
 /*
  * Relids
- *		Set of relation identifiers (indexes into the rangetable).
+ *		关系标识符集合（rangetable 索引的集合，使用 Bitmapset 表示）。
  */
 typedef Bitmapset *Relids;
 
@@ -155,15 +155,12 @@ typedef struct PlannerGlobal
 
 /*----------
  * PlannerInfo
- *		Per-query information for planning/optimization
+ *		用于每个查询的规划/优化信息
  *
- * This struct is conventionally called "root" in all the planner routines.
- * It holds links to all of the planner's working state, in addition to the
- * original Query.  Note that at present the planner extensively modifies
- * the passed-in Query data structure; someday that should stop.
+ * 在所有 planner 例程中该结构通常被称为 "root"。它保存了规划器的所有工作状态的链接，
+ * 以及原始的 Query。注意，目前 planner 会大量修改传入的 Query 数据结构；将来可能会停止这样做。
  *
- * For reasons explained in optimizer/optimizer.h, we define the typedef
- * either here or in that header, whichever is read first.
+ * 出于 optimizer/optimizer.h 中解释的原因，我们在该头文件或此处（哪个先被包含）定义 typedef。
  *----------
  */
 #ifndef HAVE_PLANNERINFO_TYPEDEF
@@ -175,199 +172,168 @@ struct PlannerInfo
 {
 	NodeTag		type;
 
-	Query	   *parse;			/* the Query being planned */
+	Query	   *parse;			/* 正在规划的 Query */
 
-	PlannerGlobal *glob;		/* global info for current planner run */
+	PlannerGlobal *glob;		/* 当前 planner 运行的全局信息 */
 
-	Index		query_level;	/* 1 at the outermost Query */
+	Index		query_level;	/* 查询层次，1标识最高层 */
 
-	PlannerInfo *parent_root;	/* NULL at outermost Query */
+	PlannerInfo* parent_root;	/* 如为子计划，则这里存储父计划器指针，NULL标识最高层 */
 
 	/*
-	 * plan_params contains the expressions that this query level needs to
-	 * make available to a lower query level that is currently being planned.
-	 * outer_params contains the paramIds of PARAM_EXEC Params that outer
-	 * query levels will make available to this query level.
+	 * plan_params 包含本查询级别需要对正在规划的下级查询提供的表达式。
+	 * outer_params 包含外层查询级别将提供给本级别的 PARAM_EXEC 参数的 paramId。
 	 */
-	List	   *plan_params;	/* list of PlannerParamItems, see below */
+	List	   *plan_params;	/* PlannerParamItems 列表，见下文 */
 	Bitmapset  *outer_params;
 
 	/*
-	 * simple_rel_array holds pointers to "base rels" and "other rels" (see
-	 * comments for RelOptInfo for more info).  It is indexed by rangetable
-	 * index (so entry 0 is always wasted).  Entries can be NULL when an RTE
-	 * does not correspond to a base relation, such as a join RTE or an
-	 * unreferenced view RTE; or if the RelOptInfo hasn't been made yet.
+	 * simple_rel_array 保存指向“基表关系”（base rels）和“其他关系”（other rels）
+	 * （详见 RelOptInfo 注释）的指针。它以 rangetable 索引为索引（因此条目 0 总是未使用）。
+	 * 当一个 RTE 不对应基表（例如 join RTE 或未引用的 view RTE），或尚未创建 RelOptInfo 时，
+	 * 相应条目可以为 NULL。
 	 */
-	struct RelOptInfo **simple_rel_array;	/* All 1-rel RelOptInfos */
-	int			simple_rel_array_size;	/* allocated size of array */
+	struct RelOptInfo **simple_rel_array;	/* 所有单表 RelOptInfos 的数组 */
+	int			simple_rel_array_size;	/* 数组已分配大小 */
 
 	/*
-	 * simple_rte_array is the same length as simple_rel_array and holds
-	 * pointers to the associated rangetable entries.  This lets us avoid
-	 * rt_fetch(), which can be a bit slow once large inheritance sets have
-	 * been expanded.
+	 * simple_rte_array 与 simple_rel_array 长度相同，保存对应的 rangetable 条目指针。
+	 * 这样可以避免调用 rt_fetch()，在展开大型继承集合时会稍微慢一些。
 	 */
-	RangeTblEntry **simple_rte_array;	/* rangetable as an array */
+	RangeTblEntry **simple_rte_array;	/* 以数组形式的 rangetable */
 
 	/*
-	 * append_rel_array is the same length as the above arrays, and holds
-	 * pointers to the corresponding AppendRelInfo entry indexed by
-	 * child_relid, or NULL if none.  The array itself is not allocated if
-	 * append_rel_list is empty.
+	 * append_rel_array 与上述数组长度相同，按 child_relid 索引保存对应的 AppendRelInfo 指针，
+	 * 若没有则为 NULL。如果 append_rel_list 为空，则该数组本身不分配。
 	 */
 	struct AppendRelInfo **append_rel_array;
 
 	/*
-	 * all_baserels is a Relids set of all base relids (but not "other"
-	 * relids) in the query; that is, the Relids identifier of the final join
-	 * we need to form.  This is computed in make_one_rel, just before we
-	 * start making Paths.
+	 * all_baserels 是所有基表 relid 的 Relids 集合（不含 “other” rels）；
+	 * 也就是我们需要形成的最终连接的 Relids 标识符。该集合在 make_one_rel 中计算，
+	 * 就在开始生成 Paths 之前。
 	 */
 	Relids		all_baserels;
 
 	/*
-	 * nullable_baserels is a Relids set of base relids that are nullable by
-	 * some outer join in the jointree; these are rels that are potentially
-	 * nullable below the WHERE clause, SELECT targetlist, etc.  This is
-	 * computed in deconstruct_jointree.
+	 * nullable_baserels 是在连接树中某些外连接可能使之可空的基表 relids 集合；
+	 * 这些是在 WHERE、SELECT targetlist 等之下可能为 NULL 的关系。在 deconstruct_jointree 中计算。
 	 */
 	Relids		nullable_baserels;
 
 	/*
-	 * join_rel_list is a list of all join-relation RelOptInfos we have
-	 * considered in this planning run.  For small problems we just scan the
-	 * list to do lookups, but when there are many join relations we build a
-	 * hash table for faster lookups.  The hash table is present and valid
-	 * when join_rel_hash is not NULL.  Note that we still maintain the list
-	 * even when using the hash table for lookups; this simplifies life for
-	 * GEQO.
+	 * join_rel_list 是在本次规划运行中我们考虑过的所有 join-relation RelOptInfo 的列表。
+	 * 对于小问题我们直接扫描该列表以做查找，但当 join relation 很多时我们会建立哈希表以便快速查找。
+	 * 当 join_rel_hash 非 NULL 时哈希表存在且有效。即便使用哈希表进行查找，我们仍保留列表；这简化了 GEQO 的处理。
 	 */
-	List	   *join_rel_list;	/* list of join-relation RelOptInfos */
-	struct HTAB *join_rel_hash; /* optional hashtable for join relations */
+	List	   *join_rel_list;	/* join-relation RelOptInfos 列表 */
+	struct HTAB *join_rel_hash; /* 可选的 join relation 哈希表 */
 
 	/*
-	 * When doing a dynamic-programming-style join search, join_rel_level[k]
-	 * is a list of all join-relation RelOptInfos of level k, and
-	 * join_cur_level is the current level.  New join-relation RelOptInfos are
-	 * automatically added to the join_rel_level[join_cur_level] list.
-	 * join_rel_level is NULL if not in use.
+	 * 在做动态规划型的连接搜索时，join_rel_level[k] 是级别 k 的所有 join-relation RelOptInfos 的列表，
+	 * join_cur_level 是当前级别。新的 join-relation RelOptInfos 会被自动添加到 join_rel_level[join_cur_level] 列表中。
+	 * 当未使用时 join_rel_level 为 NULL。
 	 */
-	List	  **join_rel_level; /* lists of join-relation RelOptInfos */
-	int			join_cur_level; /* index of list being extended */
+	List	  **join_rel_level; /* join-relation RelOptInfos 的分级列表 */
+	int			join_cur_level; /* 正在扩展的 join_rel_level 列表的索引 */
 
-	List	   *init_plans;		/* init SubPlans for query */
+	List	   *init_plans;		/* 查询的 init SubPlans */
 
-	List	   *cte_plan_ids;	/* per-CTE-item list of subplan IDs (or -1 if
-								 * no subplan was made for that CTE) */
+	List	   *cte_plan_ids;	/* 每个 CTE 项对应的子计划 ID 列表（若未为该 CTE 生成子计划则为 -1） */
 
-	List	   *multiexpr_params;	/* List of Lists of Params for MULTIEXPR
-									 * subquery outputs */
+	List	   *multiexpr_params;	/* 用于 MULTIEXPR 子查询输出的 Params 列表的列表 */
 
-	List	   *eq_classes;		/* list of active EquivalenceClasses */
+	List	   *eq_classes;		/* 活跃的 EquivalenceClasses 列表 */
 
-	List	   *canon_pathkeys; /* list of "canonical" PathKeys */
+	List	   *canon_pathkeys; /* “规范化” PathKeys 列表 */
 
-	List	   *left_join_clauses;	/* list of RestrictInfos for mergejoinable
-									 * outer join clauses w/nonnullable var on
-									 * left */
+	List	   *left_join_clauses;	/* 针对 mergejoin 可用且左侧非空的外连接 RestrictInfos 列表 */
 
-	List	   *right_join_clauses; /* list of RestrictInfos for mergejoinable
-									 * outer join clauses w/nonnullable var on
-									 * right */
+	List	   *right_join_clauses; /* 针对 mergejoin 可用且右侧非空的外连接 RestrictInfos 列表 */
 
-	List	   *full_join_clauses;	/* list of RestrictInfos for mergejoinable
-									 * full join clauses */
+	List	   *full_join_clauses;	/* 针对 mergejoin 可用的 full join RestrictInfos 列表 */
 
-	List	   *join_info_list; /* list of SpecialJoinInfos */
+	List	   *join_info_list; /* SpecialJoinInfos 列表 */
 
 	/*
-	 * Note: for AppendRelInfos describing partitions of a partitioned table,
-	 * we guarantee that partitions that come earlier in the partitioned
-	 * table's PartitionDesc will appear earlier in append_rel_list.
+	 * 注意：对于描述分区表各分区的 AppendRelInfos，我们保证在 PartitionDesc 中较早出现的分区
+	 * 在 append_rel_list 中也较早出现。
 	 */
-	List	   *append_rel_list;	/* list of AppendRelInfos */
+	List	   *append_rel_list;	/* AppendRelInfos 列表 */
 
-	List	   *rowMarks;		/* list of PlanRowMarks */
+	List	   *rowMarks;		/* PlanRowMarks 列表 */
 
-	List	   *placeholder_list;	/* list of PlaceHolderInfos */
+	List	   *placeholder_list;	/* PlaceHolderInfos 列表 */
 
-	List	   *fkey_list;		/* list of ForeignKeyOptInfos */
+	List	   *fkey_list;		/* ForeignKeyOptInfos 列表 */
 
-	List	   *query_pathkeys; /* desired pathkeys for query_planner() */
+	List	   *query_pathkeys; /* 传入 query_planner() 的期望 pathkeys */
 
-	List	   *group_pathkeys; /* groupClause pathkeys, if any */
-	List	   *window_pathkeys;	/* pathkeys of bottom window, if any */
-	List	   *distinct_pathkeys;	/* distinctClause pathkeys, if any */
-	List	   *sort_pathkeys;	/* sortClause pathkeys, if any */
+	List	   *group_pathkeys; /* groupClause 的 pathkeys（如存在） */
+	List	   *window_pathkeys;	/* 底层 window 的 pathkeys（如存在） */
+	List	   *distinct_pathkeys;	/* distinctClause 的 pathkeys（如存在） */
+	List	   *sort_pathkeys;	/* sortClause 的 pathkeys（如存在） */
 
-	List	   *part_schemes;	/* Canonicalised partition schemes used in the
-								 * query. */
+	List	   *part_schemes;	/* 查询中使用的规范化分区方案列表 */
 
-	List	   *initial_rels;	/* RelOptInfos we are now trying to join */
+	List	   *initial_rels;	/* 我们当前正在尝试连接的 RelOptInfos 列表 */
 
-	/* Use fetch_upper_rel() to get any particular upper rel */
-	List	   *upper_rels[UPPERREL_FINAL + 1]; /* upper-rel RelOptInfos */
+	/* 使用 fetch_upper_rel() 获取任何特定的 upper rel */
+	List	   *upper_rels[UPPERREL_FINAL + 1]; /* upper-rel 的 RelOptInfos */
 
-	/* Result tlists chosen by grouping_planner for upper-stage processing */
+	/* grouping_planner 为上层处理选择的结果 tlist */
 	struct PathTarget *upper_targets[UPPERREL_FINAL + 1];
 
 	/*
-	 * The fully-processed targetlist is kept here.  It differs from
-	 * parse->targetList in that (for INSERT and UPDATE) it's been reordered
-	 * to match the target table, and defaults have been filled in.  Also,
-	 * additional resjunk targets may be present.  preprocess_targetlist()
-	 * does most of this work, but note that more resjunk targets can get
-	 * added during appendrel expansion.  (Hence, upper_targets mustn't get
-	 * set up till after that.)
+	 * 完全处理后的 targetlist 存放在这里。它不同于 parse->targetList，
+	 * 因为（对于 INSERT 和 UPDATE）它已经按目标表重排并填充了默认值。
+	 * 此外，可能存在额外的 resjunk targets。preprocess_targetlist() 大部分完成这项工作，
+	 * 但注意在 appendrel 展开期间可能会添加更多的 resjunk targets。
+	 * 因此，在那之前不应设置 upper_targets。
 	 */
 	List	   *processed_tlist;
 
-	/* Fields filled during create_plan() for use in setrefs.c */
-	AttrNumber *grouping_map;	/* for GroupingFunc fixup */
-	List	   *minmax_aggs;	/* List of MinMaxAggInfos */
+	/* 在 create_plan() 中填写，供 setrefs.c 使用 */
+	AttrNumber *grouping_map;	/* 用于 GroupingFunc 的修正 */
+	List	   *minmax_aggs;	/* MinMaxAggInfos 列表 */
 
-	MemoryContext planner_cxt;	/* context holding PlannerInfo */
+	MemoryContext planner_cxt;	/* 保存 PlannerInfo 的内存上下文 */
 
-	double		total_table_pages;	/* # of pages in all non-dummy tables of
-									 * query */
+	double		total_table_pages;	/* 查询中所有非 dummy 表的页面总数 */
 
-	double		tuple_fraction; /* tuple_fraction passed to query_planner */
-	double		limit_tuples;	/* limit_tuples passed to query_planner */
+	double		tuple_fraction; /* 传入 query_planner 的 tuple_fraction */
+	double		limit_tuples;	/* 传入 query_planner 的 limit_tuples */
 
-	Index		qual_security_level;	/* minimum security_level for quals */
-	/* Note: qual_security_level is zero if there are no securityQuals */
+	Index		qual_security_level;	/* quals 的最小 security_level */
+	/* 注意：如果没有 securityQuals，则 qual_security_level 为 0 */
 
-	InheritanceKind inhTargetKind;	/* indicates if the target relation is an
-									 * inheritance child or partition or a
-									 * partitioned table */
-	bool		hasJoinRTEs;	/* true if any RTEs are RTE_JOIN kind */
-	bool		hasLateralRTEs; /* true if any RTEs are marked LATERAL */
-	bool		hasHavingQual;	/* true if havingQual was non-null */
-	bool		hasPseudoConstantQuals; /* true if any RestrictInfo has
-										 * pseudoconstant = true */
-	bool		hasRecursion;	/* true if planning a recursive WITH item */
+	InheritanceKind inhTargetKind;	/* 指示目标关系是继承子表、分区子表还是分区表本身 */
+	bool		hasJoinRTEs;	/* 若有任何 RTE 为 RTE_JOIN 则为真 */
+	bool		hasLateralRTEs; /* 若有任何 RTE 标记为 LATERAL 则为真 */
+	bool		hasHavingQual;	/* 若 havingQual 非空则为真 */
+	bool		hasPseudoConstantQuals; /* 若有任何 RestrictInfo 的 pseudoconstant = true 则为真 */
+	bool		hasRecursion;	/* 若正在规划递归 WITH 项则为真 */
 
-	/* These fields are used only when hasRecursion is true: */
-	int			wt_param_id;	/* PARAM_EXEC ID for the work table */
-	struct Path *non_recursive_path;	/* a path for non-recursive term */
+	/* 当 hasRecursion 为真时使用的字段： */
+	int			wt_param_id;	/* work table 的 PARAM_EXEC ID */
+	struct Path *non_recursive_path;	/* 非递归项的路径 */
 
-	/* These fields are workspace for createplan.c */
-	Relids		curOuterRels;	/* outer rels above current node */
-	List	   *curOuterParams; /* not-yet-assigned NestLoopParams */
+	/* createplan.c 使用的工作区字段 */
+	Relids		curOuterRels;	/* 当前节点之上可见的外部 rels */
+	List	   *curOuterParams; /* 尚未分配的 NestLoopParams */
 
-	/* optional private data for join_search_hook, e.g., GEQO */
+	/* join_search_hook 的可选私有数据，例如 GEQO */
 	void	   *join_search_private;
 
-	/* Does this query modify any partition key columns? */
+	/* 本查询是否修改了任何分区键列？ */
 	bool		partColsUpdated;
 };
 
 
 /*
- * In places where it's known that simple_rte_array[] must have been prepared
- * already, we just index into it to fetch RTEs.  In code that might be
- * executed before or after entering query_planner(), use this macro.
+ * 在那些已知 simple_rte_array[] 已经被准备好的位置，我们直接通过索引
+ * 从该数组获取 RTE。对于可能在进入或离开 query_planner() 之前/之后执行
+ * 的代码，应使用此宏以保证正确获取 RTE（会在必要时回退到 rt_fetch）。
  */
 #define planner_rt_fetch(rti, root) \
 	((root)->simple_rte_array ? (root)->simple_rte_array[rti] : \
@@ -407,224 +373,173 @@ typedef struct PartitionSchemeData *PartitionScheme;
 
 /*----------
  * RelOptInfo
- *		Per-relation information for planning/optimization
+ *		用于规划/优化的每个关系信息
  *
- * For planning purposes, a "base rel" is either a plain relation (a table)
- * or the output of a sub-SELECT or function that appears in the range table.
- * In either case it is uniquely identified by an RT index.  A "joinrel"
- * is the joining of two or more base rels.  A joinrel is identified by
- * the set of RT indexes for its component baserels.  We create RelOptInfo
- * nodes for each baserel and joinrel, and store them in the PlannerInfo's
- * simple_rel_array and join_rel_list respectively.
+ * 在规划阶段，“基表（base rel）”是指出现在 rangetable 中的普通表（table）
+ * 或出现在 FROM 子句中的子 SELECT 或函数的输出。在任一情况下，它由一个
+ * RT 索引唯一标识。“joinrel”是两个或多个基表的连接。joinrel 由其组成基表
+ * 的 RT 索引集合标识。我们为每个 baserel 和 joinrel 创建 RelOptInfo 节点，
+ * 并分别将它们存储在 PlannerInfo 的 simple_rel_array 和 join_rel_list 中。
  *
- * Note that there is only one joinrel for any given set of component
- * baserels, no matter what order we assemble them in; so an unordered
- * set is the right datatype to identify it with.
+ * 注意：对于任意给定的一组组成基表，不管我们以何种顺序将它们组装，都只有
+ * 一个 joinrel；因此用无序集合作为标识类型是合适的。
  *
- * We also have "other rels", which are like base rels in that they refer to
- * single RT indexes; but they are not part of the join tree, and are given
- * a different RelOptKind to identify them.
- * Currently the only kind of otherrels are those made for member relations
- * of an "append relation", that is an inheritance set or UNION ALL subquery.
- * An append relation has a parent RTE that is a base rel, which represents
- * the entire append relation.  The member RTEs are otherrels.  The parent
- * is present in the query join tree but the members are not.  The member
- * RTEs and otherrels are used to plan the scans of the individual tables or
- * subqueries of the append set; then the parent baserel is given Append
- * and/or MergeAppend paths comprising the best paths for the individual
- * member rels.  (See comments for AppendRelInfo for more information.)
+ * 我们还有“other rels”，它们类似于基表，因为它们引用单个 RT 索引；但它们
+ * 不在连接树中，因此用不同的 RelOptKind 来标识。目前唯一的 otherrels 是为
+ * “append relation”的成员关系制作的，即继承集或 UNION ALL 子查询的成员。
+ * 一个 append relation 有一个作为基表的父 RTE，表示整个 append relation。
+ * 成员 RTE 是 otherrels。成员 RTE 和 otherrels 用于规划 append 集合中各个表
+ * 或子查询的扫描；然后父 baserel 会被赋予由各成员的最佳路径组成的 Append
+ * 和/或 MergeAppend 路径。（关于 AppendRelInfo 的更多信息见相应注释。）
  *
- * At one time we also made otherrels to represent join RTEs, for use in
- * handling join alias Vars.  Currently this is not needed because all join
- * alias Vars are expanded to non-aliased form during preprocess_expression.
+ * 曾经我们还为表示连接 RTE 的情况创建 otherrels，用于处理连接别名 Vars。
+ * 目前不需要这样做，因为所有连接别名 Vars 在 preprocess_expression 阶段
+ * 已经被展开为非别名形式。
  *
- * We also have relations representing joins between child relations of
- * different partitioned tables. These relations are not added to
- * join_rel_level lists as they are not joined directly by the dynamic
- * programming algorithm.
+ * 我们还为不同分区表的子关系之间的连接创建关系。这些关系不会被加入到
+ * join_rel_level 列表，因为它们不会被动态规划算法直接连接。
  *
- * There is also a RelOptKind for "upper" relations, which are RelOptInfos
- * that describe post-scan/join processing steps, such as aggregation.
- * Many of the fields in these RelOptInfos are meaningless, but their Path
- * fields always hold Paths showing ways to do that processing step.
+ * 还有一种 RelOptKind 用于“upper”关系，即描述扫描/连接之后处理步骤的
+ * RelOptInfos，例如聚合（aggregation）。这些 RelOptInfo 的许多字段没有意义，
+ * 但它们的 Path 字段总是保存执行该处理步骤的路径。
  *
- * Lastly, there is a RelOptKind for "dead" relations, which are base rels
- * that we have proven we don't need to join after all.
+ * 最后，还有一种 RelOptKind 用于“dead”关系，即那些我们已经证明不需要再
+ * 参与连接的基表。
  *
- * Parts of this data structure are specific to various scan and join
- * mechanisms.  It didn't seem worth creating new node types for them.
+ * 该数据结构的部分字段针对各种扫描和连接机制是专用的，因此并不值得为它们
+ * 新建节点类型。
  *
- *		relids - Set of base-relation identifiers; it is a base relation
- *				if there is just one, a join relation if more than one
- *		rows - estimated number of tuples in the relation after restriction
- *			   clauses have been applied (ie, output rows of a plan for it)
- *		consider_startup - true if there is any value in keeping plain paths for
- *						   this rel on the basis of having cheap startup cost
- *		consider_param_startup - the same for parameterized paths
- *		reltarget - Default Path output tlist for this rel; normally contains
- *					Var and PlaceHolderVar nodes for the values we need to
- *					output from this relation.
- *					List is in no particular order, but all rels of an
- *					appendrel set must use corresponding orders.
- *					NOTE: in an appendrel child relation, may contain
- *					arbitrary expressions pulled up from a subquery!
- *		pathlist - List of Path nodes, one for each potentially useful
- *				   method of generating the relation
- *		ppilist - ParamPathInfo nodes for parameterized Paths, if any
- *		cheapest_startup_path - the pathlist member with lowest startup cost
- *			(regardless of ordering) among the unparameterized paths;
- *			or NULL if there is no unparameterized path
- *		cheapest_total_path - the pathlist member with lowest total cost
- *			(regardless of ordering) among the unparameterized paths;
- *			or if there is no unparameterized path, the path with lowest
- *			total cost among the paths with minimum parameterization
- *		cheapest_unique_path - for caching cheapest path to produce unique
- *			(no duplicates) output from relation; NULL if not yet requested
- *		cheapest_parameterized_paths - best paths for their parameterizations;
- *			always includes cheapest_total_path, even if that's unparameterized
- *		direct_lateral_relids - rels this rel has direct LATERAL references to
- *		lateral_relids - required outer rels for LATERAL, as a Relids set
- *			(includes both direct and indirect lateral references)
+ *		relids - 包含的基表标识集合；若只有一个则为基表，若多于一个则为 joinrel
+ *		rows - 在应用限制性子句（restriction clauses）后估计的元组数
+ *		consider_startup - 是否有必要因为低启动成本而保留普通路径
+ *		consider_param_startup - 针对参数化路径的同样判断
+ *		reltarget - 此关系扫描的默认 Path 输出目标列表；通常包含需要从该关系
+ *					输出的 Var 和 PlaceHolderVar 节点。
+ *					该列表无特定顺序，但 appendrel 集合中的所有关系必须使用
+ *					对应的顺序。
+ *					注意：在 appendrel 子关系中，可能包含从子查询提升的任意表达式！
+ *		pathlist - Path 节点列表，每个表示生成该关系的一种可能方法
+ *		ppilist - 与 pathlist 中的参数化路径对应的 ParamPathInfo 列表（若存在）
+ *		cheapest_startup_path - 在未参数化路径中启动成本最低者（不考虑排序）；
+ *			若不存在未参数化路径则为 NULL
+ *		cheapest_total_path - 在未参数化路径中总成本最低者（不考虑排序）；
+ *			如果不存在未参数化路径，则在具有最小参数化的路径中选择总成本最低者
+ *		cheapest_unique_path - 缓存生成唯一（无重复）输出的最低成本路径；若尚
+ *			未请求则为 NULL
+ *		cheapest_parameterized_paths - 针对不同参数化情况的最佳路径列表；
+ *			该列表总是包含 cheapest_total_path，即使它是未参数化的
+ *		direct_lateral_relids - 该关系直接横向（LATERAL）引用的 rels
+ *		lateral_relids - 横向参数化所需的最小外部 rels（Relids 集合，包含直接和间接引用）
  *
- * If the relation is a base relation it will have these fields set:
+ * 若该关系为基表，将设置以下字段：
  *
- *		relid - RTE index (this is redundant with the relids field, but
- *				is provided for convenience of access)
- *		rtekind - copy of RTE's rtekind field
- *		min_attr, max_attr - range of valid AttrNumbers for rel
- *		attr_needed - array of bitmapsets indicating the highest joinrel
- *				in which each attribute is needed; if bit 0 is set then
- *				the attribute is needed as part of final targetlist
- *		attr_widths - cache space for per-attribute width estimates;
- *					  zero means not computed yet
- *		lateral_vars - lateral cross-references of rel, if any (list of
- *					   Vars and PlaceHolderVars)
- *		lateral_referencers - relids of rels that reference this one laterally
- *				(includes both direct and indirect lateral references)
- *		indexlist - list of IndexOptInfo nodes for relation's indexes
- *					(always NIL if it's not a table)
- *		pages - number of disk pages in relation (zero if not a table)
- *		tuples - number of tuples in relation (not considering restrictions)
- *		allvisfrac - fraction of disk pages that are marked all-visible
- *		subroot - PlannerInfo for subquery (NULL if it's not a subquery)
- *		subplan_params - list of PlannerParamItems to be passed to subquery
+ *		relid - RTE 索引（与 relids 字段冗余，但为了访问方便而提供）
+ *		rtekind - RTE 的 rtekind 字段副本
+ *		min_attr, max_attr - 该关系的有效 AttrNumber 范围
+ *		attr_needed - 按属性索引的 bitmapset 数组，指示每个属性在最高的 joinrel
+ *					  中是否需要；如果 bit 0 被设置则表示该属性在最终 targetlist 中需要
+ *		attr_widths - 每属性宽度估计的缓存；为 0 表示尚未计算
+ *		lateral_vars - 该关系引用的横向变量（Vars 和 PlaceHolderVars）列表
+ *		lateral_referencers - 横向引用此关系的 rels 的 relids（包含直接和间接引用）
+ *		indexlist - 该关系的 IndexOptInfo 列表（若不是表则始终为 NIL）
+ *		pages - 关系的磁盘页面数估计（若不是表则为 0）
+ *		tuples - 表中元组数估计（不考虑过滤）
+ *		allvisfrac - 全可见页面比例估计
+ *		subroot - 若为子查询，则为其 PlannerInfo；否则为 NULL
+ *		subplan_params - 若为子查询，要传入子查询的 PlannerParamItems 列表
  *
- *		Note: for a subquery, tuples and subroot are not set immediately
- *		upon creation of the RelOptInfo object; they are filled in when
- *		set_subquery_pathlist processes the object.
+ *		注意：对于子查询，tuples 和 subroot 并不会在创建 RelOptInfo 时立即设置；
+ *		它们会在 set_subquery_pathlist 处理该对象时填充。
  *
- *		For otherrels that are appendrel members, these fields are filled
- *		in just as for a baserel, except we don't bother with lateral_vars.
+ *		对于作为 appendrel 成员的 otherrels，这些字段与 baserel 类似地被填充，
+ *		只是我们不为其维护 lateral_vars。
  *
- * If the relation is either a foreign table or a join of foreign tables that
- * all belong to the same foreign server and are assigned to the same user to
- * check access permissions as (cf checkAsUser), these fields will be set:
+ * 如果该关系是外部表或所有参与的外部连接都属于相同外部服务器且为同一用户
+ * 分配了访问权限（参见 checkAsUser），则会设置以下字段：
  *
- *		serverid - OID of foreign server, if foreign table (else InvalidOid)
- *		userid - OID of user to check access as (InvalidOid means current user)
- *		useridiscurrent - we've assumed that userid equals current user
- *		fdwroutine - function hooks for FDW, if foreign table (else NULL)
- *		fdw_private - private state for FDW, if foreign table (else NULL)
+ *		serverid - 外部服务器的 OID（若为外部表，否则为 InvalidOid）
+ *		userid - 用于检查权限的用户 OID（InvalidOid 表示当前用户）
+ *		useridiscurrent - 标识 userid 是否等于当前用户
+ *		fdwroutine - FDW 的函数钩子（若为外部表，否则为 NULL）
+ *		fdw_private - FDW 的私有状态（若为外部表，否则为 NULL）
  *
- * Two fields are used to cache knowledge acquired during the join search
- * about whether this rel is provably unique when being joined to given other
- * relation(s), ie, it can have at most one row matching any given row from
- * that join relation.  Currently we only attempt such proofs, and thus only
- * populate these fields, for base rels; but someday they might be used for
- * join rels too:
+ * 有两个字段用于缓存连接搜索过程中获得的关于当该 rel 与给定其他关系连接时
+ * 是否可断言其是唯一（即对于任一给定的其他关系行，至多有一行匹配）的知识。
+ * 目前我们仅尝试对基表进行此类证明，因此只会为基表填充这些字段；未来也可能
+ * 用于 join rel：
  *
- *		unique_for_rels - list of Relid sets, each one being a set of other
- *					rels for which this one has been proven unique
- *		non_unique_for_rels - list of Relid sets, each one being a set of
- *					other rels for which we have tried and failed to prove
- *					this one unique
+ *		unique_for_rels - Relid 集合列表，每个集合表示对于这些其他 rels 已证明
+ *						  当前 rel 是唯一的
+ *		non_unique_for_rels - Relid 集合列表，每个集合表示对于这些集合我们已尝试但
+ *							  未能证明该 rel 是唯一的
  *
- * The presence of the following fields depends on the restrictions
- * and joins that the relation participates in:
+ * 下列字段的存在取决于该关系所参与的限制和连接：
  *
- *		baserestrictinfo - List of RestrictInfo nodes, containing info about
- *					each non-join qualification clause in which this relation
- *					participates (only used for base rels)
- *		baserestrictcost - Estimated cost of evaluating the baserestrictinfo
- *					clauses at a single tuple (only used for base rels)
- *		baserestrict_min_security - Smallest security_level found among
- *					clauses in baserestrictinfo
- *		joininfo  - List of RestrictInfo nodes, containing info about each
- *					join clause in which this relation participates (but
- *					note this excludes clauses that might be derivable from
- *					EquivalenceClasses)
- *		has_eclass_joins - flag that EquivalenceClass joins are possible
+ *		baserestrictinfo - RestrictInfo 节点列表，包含该关系参与的每个非连接限制子句
+ *						  的信息（仅用于基表）
+ *		baserestrictcost - 在单个元组上评估 baserestrictinfo 子句的估计成本（仅用于基表）
+ *		baserestrict_min_security - 在 baserestrictinfo 中发现的最小 security_level
+ *		joininfo  - RestrictInfo 节点列表，包含该关系参与的每个连接子句的信息
+ *		has_eclass_joins - 标志，若存在 EquivalenceClass 连接则为真（意味着 joininfo 可能不完整）
  *
- * Note: Keeping a restrictinfo list in the RelOptInfo is useful only for
- * base rels, because for a join rel the set of clauses that are treated as
- * restrict clauses varies depending on which sub-relations we choose to join.
- * (For example, in a 3-base-rel join, a clause relating rels 1 and 2 must be
- * treated as a restrictclause if we join {1} and {2 3} to make {1 2 3}; but
- * if we join {1 2} and {3} then that clause will be a restrictclause in {1 2}
- * and should not be processed again at the level of {1 2 3}.)	Therefore,
- * the restrictinfo list in the join case appears in individual JoinPaths
- * (field joinrestrictinfo), not in the parent relation.  But it's OK for
- * the RelOptInfo to store the joininfo list, because that is the same
- * for a given rel no matter how we form it.
+ * 注意：在 RelOptInfo 中保存 restrictinfo 列表仅对基表有用，因为对于 join rel，
+ * 被视为 restrict clauses 的子句集合会随我们选择连接的子关系而变化。
+ * 因此在 JoinPath（字段 joinrestrictinfo）中保存连接级别的 restrictinfo 列表更合适。
+ * 但将 joininfo 列表保留在 RelOptInfo 中是可以的，因为对于给定的 rel，无论我们如何形成它，
+ * 该列表都是相同的。
  *
- * We store baserestrictcost in the RelOptInfo (for base relations) because
- * we know we will need it at least once (to price the sequential scan)
- * and may need it multiple times to price index scans.
+ * 我们在 RelOptInfo 中存储 baserestrictcost（仅对于基表）是因为我们知道至少需要一次
+ * （用于估价顺序扫描），并且可能多次需要它来估价索引扫描。
  *
- * If the relation is partitioned, these fields will be set:
+ * 如果该关系是分区表，则会设置以下字段：
  *
- *		part_scheme - Partitioning scheme of the relation
- *		nparts - Number of partitions
- *		boundinfo - Partition bounds
- *		partition_qual - Partition constraint if not the root
- *		part_rels - RelOptInfos for each partition
- *		partexprs, nullable_partexprs - Partition key expressions
- *		partitioned_child_rels - RT indexes of unpruned partitions of
- *								 this relation that are partitioned tables
- *								 themselves, in hierarchical order
+ *		part_scheme - 分区方案
+ *		nparts - 分区数
+ *		boundinfo - 分区边界信息
+ *		partition_qual - 若不是根分区则为分区约束
+ *		part_rels - 每个分区的 RelOptInfo（按边界顺序）
+ *		partexprs, nullable_partexprs - 分区键表达式
+ *		partitioned_child_rels - 分区表中未被裁剪的分区的 RT 索引列表，
+ *								 按层次顺序
  *
- * Note: A base relation always has only one set of partition keys, but a join
- * relation may have as many sets of partition keys as the number of relations
- * being joined. partexprs and nullable_partexprs are arrays containing
- * part_scheme->partnatts elements each. Each of these elements is a list of
- * partition key expressions.  For a base relation each list in partexprs
- * contains only one expression and nullable_partexprs is not populated. For a
- * join relation, partexprs and nullable_partexprs contain partition key
- * expressions from non-nullable and nullable relations resp. Lists at any
- * given position in those arrays together contain as many elements as the
- * number of joining relations.
+ * 注意：一个基表总是只有一组分区键，但一个 join relation 可以有多组分区键，
+ * 数量等于被连接的关系数。partexprs 和 nullable_partexprs 是包含
+ * part_scheme->partnatts 元素的数组。每个元素本身是一个分区键表达式列表。
+ * 对于基表，partexprs 中每个列表只包含一个表达式，nullable_partexprs 不被填充。
+ * 对于 join relation，partexprs 和 nullable_partexprs 分别包含来自不可空和可空
+ * 关系的分区键表达式。任一位置处这些数组中的列表一起包含的元素个数等于加入
+ * 的关系数。
  *----------
  */
 typedef enum RelOptKind
 {
-	RELOPT_BASEREL,
-	RELOPT_JOINREL,
-	RELOPT_OTHER_MEMBER_REL,
-	RELOPT_OTHER_JOINREL,
-	RELOPT_UPPER_REL,
-	RELOPT_OTHER_UPPER_REL,
-	RELOPT_DEADREL
+	RELOPT_BASEREL,			/* 基表关系（单一基表或子查询/函数结果） */
+	RELOPT_JOINREL,			/* 连接关系（由多个基表组成的 join rel，连接操作的中间结果） */
+	RELOPT_OTHER_MEMBER_REL,/* append 成员关系（other member rel，用于继承/UNION ALL 成员） */
+	RELOPT_OTHER_JOINREL,	/* append 成员的 joinrel（other join rel） */
+	RELOPT_UPPER_REL,		/* 上层关系（扫描/连接之后的处理，如聚合、窗口等） */
+	RELOPT_OTHER_UPPER_REL,	/* 上层关系的成员（other upper rel，append/partition 情况） */
+	RELOPT_DEADREL			/* 已证明为空的关系（dummy/死关系） */
 } RelOptKind;
 
 /*
- * Is the given relation a simple relation i.e a base or "other" member
- * relation?
+ * 判断给定的 RelOptInfo 是否为简单关系（即基表或“其他”成员关系）
  */
 #define IS_SIMPLE_REL(rel) \
 	((rel)->reloptkind == RELOPT_BASEREL || \
 	 (rel)->reloptkind == RELOPT_OTHER_MEMBER_REL)
 
-/* Is the given relation a join relation? */
+/* 判断给定的关系是否为连接关系 */
 #define IS_JOIN_REL(rel)	\
 	((rel)->reloptkind == RELOPT_JOINREL || \
 	 (rel)->reloptkind == RELOPT_OTHER_JOINREL)
 
-/* Is the given relation an upper relation? */
+/* 判断给定的关系是否为上层（upper）关系 */
 #define IS_UPPER_REL(rel)	\
 	((rel)->reloptkind == RELOPT_UPPER_REL || \
 	 (rel)->reloptkind == RELOPT_OTHER_UPPER_REL)
 
-/* Is the given relation an "other" relation? */
+/* 判断给定的关系是否为“其他”类型关系（other rel） */
 #define IS_OTHER_REL(rel) \
 	((rel)->reloptkind == RELOPT_OTHER_MEMBER_REL || \
 	 (rel)->reloptkind == RELOPT_OTHER_JOINREL || \
@@ -636,91 +551,94 @@ typedef struct RelOptInfo
 
 	RelOptKind	reloptkind;
 
-	/* all relations included in this RelOptInfo */
-	Relids		relids;			/* set of base relids (rangetable indexes) */
+	/* 此 RelOptInfo 包含的所有基表 relids 集合（rangetable 索引）
+	 * 对于基表类型的 reloptkind，该集合仅包含一个元素，relids 存储的是单个基表的 rtindex 索引
+	 * 对于连接类型的 reloptkind，该集合包含多个元素，relids 存储的是组成该连接的各个基表的 rtindex 索引
+	 */
+	Relids		relids;
 
-	/* size estimates generated by planner */
-	double		rows;			/* estimated number of result tuples */
+	/* planner 生成的大小估计 */
+	double		rows;			/* 估计的结果元组数 */
 
-	/* per-relation planner control flags */
-	bool		consider_startup;	/* keep cheap-startup-cost paths? */
-	bool		consider_param_startup; /* ditto, for parameterized paths? */
-	bool		consider_parallel;	/* consider parallel paths? */
+	/* 每个关系的规划控制标志
+	 * 对查询的物理路径做预检（add_path_precheck）的时候，是否考虑预检启动代价（startup_cost）
+	 */
+	bool		consider_startup;			/* 针对非参数化路径，是否保留低启动成本的路径？ */
+	bool		consider_param_startup; 	/* 同上，针对参数化路径，在 Semi Join 和 Anti Join 中是否考虑启动成本？参照 set_base_rel_consider_startup 函数 */
+	bool		consider_parallel;			/* 是否考虑并行路径？ */
 
-	/* default result targetlist for Paths scanning this relation */
-	struct PathTarget *reltarget;	/* list of Vars/Exprs, cost, width */
+	/* RelOptInfo 的查询结果对应的投影列 */
+	struct PathTarget *reltarget;			/* 要计算的 Vars/Expr 列表、成本、宽度 */
 
-	/* materialization information */
-	List	   *pathlist;		/* Path structures */
-	List	   *ppilist;		/* ParamPathInfos used in pathlist */
-	List	   *partial_pathlist;	/* partial Paths */
-	struct Path *cheapest_startup_path;
-	struct Path *cheapest_total_path;
-	struct Path *cheapest_unique_path;
-	List	   *cheapest_parameterized_paths;
+	/* 物化/路径信息 */
+	List	   *pathlist;						/* Path 结构列表，记录所有可行的路径 */
+	List	   *ppilist;						/* pathlist 中使用的 ParamPathInfo 列表，参数化路径的参数 */
+	List* partial_pathlist;				/* 部分（partial）Path 列表 */
+	
+	struct Path* 	cheapest_startup_path; 			/* 启动成本最低的 Path */
+	struct Path* 	cheapest_total_path;   			/* 总成本最低的 Path */
+	struct Path* 	cheapest_unique_path;  			/* 产生唯一输出的最低成本 Path，和 Semi Join 有关*/
+	List* 			cheapest_parameterized_paths; 	/* 包含所有的参数化路径，另外 cheapest_total_path 也在此列表中，即使它不是参数化路径 */
 
-	/* parameterization information needed for both base rels and join rels */
-	/* (see also lateral_vars and lateral_referencers) */
-	Relids		direct_lateral_relids;	/* rels directly laterally referenced */
-	Relids		lateral_relids; /* minimum parameterization of rel */
+	/* 基表和连接表均需的参数化信息（参见 lateral_vars 和 lateral_referencers） */
+	Relids		direct_lateral_relids;	/* 语句中直接指出的 LATERAL rels */
+	Relids		lateral_relids; 		/* 最小的横向参数化 rels，由 direct_lateral_relids 推导而来的表之间的依赖关系 */
 
-	/* information about a base rel (not set for join rels!) */
-	Index		relid;
-	Oid			reltablespace;	/* containing tablespace */
-	RTEKind		rtekind;		/* RELATION, SUBQUERY, FUNCTION, etc */
-	AttrNumber	min_attr;		/* smallest attrno of rel (often <0) */
-	AttrNumber	max_attr;		/* largest attrno of rel */
-	Relids	   *attr_needed;	/* array indexed [min_attr .. max_attr] */
-	int32	   *attr_widths;	/* array indexed [min_attr .. max_attr] */
-	List	   *lateral_vars;	/* LATERAL Vars and PHVs referenced by rel */
-	Relids		lateral_referencers;	/* rels that reference me laterally */
-	List	   *indexlist;		/* list of IndexOptInfo */
-	List	   *statlist;		/* list of StatisticExtInfo */
-	BlockNumber pages;			/* size estimates derived from pg_class */
-	double		tuples;
-	double		allvisfrac;
-	PlannerInfo *subroot;		/* if subquery */
-	List	   *subplan_params; /* if subquery */
-	int			rel_parallel_workers;	/* wanted number of parallel workers */
+	/* 关于基表（RELOPT_BASEREL）类型的 RelOptInfo 的信息（对于连接表（RELOPT_JOINREL）不设置） */
+	Index		relid;					/* RTE 索引，基表的 rtindex */
+	Oid			reltablespace;			/* 所在表空间 */
+	RTEKind		rtekind;				/* RTE 的类型：RELATION、SUBQUERY、FUNCTION 等 */
 
-	/* Information about foreign tables and foreign joins */
-	Oid			serverid;		/* identifies server for the table or join */
-	Oid			userid;			/* identifies user to check access as */
-	bool		useridiscurrent;	/* join is only valid for current user */
-	/* use "struct FdwRoutine" to avoid including fdwapi.h here */
+	AttrNumber	min_attr;				/* 关系的最小属性号（常可 < 0），即表中的首列编号。对 RTE_RELATION 类型的 RTE，min_attr 应该是 FirstLowInvalidHeapAttributeNumber+1，否则应该是 0 */
+	AttrNumber	max_attr;				/* 关系的最大属性号，即表中的末列编号。对于 RTE_SUBQUERY、RTE_FUNCTION 类型的 RTE，max_attr 应该是这个 RelOptInfo 结果集投影列的个数 */
+	Relids	   *attr_needed;			/* 按属性索引的 bitmapset 数组，表示每属性在何处需要，长度为 max_attr - min_attr + 1 */
+	int32	   *attr_widths;			/* 按属性索引的宽度估计缓存；为 0 表示尚未计算，每个数组元素代表了该列的宽度 */
+	
+	List	   *lateral_vars;			/* 该关系引用的 LATERAL Vars 和 PlaceHolderVar 列表 */
+	Relids		lateral_referencers;	/* 引用该关系的 rels（横向参考） */
+	
+	List	   *indexlist;				/* 该关系的 IndexOptInfo 列表，即该表的所有索引 */
+	List	   *statlist;				/* StatisticExtInfo 列表，扩展多列统计信息 */
+	BlockNumber pages;					/* 从 pg_class 等得出的页面数估计 */
+	double		tuples;					/* 表中元组数估计（不考虑过滤） */
+	double		allvisfrac;				/* 全可见页面的比例估计 */
+
+	PlannerInfo* 	subroot;				/* 若为子查询，则为其 PlannerInfo，子查询生成的子执行计划 */
+	List	   		*subplan_params; 		/* 若为子查询，传入子查询的 PlannerParamItems 列表，子查询的参数 */
+	int				rel_parallel_workers;	/* 希望的并行 worker 数 */
+
+	/* 关于外部表和外部连接的信息 */
+	Oid			serverid;			/* 外部表或连接所在的 server OID */
+	Oid			userid;				/* 用于检查权限的用户 OID */
+	bool		useridiscurrent;	/* 标识 userid 是否等于当前用户 */
+	/* 使用 "struct FdwRoutine" 避免在此包含 fdwapi.h */
 	struct FdwRoutine *fdwroutine;
 	void	   *fdw_private;
 
-	/* cache space for remembering if we have proven this relation unique */
-	List	   *unique_for_rels;	/* known unique for these other relid
-									 * set(s) */
-	List	   *non_unique_for_rels;	/* known not unique for these set(s) */
+	/* 用于缓存我们是否已经证明该关系在作为内表情况下具有唯一性 */
+	List	   *unique_for_rels;		/* 已知对这些其他 relid 集合是唯一的 */
+	List	   *non_unique_for_rels;	/* 已知对这些集合不是唯一的 */
 
-	/* used by various scans and joins: */
-	List	   *baserestrictinfo;	/* RestrictInfo structures (if base rel) */
-	QualCost	baserestrictcost;	/* cost of evaluating the above */
-	Index		baserestrict_min_security;	/* min security_level found in
-											 * baserestrictinfo */
-	List	   *joininfo;		/* RestrictInfo structures for join clauses
-								 * involving this rel */
-	bool		has_eclass_joins;	/* T means joininfo is incomplete */
+	/* 被各种扫描和连接使用： */
+	List	   *baserestrictinfo;			/* RestrictInfo 结构列表（若为基表），基表上的过滤条件 */
+	QualCost	baserestrictcost;			/* 评估上述约束的成本 */
+	Index		baserestrict_min_security;	/* baserestrictinfo 中发现的最小 security_level */
+	List	   *joininfo;					/* 涉及该关系的连接条件的 RestrictInfo 列表，连接条件 */
+	bool		has_eclass_joins;			/* 为 true 表示存在 EquivalenceClass 等值连接条件（即 joininfo 可能不完整） */
 
-	/* used by partitionwise joins: */
-	bool		consider_partitionwise_join;	/* consider partitionwise join
-												 * paths? (if partitioned rel) */
-	Relids		top_parent_relids;	/* Relids of topmost parents (if "other"
-									 * rel) */
+	/* 用于分区感知的连接： */
+	bool		consider_partitionwise_join;	/* 是否考虑分区感知连接路径？（若为分区关系） */
+	Relids		top_parent_relids;				/* 顶层父关系的 Relids（若为 "other" rel） */
 
-	/* used for partitioned relations */
-	PartitionScheme part_scheme;	/* Partitioning scheme. */
-	int			nparts;			/* number of partitions */
-	struct PartitionBoundInfoData *boundinfo;	/* Partition bounds */
-	List	   *partition_qual; /* partition constraint */
-	struct RelOptInfo **part_rels;	/* Array of RelOptInfos of partitions,
-									 * stored in the same order of bounds */
-	List	  **partexprs;		/* Non-nullable partition key expressions. */
-	List	  **nullable_partexprs; /* Nullable partition key expressions. */
-	List	   *partitioned_child_rels; /* List of RT indexes. */
+	/* 用于分区关系 */
+	PartitionScheme part_scheme;				/* 分区方案 */
+	int			nparts;							/* 分区数量 */
+	struct PartitionBoundInfoData *boundinfo;	/* 分区边界信息 */
+	List	   *partition_qual;					/* 分区约束 */
+	struct RelOptInfo **part_rels;				/* 分区的 RelOptInfo 数组，按边界顺序存放 */
+	List	  **partexprs;						/* 非可空的分区键表达式数组（每个分区键一个 list） */
+	List	  **nullable_partexprs;				/* 可空的分区键表达式数组 */
+	List	   *partitioned_child_rels;			/* 分区子表的 RT 索引列表 */
 } RelOptInfo;
 
 /*
@@ -1075,56 +993,51 @@ typedef struct ParamPathInfo
 
 
 /*
- * Type "Path" is used as-is for sequential-scan paths, as well as some other
- * simple plan types that we don't need any extra information in the path for.
- * For other path types it is the first component of a larger struct.
+ * Path 类型直接用于顺序扫描路径，以及其它一些不需要在 path 中
+ * 保存额外信息的简单计划类型。
  *
- * "pathtype" is the NodeTag of the Plan node we could build from this Path.
- * It is partially redundant with the Path's NodeTag, but allows us to use
- * the same Path type for multiple Plan types when there is no need to
- * distinguish the Plan type during path processing.
+ * "pathtype" 指明了可由此 Path 构建的 Plan 节点的 NodeTag。
+ * 这与 Path 本身的 NodeTag 部分重叠，但允许在不同 Plan 类型
+ * 之间复用同一种 Path 类型，在路径处理期间无需区分具体的 Plan 类型。
  *
- * "parent" identifies the relation this Path scans, and "pathtarget"
- * describes the precise set of output columns the Path would compute.
- * In simple cases all Paths for a given rel share the same targetlist,
- * which we represent by having path->pathtarget equal to parent->reltarget.
+ * "parent" 标识该 Path 所扫描的关系，"pathtarget" 描述该 Path
+ * 将计算出的精确输出列集合。在简单情况下，一个关系的所有 Path
+ * 共享同一目标列表，此时 path->pathtarget 等于 parent->reltarget。
  *
- * "param_info", if not NULL, links to a ParamPathInfo that identifies outer
- * relation(s) that provide parameter values to each scan of this path.
- * That means this path can only be joined to those rels by means of nestloop
- * joins with this path on the inside.  Also note that a parameterized path
- * is responsible for testing all "movable" joinclauses involving this rel
- * and the specified outer rel(s).
+ * 如果 param_info 非 NULL，则它指向一个 ParamPathInfo，说明每次对
+ * 该 path 的扫描会使用来自某些外部关系的参数值。也就是说，
+ * 该 path 只能通过嵌套循环（nestloop）将其作为内侧连接到这些外部关系。
+ * 同时应注意，参数化路径负责测试所有涉及该关系与指定外部关系的
+ * “可移动”连接子句。
  *
- * "rows" is the same as parent->rows in simple paths, but in parameterized
- * paths and UniquePaths it can be less than parent->rows, reflecting the
- * fact that we've filtered by extra join conditions or removed duplicates.
+ * "rows" 在简单路径中与 parent->rows 相同，但在参数化路径和 UniquePath
+ * 中它可能小于 parent->rows，以反映已经由额外连接条件过滤或去重后
+ * 的估计行数。
  *
- * "pathkeys" is a List of PathKey nodes (see above), describing the sort
- * ordering of the path's output rows.
+ * "pathkeys" 是一个 PathKey 节点的 List（见上文），描述了该 path 输出行的排序顺序。
  */
 typedef struct Path
 {
 	NodeTag		type;
 
-	NodeTag		pathtype;		/* tag identifying scan/join method */
+	NodeTag		pathtype;		/* 标识可构建的扫描/连接方法的 tag */
 
-	RelOptInfo *parent;			/* the relation this path can build */
-	PathTarget *pathtarget;		/* list of Vars/Exprs, cost, width */
+	RelOptInfo *parent;			/* 该 path 能构建的关系 */
+	PathTarget *pathtarget;		/* 要计算的 Vars/Expr 列表、成本、宽度 */
 
-	ParamPathInfo *param_info;	/* parameterization info, or NULL if none */
+	ParamPathInfo *param_info;	/* 参数化信息，若无则为 NULL */
 
-	bool		parallel_aware; /* engage parallel-aware logic? */
-	bool		parallel_safe;	/* OK to use as part of parallel plan? */
-	int			parallel_workers;	/* desired # of workers; 0 = not parallel */
+	bool		parallel_aware; /* 是否启用并行感知逻辑？ */
+	bool		parallel_safe;	/* 是否可安全用于并行计划？ */
+	int			parallel_workers;	/* 期望的 worker 数；0 表示不并行 */
 
-	/* estimated size/costs for path (see costsize.c for more info) */
-	double		rows;			/* estimated number of result tuples */
-	Cost		startup_cost;	/* cost expended before fetching any tuples */
-	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
+	/* 路径的估计大小/代价（详见 costsize.c） */
+	double		rows;			/* 估计的结果元组数 */
+	Cost		startup_cost;	/* 在获取任何元组前产生的代价 */
+	Cost		total_cost;		/* 总代价（假定获取所有元组） */
 
-	List	   *pathkeys;		/* sort ordering of path's output */
-	/* pathkeys is a List of PathKey nodes; see above */
+	List	   *pathkeys;		/* path 输出的排序顺序 */
+	/* pathkeys 是 PathKey 节点的 List；详见上文 */
 } Path;
 
 /* Macro for extracting a path's parameterization relids; beware double eval */
@@ -1353,31 +1266,26 @@ typedef struct CustomPath
 } CustomPath;
 
 /*
- * AppendPath represents an Append plan, ie, successive execution of
- * several member plans.
+ * AppendPath 表示一个 Append 计划节点，即依次执行多个成员计划。
  *
- * For partial Append, 'subpaths' contains non-partial subpaths followed by
- * partial subpaths.
+ * 对于 partial Append，'subpaths' 包含非 partial 的 subpath，后面跟着 partial 的 subpath。
  *
- * Note: it is possible for "subpaths" to contain only one, or even no,
- * elements.  These cases are optimized during create_append_plan.
- * In particular, an AppendPath with no subpaths is a "dummy" path that
- * is created to represent the case that a relation is provably empty.
- * (This is a convenient representation because it means that when we build
- * an appendrel and find that all its children have been excluded, no extra
- * action is needed to recognize the relation as dummy.)
+ * 注意："subpaths" 可能只包含一个，甚至没有元素。这些情况会在 create_append_plan 中进行优化。
+ * 特别地，一个没有 subpaths 的 AppendPath 是一个“dummy”路径，用于表示关系被证明为空的情况。
+ * （这样表示很方便，因为当我们构建一个 appendrel 并发现所有子节点都被排除时，无需额外操作即可识别该关系为 dummy。）
  */
 typedef struct AppendPath
 {
 	Path		path;
-	/* RT indexes of non-leaf tables in a partition tree */
+	/* 分区树中非叶子表的 RT 索引列表 */
 	List	   *partitioned_rels;
-	List	   *subpaths;		/* list of component Paths */
-	/* Index of first partial path in subpaths; list_length(subpaths) if none */
+	List	   *subpaths;		/* 组件 Path 的列表 */
+	/* subpaths 中第一个 partial path 的索引；若没有则为 list_length(subpaths) */
 	int			first_partial_path;
-	double		limit_tuples;	/* hard limit on output tuples, or -1 */
+	double		limit_tuples;	/* 输出元组的硬限制，或为 -1 表示无限制 */
 } AppendPath;
 
+/* 判断是否为 dummy AppendPath（即 subpaths 为空） */
 #define IS_DUMMY_APPEND(p) \
 	(IsA((p), AppendPath) && ((AppendPath *) (p))->subpaths == NIL)
 
@@ -2067,61 +1975,48 @@ typedef struct PlaceHolderVar
 } PlaceHolderVar;
 
 /*
- * "Special join" info.
+ * "特殊连接"信息。
  *
- * One-sided outer joins constrain the order of joining partially but not
- * completely.  We flatten such joins into the planner's top-level list of
- * relations to join, but record information about each outer join in a
- * SpecialJoinInfo struct.  These structs are kept in the PlannerInfo node's
- * join_info_list.
+ * 单边外连接（one-sided outer joins）部分但不完全约束连接顺序。
+ * 我们将这些连接展平成 planner 的顶层关系列表进行连接，但会在
+ * SpecialJoinInfo 结构体中记录每个外连接的信息。这些结构体存储在
+ * PlannerInfo 节点的 join_info_list 中。
  *
- * Similarly, semijoins and antijoins created by flattening IN (subselect)
- * and EXISTS(subselect) clauses create partial constraints on join order.
- * These are likewise recorded in SpecialJoinInfo structs.
+ * 类似地，通过展平 IN (subselect) 和 EXISTS(subselect) 子句创建的
+ * 半连接（semijoin）和反连接（antijoin）也会对连接顺序产生部分约束。
+ * 这些约束同样记录在 SpecialJoinInfo 结构体中。
  *
- * We make SpecialJoinInfos for FULL JOINs even though there is no flexibility
- * of planning for them, because this simplifies make_join_rel()'s API.
+ * 即使 FULL JOIN 没有灵活的规划方式，我们也会为其创建 SpecialJoinInfo，
+ * 因为这简化了 make_join_rel() 的 API。
  *
- * min_lefthand and min_righthand are the sets of base relids that must be
- * available on each side when performing the special join.  lhs_strict is
- * true if the special join's condition cannot succeed when the LHS variables
- * are all NULL (this means that an outer join can commute with upper-level
- * outer joins even if it appears in their RHS).  We don't bother to set
- * lhs_strict for FULL JOINs, however.
+ * min_lefthand 和 min_righthand 分别是执行特殊连接时每一侧必须可用的
+ * 基表 relids 集合。lhs_strict 为真表示特殊连接条件在 LHS 变量全为 NULL 时
+ * 不可能成立（这意味着外连接即使出现在上层 RHS，也可以与上层外连接交换）。
+ * 但对于 FULL JOIN，我们不会设置 lhs_strict。
  *
- * It is not valid for either min_lefthand or min_righthand to be empty sets;
- * if they were, this would break the logic that enforces join order.
+ * min_lefthand 和 min_righthand 都不能为空集，否则会破坏强制连接顺序的逻辑。
  *
- * syn_lefthand and syn_righthand are the sets of base relids that are
- * syntactically below this special join.  (These are needed to help compute
- * min_lefthand and min_righthand for higher joins.)
+ * syn_lefthand 和 syn_righthand 是在该特殊连接之下语法层面的基表 relids 集合。
+ * （这些用于帮助计算更高层连接的 min_lefthand 和 min_righthand。）
  *
- * delay_upper_joins is set true if we detect a pushed-down clause that has
- * to be evaluated after this join is formed (because it references the RHS).
- * Any outer joins that have such a clause and this join in their RHS cannot
- * commute with this join, because that would leave noplace to check the
- * pushed-down clause.  (We don't track this for FULL JOINs, either.)
+ * delay_upper_joins 若为真，表示检测到一个下推子句必须在该连接形成后才能评估
+ * （因为它引用了 RHS）。任何有此类子句且该连接在其 RHS 的外连接都不能与该连接交换，
+ * 否则会导致无法检查下推子句。（对于 FULL JOIN，我们也不跟踪此项。）
  *
- * For a semijoin, we also extract the join operators and their RHS arguments
- * and set semi_operators, semi_rhs_exprs, semi_can_btree, and semi_can_hash.
- * This is done in support of possibly unique-ifying the RHS, so we don't
- * bother unless at least one of semi_can_btree and semi_can_hash can be set
- * true.  (You might expect that this information would be computed during
- * join planning; but it's helpful to have it available during planning of
- * parameterized table scans, so we store it in the SpecialJoinInfo structs.)
+ * 对于半连接（semijoin），我们还会提取连接操作符及其 RHS 参数，并设置
+ * semi_operators、semi_rhs_exprs、semi_can_btree 和 semi_can_hash。
+ * 这是为了支持对 RHS 唯一化（unique-ifying），所以只有当 semi_can_btree 或
+ * semi_can_hash 至少有一个为真时才会设置这些信息。（你可能认为这些信息应在连接规划时
+ * 计算，但在参数化表扫描规划期间能用到这些信息，因此我们将其存储在 SpecialJoinInfo 中。）
  *
- * jointype is never JOIN_RIGHT; a RIGHT JOIN is handled by switching
- * the inputs to make it a LEFT JOIN.  So the allowed values of jointype
- * in a join_info_list member are only LEFT, FULL, SEMI, or ANTI.
+ * jointype 永远不会是 JOIN_RIGHT；RIGHT JOIN 会通过交换输入变为 LEFT JOIN。
+ * 因此 join_info_list 成员中 jointype 只允许为 LEFT、FULL、SEMI 或 ANTI。
  *
- * For purposes of join selectivity estimation, we create transient
- * SpecialJoinInfo structures for regular inner joins; so it is possible
- * to have jointype == JOIN_INNER in such a structure, even though this is
- * not allowed within join_info_list.  We also create transient
- * SpecialJoinInfos with jointype == JOIN_INNER for outer joins, since for
- * cost estimation purposes it is sometimes useful to know the join size under
- * plain innerjoin semantics.  Note that lhs_strict, delay_upper_joins, and
- * of course the semi_xxx fields are not set meaningfully within such structs.
+ * 为了连接选择性估算，我们会为常规内连接创建临时的 SpecialJoinInfo 结构体；
+ * 所以 jointype == JOIN_INNER 在这种结构体中是可能的，尽管在 join_info_list 中不允许。
+ * 我们也会为外连接创建 jointype == JOIN_INNER 的临时 SpecialJoinInfo，因为在成本估算时
+ * 有时需要知道纯内连接语义下的连接大小。注意 lhs_strict、delay_upper_joins 以及
+ * semi_xxx 字段在这种结构体中没有实际意义。
  */
 #ifndef HAVE_SPECIALJOININFO_TYPEDEF
 typedef struct SpecialJoinInfo SpecialJoinInfo;
@@ -2131,18 +2026,19 @@ typedef struct SpecialJoinInfo SpecialJoinInfo;
 struct SpecialJoinInfo
 {
 	NodeTag		type;
-	Relids		min_lefthand;	/* base relids in minimum LHS for join */
-	Relids		min_righthand;	/* base relids in minimum RHS for join */
-	Relids		syn_lefthand;	/* base relids syntactically within LHS */
-	Relids		syn_righthand;	/* base relids syntactically within RHS */
-	JoinType	jointype;		/* always INNER, LEFT, FULL, SEMI, or ANTI */
-	bool		lhs_strict;		/* joinclause is strict for some LHS rel */
-	bool		delay_upper_joins;	/* can't commute with upper RHS */
-	/* Remaining fields are set only for JOIN_SEMI jointype: */
-	bool		semi_can_btree; /* true if semi_operators are all btree */
-	bool		semi_can_hash;	/* true if semi_operators are all hash */
-	List	   *semi_operators; /* OIDs of equality join operators */
-	List	   *semi_rhs_exprs; /* righthand-side expressions of these ops */
+	Relids		min_lefthand;	/* 连接时左侧必须包含的基表 relids */
+	Relids		min_righthand;	/* 连接时右侧必须包含的基表 relids */
+	Relids		syn_lefthand;	/* 语法层面左侧包含的基表 relids */
+	Relids		syn_righthand;	/* 语法层面右侧包含的基表 relids */
+	JoinType	jointype;		/* 仅为 INNER、LEFT、FULL、SEMI 或 ANTI */
+	bool		lhs_strict;		/* 连接条件对某些 LHS rel 是严格的 */
+	bool		delay_upper_joins;	/* 不能与上层 RHS 交换连接顺序 */
+
+	/* 以下字段仅对 JOIN_SEMI 类型设置： */
+	bool		semi_can_btree; /* 若 semi_operators 全为 btree 操作符则为真 */
+	bool		semi_can_hash;	/* 若 semi_operators 全为 hash 操作符则为真 */
+	List	   *semi_operators; /* 等值连接操作符的 OID 列表 */
+	List	   *semi_rhs_exprs; /* 这些操作符的右侧表达式列表 */
 };
 
 /*

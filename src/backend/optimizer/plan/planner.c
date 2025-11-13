@@ -651,6 +651,11 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 	 * to transform them into joins.  Note that this step does not descend
 	 * into subqueries; if we pull up any subqueries below, their SubLinks are
 	 * processed just before pulling them up.
+	 *
+	 * 在 WHERE 和 JOIN/ON 子句中查找 ANY 和 EXISTS 类型的 SubLink，
+	 * 并尝试将其上拉转换为连接（join）。
+	 * 注意：此步骤不会递归处理子查询；如果后续拉升了子查询，
+	 * 其内部的 SubLink 会在拉升前被处理。
 	 */
 	if (parse->hasSubLinks)
 		pull_up_sublinks(root);
@@ -1791,30 +1796,25 @@ inheritance_planner(PlannerInfo *root)
 
 /*--------------------
  * grouping_planner
- *	  Perform planning steps related to grouping, aggregation, etc.
+ *	  执行与分组、聚合等相关的规划步骤。
  *
- * This function adds all required top-level processing to the scan/join
- * Path(s) produced by query_planner.
+ * 该函数将所有必需的顶层处理添加到由 query_planner 生产的
+ * 扫描/连接 Path(s) 上。
  *
- * If inheritance_update is true, we're being called from inheritance_planner
- * and should not include a ModifyTable step in the resulting Path(s).
- * (inheritance_planner will create a single ModifyTable node covering all the
- * target tables.)
+ * 如果 inheritance_update 为 true，表示该函数由 inheritance_planner
+ * 调用，不应在生成的 Path(s) 中包含 ModifyTable 步骤。
+ * （inheritance_planner 将为所有目标表创建一个单一的 ModifyTable 节点。）
  *
- * tuple_fraction is the fraction of tuples we expect will be retrieved.
- * tuple_fraction is interpreted as follows:
- *	  0: expect all tuples to be retrieved (normal case)
- *	  0 < tuple_fraction < 1: expect the given fraction of tuples available
- *		from the plan to be retrieved
- *	  tuple_fraction >= 1: tuple_fraction is the absolute number of tuples
- *		expected to be retrieved (ie, a LIMIT specification)
+ * tuple_fraction 是我们预期将被检索的元组的比例。
+ * tuple_fraction 的解释如下：
+ *	  0: 预计检索所有元组（正常情况）
+ *	  0 < tuple_fraction < 1: 预计检索计划可用元组的给定比例
+ *	  tuple_fraction >= 1: tuple_fraction 表示预计检索的元组的绝对数量（即 LIMIT）
  *
- * Returns nothing; the useful output is in the Paths we attach to the
- * (UPPERREL_FINAL, NULL) upperrel in *root.  In addition,
- * root->processed_tlist contains the final processed targetlist.
+ * 函数不返回值；有用的输出在 *root 中我们附加到 (UPPERREL_FINAL, NULL)
+ * upperrel 的 Paths 中。另外，root->processed_tlist 包含最终处理的目标列表。
  *
- * Note that we have not done set_cheapest() on the final rel; it's convenient
- * to leave this to the caller.
+ * 注意：我们尚未对最终 rel 执行 set_cheapest()；将这一工作留给调用者更方便。
  *--------------------
  */
 static void
@@ -1835,72 +1835,63 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 	FinalPathExtraData extra;
 	ListCell   *lc;
 
-	/* Tweak caller-supplied tuple_fraction if have LIMIT/OFFSET */
+	/* 如果存在 LIMIT/OFFSET, 调整调用者提供的 tuple_fraction */
 	if (parse->limitCount || parse->limitOffset)
 	{
 		tuple_fraction = preprocess_limit(root, tuple_fraction,
 										  &offset_est, &count_est);
 
 		/*
-		 * If we have a known LIMIT, and don't have an unknown OFFSET, we can
-		 * estimate the effects of using a bounded sort.
+		 * 如果我们有一个已知的 LIMIT，且没有未知的 OFFSET，则可估算
+		 * 有界排序的效果。
 		 */
 		if (count_est > 0 && offset_est >= 0)
 			limit_tuples = (double) count_est + (double) offset_est;
 	}
 
-	/* Make tuple_fraction accessible to lower-level routines */
+	/* 使 tuple_fraction 对低层函数可见 */
 	root->tuple_fraction = tuple_fraction;
 
 	if (parse->setOperations)
 	{
 		/*
-		 * If there's a top-level ORDER BY, assume we have to fetch all the
-		 * tuples.  This might be too simplistic given all the hackery below
-		 * to possibly avoid the sort; but the odds of accurate estimates here
-		 * are pretty low anyway.  XXX try to get rid of this in favor of
-		 * letting plan_set_operations generate both fast-start and
-		 * cheapest-total paths.
+		 * 如果存在顶层 ORDER BY，则假定必须获取所有元组。
+		 * 虽然下面有很多为避免排序而做的特殊处理，但在此处作此简化。
 		 */
 		if (parse->sortClause)
 			root->tuple_fraction = 0.0;
 
 		/*
-		 * Construct Paths for set operations.  The results will not need any
-		 * work except perhaps a top-level sort and/or LIMIT.  Note that any
-		 * special work for recursive unions is the responsibility of
-		 * plan_set_operations.
+		 * 为集合操作构造 Paths。结果通常只需一个顶层排序和/或 LIMIT。
+		 * 注意：递归 union 的特殊工作由 plan_set_operations 负责。
 		 */
 		current_rel = plan_set_operations(root);
 
 		/*
-		 * We should not need to call preprocess_targetlist, since we must be
-		 * in a SELECT query node.  Instead, use the processed_tlist returned
-		 * by plan_set_operations (since this tells whether it returned any
-		 * resjunk columns!), and transfer any sort key information from the
-		 * original tlist.
+		 * 我们不应需要调用 preprocess_targetlist，因为我们必须处于 SELECT
+		 * 查询节点。使用 plan_set_operations 返回的 processed_tlist（复制）
+		 * 并从原始 tlist 转移任何排序键信息。
 		 */
 		Assert(parse->commandType == CMD_SELECT);
 
-		/* for safety, copy processed_tlist instead of modifying in-place */
+		/* 为安全起见，复制 processed_tlist 而不是直接修改 */
 		root->processed_tlist =
 			postprocess_setop_tlist(copyObject(root->processed_tlist),
 									parse->targetList);
 
-		/* Also extract the PathTarget form of the setop result tlist */
+		/* 也提取 setop 结果 tlist 的 PathTarget 形式 */
 		final_target = current_rel->cheapest_total_path->pathtarget;
 
-		/* And check whether it's parallel safe */
+		/* 并检查其是否并行安全 */
 		final_target_parallel_safe =
 			is_parallel_safe(root, (Node *) final_target->exprs);
 
-		/* The setop result tlist couldn't contain any SRFs */
+		/* setop 结果 tlist 不会包含任何 SRF */
 		Assert(!parse->hasTargetSRFs);
 		final_targets = final_targets_contain_srfs = NIL;
 
 		/*
-		 * Can't handle FOR [KEY] UPDATE/SHARE here (parser should have
-		 * checked already, but let's make sure).
+		 * 这里不能处理 FOR [KEY] UPDATE/SHARE（解析器应已检查，但再加以确认）。
 		 */
 		if (parse->rowMarks)
 			ereport(ERROR,
@@ -1912,7 +1903,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 													   parse->rowMarks)->strength))));
 
 		/*
-		 * Calculate pathkeys that represent result ordering requirements
+		 * 计算表示结果排序要求的 pathkeys
 		 */
 		Assert(parse->distinctClause == NIL);
 		root->sort_pathkeys = make_pathkeys_for_sortclauses(root,
@@ -1921,7 +1912,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 	}
 	else
 	{
-		/* No set operations, do regular planning */
+		/* 非集合操作，执行常规规划 */
 		PathTarget *sort_input_target;
 		List	   *sort_input_targets;
 		List	   *sort_input_targets_contain_srfs;
@@ -1942,42 +1933,32 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		grouping_sets_data *gset_data = NULL;
 		standard_qp_extra qp_extra;
 
-		/* A recursive query should always have setOperations */
+		/* 递归查询应始终具有 setOperations */
 		Assert(!root->hasRecursion);
 
-		/* Preprocess grouping sets and GROUP BY clause, if any */
+		/* 预处理 grouping sets 和 GROUP BY 子句（如有） */
 		if (parse->groupingSets)
 		{
 			gset_data = preprocess_grouping_sets(root);
 		}
 		else
 		{
-			/* Preprocess regular GROUP BY clause, if any */
+			/* 预处理常规 GROUP BY 子句（如有） */
 			if (parse->groupClause)
 				parse->groupClause = preprocess_groupclause(root, NIL);
 		}
 
 		/*
-		 * Preprocess targetlist.  Note that much of the remaining planning
-		 * work will be done with the PathTarget representation of tlists, but
-		 * we must also maintain the full representation of the final tlist so
-		 * that we can transfer its decoration (resnames etc) to the topmost
-		 * tlist of the finished Plan.  This is kept in processed_tlist.
+		 * 预处理 targetlist。虽然剩余多数规划工作使用 PathTarget 表示，
+		 * 但仍需保留最终 tlist 的完整表示以便在生成的 Plan 顶层保留修饰
+		 * （例如 resnames 等）。
 		 */
 		root->processed_tlist = preprocess_targetlist(root);
 
 		/*
-		 * Collect statistics about aggregates for estimating costs, and mark
-		 * all the aggregates with resolved aggtranstypes.  We must do this
-		 * before slicing and dicing the tlist into various pathtargets, else
-		 * some copies of the Aggref nodes might escape being marked with the
-		 * correct transtypes.
-		 *
-		 * Note: currently, we do not detect duplicate aggregates here.  This
-		 * may result in somewhat-overestimated cost, which is fine for our
-		 * purposes since all Paths will get charged the same.  But at some
-		 * point we might wish to do that detection in the planner, rather
-		 * than during executor startup.
+		 * 收集聚合的统计信息用于估算成本，并标记所有 Aggref 的 aggtranstype。
+		 * 必须在将 tlist 拆分成各种 pathtarget 之前完成，否则某些 Aggref
+		 * 的副本可能逃过正确标记。
 		 */
 		MemSet(&agg_costs, 0, sizeof(AggClauseCosts));
 		if (parse->hasAggs)
@@ -1989,10 +1970,8 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * Locate any window functions in the tlist.  (We don't need to look
-		 * anywhere else, since expressions used in ORDER BY will be in there
-		 * too.)  Note that they could all have been eliminated by constant
-		 * folding, in which case we don't need to do any more work.
+		 * 在 tlist 中查找窗口函数（也会包含 ORDER BY 使用的表达式）。
+		 * 注意它们可能已被常量折叠移除。
 		 */
 		if (parse->hasWindowFuncs)
 		{
@@ -2005,19 +1984,16 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * Preprocess MIN/MAX aggregates, if any.  Note: be careful about
-		 * adding logic between here and the query_planner() call.  Anything
-		 * that is needed in MIN/MAX-optimizable cases will have to be
-		 * duplicated in planagg.c.
+		 * 预处理 MIN/MAX 聚合（如有）。注意：在此与调用 query_planner()
+		 * 之间不要添加需要在 planagg.c 中重复的逻辑。
 		 */
 		if (parse->hasAggs)
 			preprocess_minmax_aggregates(root);
 
 		/*
-		 * Figure out whether there's a hard limit on the number of rows that
-		 * query_planner's result subplan needs to return.  Even if we know a
-		 * hard limit overall, it doesn't apply if the query has any
-		 * grouping/aggregation operations, or SRFs in the tlist.
+		 * 确定 query_planner 的结果子计划需要返回的行数上限。
+		 * 即使我们总体上知道上限，如果查询包含任何分组/聚合操作或
+		 * tlist 中的 SRF，则该上限不适用。
 		 */
 		if (parse->groupClause ||
 			parse->groupingSets ||
@@ -2030,38 +2006,32 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		else
 			root->limit_tuples = limit_tuples;
 
-		/* Set up data needed by standard_qp_callback */
+		/* 为 standard_qp_callback 设置所需数据 */
 		qp_extra.activeWindows = activeWindows;
 		qp_extra.groupClause = (gset_data
 								? (gset_data->rollups ? linitial_node(RollupData, gset_data->rollups)->groupClause : NIL)
 								: parse->groupClause);
 
 		/*
-		 * Generate the best unsorted and presorted paths for the scan/join
-		 * portion of this Query, ie the processing represented by the
-		 * FROM/WHERE clauses.  (Note there may not be any presorted paths.)
-		 * We also generate (in standard_qp_callback) pathkey representations
-		 * of the query's sort clause, distinct clause, etc.
+		 * 为 FROM/WHERE 部分生成最佳的未排序和预排序路径（query_planner 会调用 standard_qp_callback
+		 * 来生成 pathkeys 表示）。可能不存在任何预排序路径。
 		 */
 		current_rel = query_planner(root, standard_qp_callback, &qp_extra);
 
 		/*
-		 * Convert the query's result tlist into PathTarget format.
+		 * 将查询的结果 tlist 转换为 PathTarget 形式。
 		 *
-		 * Note: this cannot be done before query_planner() has performed
-		 * appendrel expansion, because that might add resjunk entries to
-		 * root->processed_tlist.  Waiting till afterwards is also helpful
-		 * because the target width estimates can use per-Var width numbers
-		 * that were obtained within query_planner().
+		 * 注意：这不能在 query_planner() 之前完成，因为 appendrel 展开可能会在
+		 * root->processed_tlist 中添加 resjunk 条目。等待到此刻也有利于使用
+		 * query_planner() 中获得的每个 Var 的宽度估计。
 		 */
 		final_target = create_pathtarget(root, root->processed_tlist);
 		final_target_parallel_safe =
 			is_parallel_safe(root, (Node *) final_target->exprs);
 
 		/*
-		 * If ORDER BY was given, consider whether we should use a post-sort
-		 * projection, and compute the adjusted target for preceding steps if
-		 * so.
+		 * 如果给出了 ORDER BY，考虑是否应使用后置投影，并在需要时计算
+		 * 前序步骤的调整后目标。
 		 */
 		if (parse->sortClause)
 		{
@@ -2078,9 +2048,8 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * If we have window functions to deal with, the output from any
-		 * grouping step needs to be what the window functions want;
-		 * otherwise, it should be sort_input_target.
+		 * 如果有窗口函数，则任何分组步骤的输出应满足窗口函数的要求；
+		 * 否则应为 sort_input_target。
 		 */
 		if (activeWindows)
 		{
@@ -2097,9 +2066,8 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * If we have grouping or aggregation to do, the topmost scan/join
-		 * plan node must emit what the grouping step wants; otherwise, it
-		 * should emit grouping_target.
+		 * 如果需要分组或聚合，顶层扫描/连接计划节点必须产生 grouping_target；
+		 * 否则应产生 grouping_target（对没有分组的情况两者相同）。
 		 */
 		have_grouping = (parse->groupClause || parse->groupingSets ||
 						 parse->hasAggs || root->hasHavingQual);
@@ -2116,32 +2084,31 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * If there are any SRFs in the targetlist, we must separate each of
-		 * these PathTargets into SRF-computing and SRF-free targets.  Replace
-		 * each of the named targets with a SRF-free version, and remember the
-		 * list of additional projection steps we need to add afterwards.
+		 * 如果 targetlist 中有 SRF，必须将每个 PathTarget 划分为 SRF 计算部分
+		 * 与 SRF-free 部分。用不含 SRF 的版本替换每个命名目标，并记住
+		 * 以后需要添加的投影步骤列表。
 		 */
 		if (parse->hasTargetSRFs)
 		{
-			/* final_target doesn't recompute any SRFs in sort_input_target */
+			/* final_target 不会重新计算 sort_input_target 中的任何 SRF */
 			split_pathtarget_at_srfs(root, final_target, sort_input_target,
 									 &final_targets,
 									 &final_targets_contain_srfs);
 			final_target = linitial_node(PathTarget, final_targets);
 			Assert(!linitial_int(final_targets_contain_srfs));
-			/* likewise for sort_input_target vs. grouping_target */
+			/* 同样处理 sort_input_target 与 grouping_target 之间的关系 */
 			split_pathtarget_at_srfs(root, sort_input_target, grouping_target,
 									 &sort_input_targets,
 									 &sort_input_targets_contain_srfs);
 			sort_input_target = linitial_node(PathTarget, sort_input_targets);
 			Assert(!linitial_int(sort_input_targets_contain_srfs));
-			/* likewise for grouping_target vs. scanjoin_target */
+			/* 同样处理 grouping_target 与 scanjoin_target 之间的关系 */
 			split_pathtarget_at_srfs(root, grouping_target, scanjoin_target,
 									 &grouping_targets,
 									 &grouping_targets_contain_srfs);
 			grouping_target = linitial_node(PathTarget, grouping_targets);
 			Assert(!linitial_int(grouping_targets_contain_srfs));
-			/* scanjoin_target will not have any SRFs precomputed for it */
+			/* scanjoin_target 不会有任何预计算的 SRF */
 			split_pathtarget_at_srfs(root, scanjoin_target, NULL,
 									 &scanjoin_targets,
 									 &scanjoin_targets_contain_srfs);
@@ -2150,7 +2117,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 		else
 		{
-			/* initialize lists; for most of these, dummy values are OK */
+			/* 初始化列表；对多数情况，哑值是可以接受的 */
 			final_targets = final_targets_contain_srfs = NIL;
 			sort_input_targets = sort_input_targets_contain_srfs = NIL;
 			grouping_targets = grouping_targets_contain_srfs = NIL;
@@ -2158,7 +2125,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 			scanjoin_targets_contain_srfs = NIL;
 		}
 
-		/* Apply scan/join target. */
+		/* 应用 scan/join 目标到路径上 */
 		scanjoin_target_same_exprs = list_length(scanjoin_targets) == 1
 			&& equal(scanjoin_target->exprs, current_rel->reltarget->exprs);
 		apply_scanjoin_target_to_paths(root, current_rel, scanjoin_targets,
@@ -2167,11 +2134,9 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 									   scanjoin_target_same_exprs);
 
 		/*
-		 * Save the various upper-rel PathTargets we just computed into
-		 * root->upper_targets[].  The core code doesn't use this, but it
-		 * provides a convenient place for extensions to get at the info.  For
-		 * consistency, we save all the intermediate targets, even though some
-		 * of the corresponding upperrels might not be needed for this query.
+		 * 将刚计算的各个 upper-rel PathTargets 保存到 root->upper_targets[] 中。
+		 * 核心代码不上层使用它，但扩展可以从这里获取信息。为一致性，
+		 * 保存所有中间目标，即使某些对应的 upperrels 对于该查询可能不需要。
 		 */
 		root->upper_targets[UPPERREL_FINAL] = final_target;
 		root->upper_targets[UPPERREL_ORDERED] = final_target;
@@ -2180,9 +2145,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		root->upper_targets[UPPERREL_GROUP_AGG] = grouping_target;
 
 		/*
-		 * If we have grouping and/or aggregation, consider ways to implement
-		 * that.  We build a new upperrel representing the output of this
-		 * phase.
+		 * 如果需要分组和/或聚合，考虑实现方式。构建一个表示该阶段输出的 upperrel。
 		 */
 		if (have_grouping)
 		{
@@ -2192,7 +2155,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 												grouping_target_parallel_safe,
 												&agg_costs,
 												gset_data);
-			/* Fix things up if grouping_target contains SRFs */
+			/* 如果 grouping_target 包含 SRF，修正路径 */
 			if (parse->hasTargetSRFs)
 				adjust_paths_for_srfs(root, current_rel,
 									  grouping_targets,
@@ -2200,8 +2163,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * If we have window functions, consider ways to implement those.  We
-		 * build a new upperrel representing the output of this phase.
+		 * 如果有窗口函数，考虑如何实现这些函数。构建一个表示该阶段输出的 upperrel。
 		 */
 		if (activeWindows)
 		{
@@ -2212,7 +2174,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 											  sort_input_target_parallel_safe,
 											  wflists,
 											  activeWindows);
-			/* Fix things up if sort_input_target contains SRFs */
+			/* 如果 sort_input_target 包含 SRF，修正路径 */
 			if (parse->hasTargetSRFs)
 				adjust_paths_for_srfs(root, current_rel,
 									  sort_input_targets,
@@ -2220,8 +2182,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * If there is a DISTINCT clause, consider ways to implement that. We
-		 * build a new upperrel representing the output of this phase.
+		 * 如果有 DISTINCT 子句，考虑如何实现。构建一个表示该阶段输出的 upperrel。
 		 */
 		if (parse->distinctClause)
 		{
@@ -2231,11 +2192,9 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 	}							/* end of if (setOperations) */
 
 	/*
-	 * If ORDER BY was given, consider ways to implement that, and generate a
-	 * new upperrel containing only paths that emit the correct ordering and
-	 * project the correct final_target.  We can apply the original
-	 * limit_tuples limit in sort costing here, but only if there are no
-	 * postponed SRFs.
+	 * 如果存在 ORDER BY，考虑如何实现该排序，并生成一个新的 upperrel，
+	 * 其中只包含发出正确排序且投影到 final_target 的路径。
+	 * 在排序成本估算中可以应用原始的 limit_tuples 上限，但仅当没有推迟的 SRF 时才可。
 	 */
 	if (parse->sortClause)
 	{
@@ -2245,7 +2204,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 										   final_target_parallel_safe,
 										   have_postponed_srfs ? -1.0 :
 										   limit_tuples);
-		/* Fix things up if final_target contains SRFs */
+		/* 如果 final_target 包含 SRF，修正路径 */
 		if (parse->hasTargetSRFs)
 			adjust_paths_for_srfs(root, current_rel,
 								  final_targets,
@@ -2253,16 +2212,14 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 	}
 
 	/*
-	 * Now we are prepared to build the final-output upperrel.
+	 * 现在准备构建最终输出的 upperrel。
 	 */
 	final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
 
 	/*
-	 * If the input rel is marked consider_parallel and there's nothing that's
-	 * not parallel-safe in the LIMIT clause, then the final_rel can be marked
-	 * consider_parallel as well.  Note that if the query has rowMarks or is
-	 * not a SELECT, consider_parallel will be false for every relation in the
-	 * query.
+	 * 如果输入 rel 标记为 consider_parallel 且 LIMIT 子句中没有不并行安全的内容，
+	 * 则 final_rel 也可以标记为 consider_parallel。注意如果查询有 rowMarks 或不是 SELECT，
+	 * 则查询中每个关系的 consider_parallel 都为 false。
 	 */
 	if (current_rel->consider_parallel &&
 		is_parallel_safe(root, parse->limitOffset) &&
@@ -2270,7 +2227,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		final_rel->consider_parallel = true;
 
 	/*
-	 * If the current_rel belongs to a single FDW, so does the final_rel.
+	 * 如果 current_rel 属于单个 FDW，则 final_rel 也同样属于该 FDW。
 	 */
 	final_rel->serverid = current_rel->serverid;
 	final_rel->userid = current_rel->userid;
@@ -2278,19 +2235,16 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 	final_rel->fdwroutine = current_rel->fdwroutine;
 
 	/*
-	 * Generate paths for the final_rel.  Insert all surviving paths, with
-	 * LockRows, Limit, and/or ModifyTable steps added if needed.
+	 * 为 final_rel 生成路径。插入所有保留下来的路径，并在需要时添加
+	 * LockRows、Limit 和/或 ModifyTable 步骤。
 	 */
 	foreach(lc, current_rel->pathlist)
 	{
 		Path	   *path = (Path *) lfirst(lc);
 
 		/*
-		 * If there is a FOR [KEY] UPDATE/SHARE clause, add the LockRows node.
-		 * (Note: we intentionally test parse->rowMarks not root->rowMarks
-		 * here.  If there are only non-locking rowmarks, they should be
-		 * handled by the ModifyTable node instead.  However, root->rowMarks
-		 * is what goes into the LockRows node.)
+		 * 如果存在 FOR [KEY] UPDATE/SHARE 子句，添加 LockRows 节点。
+		 * （注意：我们有意测试 parse->rowMarks 而不是 root->rowMarks。）
 		 */
 		if (parse->rowMarks)
 		{
@@ -2300,7 +2254,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * If there is a LIMIT/OFFSET clause, add the LIMIT node.
+		 * 如果存在 LIMIT/OFFSET 子句，添加 LIMIT 节点。
 		 */
 		if (limit_needed(parse))
 		{
@@ -2311,8 +2265,8 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		}
 
 		/*
-		 * If this is an INSERT/UPDATE/DELETE, and we're not being called from
-		 * inheritance_planner, add the ModifyTable node.
+		 * 如果这是 INSERT/UPDATE/DELETE，且我们不是从 inheritance_planner 调用，
+		 * 则添加 ModifyTable 节点。
 		 */
 		if (parse->commandType != CMD_SELECT && !inheritance_update)
 		{
@@ -2322,8 +2276,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 			List	   *rowMarks;
 
 			/*
-			 * If target is a partition root table, we need to mark the
-			 * ModifyTable node appropriately for that.
+			 * 如果目标是分区根表，需要相应地标记 ModifyTable 节点。
 			 */
 			if (rt_fetch(parse->resultRelation, parse->rtable)->relkind ==
 				RELKIND_PARTITIONED_TABLE)
@@ -2332,8 +2285,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 				rootRelation = 0;
 
 			/*
-			 * Set up the WITH CHECK OPTION and RETURNING lists-of-lists, if
-			 * needed.
+			 * 设置 WITH CHECK OPTION 和 RETURNING 的列表（按关系分组），如需要。
 			 */
 			if (parse->withCheckOptions)
 				withCheckOptionLists = list_make1(parse->withCheckOptions);
@@ -2346,9 +2298,8 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 				returningLists = NIL;
 
 			/*
-			 * If there was a FOR [KEY] UPDATE/SHARE clause, the LockRows node
-			 * will have dealt with fetching non-locked marked rows, else we
-			 * need to have ModifyTable do that.
+			 * 如果有 FOR [KEY] UPDATE/SHARE，LockRows 节点已处理要提取的非锁定标记行，
+			 * 否则由 ModifyTable 处理。
 			 */
 			if (parse->rowMarks)
 				rowMarks = NIL;
@@ -2372,13 +2323,13 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 										assign_special_exec_param(root));
 		}
 
-		/* And shove it into final_rel */
+		/* 将其放入 final_rel */
 		add_path(final_rel, path);
 	}
 
 	/*
-	 * Generate partial paths for final_rel, too, if outer query levels might
-	 * be able to make use of them.
+	 * 如果最终 rel 可并行，并且外层查询级别可能使用它们，则也为 final_rel
+	 * 生成 partial paths。
 	 */
 	if (final_rel->consider_parallel && root->query_level > 1 &&
 		!limit_needed(parse))
@@ -2398,8 +2349,7 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 	extra.offset_est = offset_est;
 
 	/*
-	 * If there is an FDW that's responsible for all baserels of the query,
-	 * let it consider adding ForeignPaths.
+	 * 如果有 FDW 负责查询的所有基表，让其考虑添加 ForeignPaths。
 	 */
 	if (final_rel->fdwroutine &&
 		final_rel->fdwroutine->GetForeignUpperPaths)
@@ -2407,12 +2357,12 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 													current_rel, final_rel,
 													&extra);
 
-	/* Let extensions possibly add some more paths */
+	/* 允许扩展可能添加更多路径 */
 	if (create_upper_paths_hook)
 		(*create_upper_paths_hook) (root, UPPERREL_FINAL,
 									current_rel, final_rel, &extra);
 
-	/* Note: currently, we leave it to callers to do set_cheapest() */
+	/* 注意：当前我们让调用者执行 set_cheapest() */
 }
 
 /*

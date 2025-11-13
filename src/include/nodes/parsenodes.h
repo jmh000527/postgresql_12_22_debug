@@ -96,89 +96,82 @@ typedef uint32 AclMode;			/* a bitmask of privilege bits */
 
 /*
  * Query -
- *	  Parse analysis turns all statements into a Query tree
- *	  for further processing by the rewriter and planner.
+ *	  解析分析将所有语句转换为 Query 树供重写器和规划器使用。
  *
- *	  Utility statements (i.e. non-optimizable statements) have the
- *	  utilityStmt field set, and the rest of the Query is mostly dummy.
+ *	  对于实用语句（即不可优化的语句），utilityStmt 字段被设置，
+ *	  其余 Query 字段在许多情况下是无效的。
  *
- *	  Planning converts a Query tree into a Plan tree headed by a PlannedStmt
- *	  node --- the Query structure is not used by the executor.
+ *	  规划阶段将 Query 树转换为以 PlannedStmt 为头的 Plan 树 —— 执行器不直接使用 Query。
  */
 typedef struct Query
 {
 	NodeTag		type;
 
-	CmdType		commandType;	/* select|insert|update|delete|utility */
+	CmdType		commandType;	/* 命令类型：SELECT/INSERT/UPDATE/DELETE/UTILITY */
 
-	QuerySource querySource;	/* where did I come from? */
+	QuerySource querySource;	/* 查询来源（我来自哪里） */
 
-	uint64		queryId;		/* query identifier (can be set by plugins) */
+	uint64		queryId;		/* 查询标识（可由插件设置） */
 
-	bool		canSetTag;		/* do I set the command result tag? */
+	bool		canSetTag;		/* 是否设置命令结果标签 */
 
-	Node	   *utilityStmt;	/* non-null if commandType == CMD_UTILITY */
+	Node	   *utilityStmt;	/* 若为实用命令则指向对应语句，否则为 NULL */
 
-	int			resultRelation; /* rtable index of target relation for
-								 * INSERT/UPDATE/DELETE; 0 for SELECT */
+	int			resultRelation; /* 目标关系在 rtable 中的索引（INSERT/UPDATE/DELETE），SELECT 为 0 */
 
-	bool		hasAggs;		/* has aggregates in tlist or havingQual */
-	bool		hasWindowFuncs; /* has window functions in tlist */
-	bool		hasTargetSRFs;	/* has set-returning functions in tlist */
-	bool		hasSubLinks;	/* has subquery SubLink */
-	bool		hasDistinctOn;	/* distinctClause is from DISTINCT ON */
-	bool		hasRecursive;	/* WITH RECURSIVE was specified */
-	bool		hasModifyingCTE;	/* has INSERT/UPDATE/DELETE in WITH */
-	bool		hasForUpdate;	/* FOR [KEY] UPDATE/SHARE was specified */
-	bool		hasRowSecurity; /* rewriter has applied some RLS policy */
+	bool		hasAggs;		/* tlist 或 having 是否含有聚合 */
+	bool		hasWindowFuncs; /* tlist 中是否含有窗口函数 */
+	bool		hasTargetSRFs;	/* tlist 中是否含有集合返回函数 */
+	bool		hasSubLinks;	/* 是否包含子查询 SubLink */
+	bool		hasDistinctOn;	/* distinctClause 是否来自 DISTINCT ON */
+	bool		hasRecursive;	/* 是否指定了 WITH RECURSIVE */
+	bool		hasModifyingCTE;/* WITH 中是否包含 INSERT/UPDATE/DELETE 等修改操作 */
+	bool		hasForUpdate;	/* 是否指定了 FOR [KEY] UPDATE/SHARE */
+	bool		hasRowSecurity; /* 重写器是否已应用行级安全策略 */
 
-	List	   *cteList;		/* WITH list (of CommonTableExpr's) */
+	List	   *cteList;		/* WITH 列表（CommonTableExpr 列表） */
 
-	List	   *rtable;			/* list of range table entries */
-	FromExpr   *jointree;		/* table join tree (FROM and WHERE clauses) */
+	List	   *rtable;			/* 范围表条目列表（RangeTblEntry 列表） */
+	FromExpr   *jointree;		/* 表连接树（FROM 和 WHERE 子句） */
 
-	List	   *targetList;		/* target list (of TargetEntry) */
+	List	   *targetList;		/* 目标列表（TargetEntry 列表） */
 
-	OverridingKind override;	/* OVERRIDING clause */
+	OverridingKind override;	/* OVERRIDING 子句 */
 
 	OnConflictExpr *onConflict; /* ON CONFLICT DO [NOTHING | UPDATE] */
 
-	List	   *returningList;	/* return-values list (of TargetEntry) */
+	List	   *returningList;	/* RETURNING 列表（TargetEntry 列表） */
 
-	List	   *groupClause;	/* a list of SortGroupClause's */
+	List	   *groupClause;	/* GROUP BY 列表（SortGroupClause 列表） */
 
-	List	   *groupingSets;	/* a list of GroupingSet's if present */
+	List	   *groupingSets;	/* grouping sets 列表（若存在） */
 
-	Node	   *havingQual;		/* qualifications applied to groups */
+	Node	   *havingQual;		/* HAVING 条件 */
 
-	List	   *windowClause;	/* a list of WindowClause's */
+	List	   *windowClause;	/* WINDOW/OVER 子句列表 */
 
-	List	   *distinctClause; /* a list of SortGroupClause's */
+	List	   *distinctClause; /* DISTINCT/DISTINCT ON 列表（SortGroupClause 列表） */
 
-	List	   *sortClause;		/* a list of SortGroupClause's */
+	List	   *sortClause;		/* ORDER BY 列表（SortGroupClause 列表） */
 
-	Node	   *limitOffset;	/* # of result tuples to skip (int8 expr) */
-	Node	   *limitCount;		/* # of result tuples to return (int8 expr) */
+	Node	   *limitOffset;	/* OFFSET 表达式（跳过的行数，int8 expr） */
+	Node	   *limitCount;		/* LIMIT 表达式（返回的行数，int8 expr） */
 
-	List	   *rowMarks;		/* a list of RowMarkClause's */
+	List	   *rowMarks;		/* FOR UPDATE/SHARE 的 RowMarkClause 列表 */
 
-	Node	   *setOperations;	/* set-operation tree if this is top level of
-								 * a UNION/INTERSECT/EXCEPT query */
+	Node	   *setOperations;	/* 并/交/差 操作树（若为顶层的 UNION/INTERSECT/EXCEPT 查询） */
 
-	List	   *constraintDeps; /* a list of pg_constraint OIDs that the query
-								 * depends on to be semantically valid */
+	List	   *constraintDeps; /* 查询语义上依赖的 pg_constraint OID 列表 */
 
-	List	   *withCheckOptions;	/* a list of WithCheckOption's (added
-									 * during rewrite) */
+	List	   *withCheckOptions;	/* WITH CHECK OPTION 列表（在重写期间添加） */
 
 	/*
-	 * The following two fields identify the portion of the source text string
-	 * containing this query.  They are typically only populated in top-level
-	 * Queries, not in sub-queries.  When not set, they might both be zero, or
-	 * both be -1 meaning "unknown".
+	 * 下列两个字段标识源文本字符串中包含此查询的部分。
+	 * 它们通常只在顶层 Query 中被填充，而在子查询中通常未设置。
+	 * 未设置时，可能都为 0，或都为 -1 表示“未知”。
 	 */
-	int			stmt_location;	/* start location, or -1 if unknown */
-	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+	int			stmt_location;	/* 起始位置，或 -1 表示未知 */
+	int			stmt_len;		/* 字节长度；0 表示“到字符串末尾” */
 } Query;
 
 
@@ -866,245 +859,197 @@ typedef struct PartitionCmd
 
 /*--------------------
  * RangeTblEntry -
- *	  A range table is a List of RangeTblEntry nodes.
+ *	  范围表是由 RangeTblEntry 节点组成的 List。
  *
- *	  A range table entry may represent a plain relation, a sub-select in
- *	  FROM, or the result of a JOIN clause.  (Only explicit JOIN syntax
- *	  produces an RTE, not the implicit join resulting from multiple FROM
- *	  items.  This is because we only need the RTE to deal with SQL features
- *	  like outer joins and join-output-column aliasing.)  Other special
- *	  RTE types also exist, as indicated by RTEKind.
+ *	  一个范围表项可以表示一个普通关系、FROM 子句中的子查询，或 JOIN 子句的结果。
+ *	  （只有显式的 JOIN 语法会产生 RTE，不会因为多个 FROM 项导致隐式 join 而产生。
+ *	  这是因为我们只需要 RTE 来处理诸如外连接和连接输出列别名等 SQL 特性。）
+ *	  其他特殊的 RTE 类型也存在，如 RTEKind 所示。
  *
- *	  Note that we consider RTE_RELATION to cover anything that has a pg_class
- *	  entry.  relkind distinguishes the sub-cases.
+ *	  注意我们将 RTE_RELATION 视为覆盖任何在 pg_class 中有条目的对象。
+ *	  relkind 用于区分子类型。
  *
- *	  alias is an Alias node representing the AS alias-clause attached to the
- *	  FROM expression, or NULL if no clause.
+ *	  alias 是表示附加在 FROM 表达式上的 AS 别名子句的 Alias 节点，
+ *	  如果没有别名子句则为 NULL。
  *
- *	  eref is the table reference name and column reference names (either
- *	  real or aliases).  Note that system columns (OID etc) are not included
- *	  in the column list.
- *	  eref->aliasname is required to be present, and should generally be used
- *	  to identify the RTE for error messages etc.
+ *	  eref 是表引用名和列引用名（可以是真实名或别名）。注意系统列（如 OID 等）
+ *	  不包含在列列表中。eref->aliasname 必须存在，通常用于错误信息等地方标识 RTE。
  *
- *	  In RELATION RTEs, the colnames in both alias and eref are indexed by
- *	  physical attribute number; this means there must be colname entries for
- *	  dropped columns.  When building an RTE we insert empty strings ("") for
- *	  dropped columns.  Note however that a stored rule may have nonempty
- *	  colnames for columns dropped since the rule was created (and for that
- *	  matter the colnames might be out of date due to column renamings).
- *	  The same comments apply to FUNCTION RTEs when a function's return type
- *	  is a named composite type.
+ *	  在 RELATION RTE 中，alias 和 eref 中的 colnames 是按物理属性编号索引的；
+ *	  这意味着对于被删除的列也必须有 colname 条目。构建 RTE 时对于被删除的列
+ *	  我们会插入空字符串("") 作为占位。然而，存储的规则可能包含自规则创建以来已删除列的非空 colnames
+ *	  （并且在列重命名后这些 colnames 也可能过时）。对于函数返回命名的复合类型时，也适用相同的注释。
  *
- *	  In JOIN RTEs, the colnames in both alias and eref are one-to-one with
- *	  joinaliasvars entries.  A JOIN RTE will omit columns of its inputs when
- *	  those columns are known to be dropped at parse time.  Again, however,
- *	  a stored rule might contain entries for columns dropped since the rule
- *	  was created.  (This is only possible for columns not actually referenced
- *	  in the rule.)  When loading a stored rule, we replace the joinaliasvars
- *	  items for any such columns with null pointers.  (We can't simply delete
- *	  them from the joinaliasvars list, because that would affect the attnums
- *	  of Vars referencing the rest of the list.)
+ *	  在 JOIN RTE 中，alias 和 eref 中的 colnames 与 joinaliasvars 条目一一对应。
+ *	  JOIN RTE 在解析时会省略其输入中已知被删除的列。但是，存储的规则仍可能包含自规则创建以来被删除列的条目
+ *	  （对于规则中未实际引用的列才可能出现这种情况）。从存储的规则加载时，我们会将这类列在 joinaliasvars 中的条目替换为 NULL 指针。
+ *	  （我们不能简单地从 joinaliasvars 列表中删除它们，因为那会影响引用其余列表项的 Vars 的 attnums。）
+ *	  一旦开始规划，joinaliasvars 的项可能变得几乎任意，这是子查询扁平化替换的结果。
  *
- *	  inh is true for relation references that should be expanded to include
- *	  inheritance children, if the rel has any.  This *must* be false for
- *	  RTEs other than RTE_RELATION entries.
+ *	  inh 对于应该扩展为包含继承子表的关系引用为 true（如果该 rel 有继承子表）。
+ *	  对于非 RTE_RELATION 条目此字段必须为 false。
  *
- *	  inFromCl marks those range variables that are listed in the FROM clause.
- *	  It's false for RTEs that are added to a query behind the scenes, such
- *	  as the NEW and OLD variables for a rule, or the subqueries of a UNION.
- *	  This flag is not used during parsing (except in transformLockingClause,
- *	  q.v.); the parser now uses a separate "namespace" data structure to
- *	  control visibility.  But it is needed by ruleutils.c to determine
- *	  whether RTEs should be shown in decompiled queries.
+ *	  inFromCl 标记那些出现在 FROM 子句中的范围变量。对于在查询背后添加的 RTE（例如规则的 NEW 和 OLD 变量，
+ *	  或 UNION 的子查询），此标志为 false。这个标志在解析期间（除 transformLockingClause 外）未被使用；
+ *	  解析器现在使用单独的“命名空间”数据结构来控制可见性。但 ruleutils.c 需要此标志来决定在反编译查询时是否应显示 RTE。
  *
- *	  requiredPerms and checkAsUser specify run-time access permissions
- *	  checks to be performed at query startup.  The user must have *all*
- *	  of the permissions that are OR'd together in requiredPerms (zero
- *	  indicates no permissions checking).  If checkAsUser is not zero,
- *	  then do the permissions checks using the access rights of that user,
- *	  not the current effective user ID.  (This allows rules to act as
- *	  setuid gateways.)  Permissions checks only apply to RELATION RTEs.
+ *	  requiredPerms 和 checkAsUser 指定在查询启动时要执行的运行时访问权限检查。
+ *	  用户必须拥有在 requiredPerms 中按位 OR 的所有权限（零表示不检查权限）。
+ *	  如果 checkAsUser 非零，则使用该用户的访问权限来执行检查，而不是使用当前有效用户 ID。
+ *	  （这允许规则充当 setuid 网关。）权限检查仅适用于 RELATION RTEs。
  *
- *	  For SELECT/INSERT/UPDATE permissions, if the user doesn't have
- *	  table-wide permissions then it is sufficient to have the permissions
- *	  on all columns identified in selectedCols (for SELECT) and/or
- *	  insertedCols and/or updatedCols (INSERT with ON CONFLICT DO UPDATE may
- *	  have all 3).  selectedCols, insertedCols and updatedCols are bitmapsets,
- *	  which cannot have negative integer members, so we subtract
- *	  FirstLowInvalidHeapAttributeNumber from column numbers before storing
- *	  them in these fields.  A whole-row Var reference is represented by
- *	  setting the bit for InvalidAttrNumber.
+ *	  对于 SELECT/INSERT/UPDATE 权限，如果用户没有表级权限，则当且仅当在 selectedCols（用于 SELECT）
+ *	  和/或 insertedCols 以及/或 updatedCols（INSERT 带 ON CONFLICT DO UPDATE 可能会同时有三者）中标识的所有列
+ *	  都具有所需权限时，权限检查被视为满足。selectedCols、insertedCols 和 updatedCols 是 bitmapset，
+ *	  其不能有负整数成员，因此在存储这些字段时我们会从列号中减去 FirstLowInvalidHeapAttributeNumber。
+ *	  全行 Var 引用由为 InvalidAttrNumber 设置位来表示。
  *
- *	  updatedCols is also used in some other places, for example, to determine
- *	  which triggers to fire and in FDWs to know which changed columns they
- *	  need to ship off.
+ *	  updatedCols 在其他一些场合也被使用，例如确定要触发哪些触发器，以及在 FDW 中告知哪些被更改的列需发送。
  *
- *	  Generated columns that are caused to be updated by an update to a base
- *	  column are listed in extraUpdatedCols.  This is not considered for
- *	  permission checking, but it is useful in those places that want to know
- *	  the full set of columns being updated as opposed to only the ones the
- *	  user explicitly mentioned in the query.  (There is currently no need for
- *	  an extraInsertedCols, but it could exist.)  Note that extraUpdatedCols
- *	  is populated during query rewrite, NOT in the parser, since generated
- *	  columns could be added after a rule has been parsed and stored.
+ *	  由基列更新导致被更新的生成列记录在 extraUpdatedCols 中。这不会用于权限检查，
+ *	  但对于想知道完整被更新列集合（而不仅是用户在查询中显式提到的那些列）的场合很有用。
+ *	  （目前不需要 extraInsertedCols，但理论上可以存在。）注意 extraUpdatedCols 在查询重写期间填充，而不是在解析器中，
+ *	  因为生成列可能在规则解析并存储之后被添加。
  *
- *	  securityQuals is a list of security barrier quals (boolean expressions),
- *	  to be tested in the listed order before returning a row from the
- *	  relation.  It is always NIL in parser output.  Entries are added by the
- *	  rewriter to implement security-barrier views and/or row-level security.
- *	  Note that the planner turns each boolean expression into an implicitly
- *	  AND'ed sublist, as is its usual habit with qualification expressions.
+ *	  securityQuals 是安全屏障谓词（布尔表达式）列表，按列出顺序在返回行之前测试。
+ *	  在解析器输出中它总是 NIL。重写器会添加条目以实现安全屏障视图和/或行级安全。
+ *	  注意规划器会把每个布尔表达式转换为一个隐式 AND 的子列表，正如其对其他资格表达式的常规处理。
  *--------------------
  */
 typedef enum RTEKind
 {
-	RTE_RELATION,				/* ordinary relation reference */
-	RTE_SUBQUERY,				/* subquery in FROM */
-	RTE_JOIN,					/* join */
-	RTE_FUNCTION,				/* function in FROM */
-	RTE_TABLEFUNC,				/* TableFunc(.., column list) */
-	RTE_VALUES,					/* VALUES (<exprlist>), (<exprlist>), ... */
-	RTE_CTE,					/* common table expr (WITH list element) */
-	RTE_NAMEDTUPLESTORE,		/* tuplestore, e.g. for AFTER triggers */
-	RTE_RESULT					/* RTE represents an empty FROM clause; such
-								 * RTEs are added by the planner, they're not
-								 * present during parsing or rewriting */
+	RTE_RELATION,				/* 普通关系引用 */
+	RTE_SUBQUERY,				/* FROM 中的子查询 */
+	RTE_JOIN,					/* JOIN 产生的表 */
+	RTE_FUNCTION,				/* FROM 中的可以作为表的函数返回的表。如 generate_series() */
+	RTE_TABLEFUNC,				/* TABLE 函数类型的表，TableFunc(.., column list) */
+	RTE_VALUES,					/* VALUES 表达式产生的表，VALUES (<exprlist>), (<exprlist>), ... */
+	RTE_CTE,					/* WITH语句附带的公共表，公共表表达式 (WITH 列表项) */
+	RTE_NAMEDTUPLESTORE,		/* 命名的 tuplestore，例如 AFTER 触发器使用 */
+	RTE_RESULT					/* 表示空的 FROM 子句的 RTE；此类 RTE 由规划器添加，
+								 * 解析或重写阶段不会出现 */
 } RTEKind;
 
 typedef struct RangeTblEntry
 {
 	NodeTag		type;
 
-	RTEKind		rtekind;		/* see above */
+	RTEKind		rtekind;		/* 如上所述的 RTE 类型 */
 
 	/*
-	 * XXX the fields applicable to only some rte kinds should be merged into
-	 * a union.  I didn't do this yet because the diffs would impact a lot of
-	 * code that is being actively worked on.  FIXME someday.
+	 * XXX 仅适用于某些 RTE 类型的字段本应合并为 union。
+	 * 我还没这么做，因为差异会影响很多正在修改的代码。
+	 * 将来修复（FIXME）。
 	 */
 
 	/*
-	 * Fields valid for a plain relation RTE (else zero):
+	 * 对于普通关系 RTE 有效的字段（否则为零）：
 	 *
-	 * As a special case, RTE_NAMEDTUPLESTORE can also set relid to indicate
-	 * that the tuple format of the tuplestore is the same as the referenced
-	 * relation.  This allows plans referencing AFTER trigger transition
-	 * tables to be invalidated if the underlying table is altered.
+	 * 特殊情况：RTE_NAMEDTUPLESTORE 也可以设置 relid，以表明
+	 * tuplestore 的元组格式与所引用关系相同。
+	 * 这允许在底层表被修改时使引用 AFTER trigger 过渡表的计划失效。
 	 *
-	 * rellockmode is really LOCKMODE, but it's declared int to avoid having
-	 * to include lock-related headers here.  It must be RowExclusiveLock if
-	 * the RTE is an INSERT/UPDATE/DELETE target, else RowShareLock if the RTE
-	 * is a SELECT FOR UPDATE/FOR SHARE target, else AccessShareLock.
+	 * rellockmode 实际上是 LOCKMODE，但这里用 int 声明以避免包含
+	 * 锁相关的头文件。 如果 RTE 是 INSERT/UPDATE/DELETE 目标，
+	 * 它必须是 RowExclusiveLock；如果是 SELECT FOR UPDATE/FOR SHARE，
+	 * 则为 RowShareLock；否则为 AccessShareLock。
 	 *
-	 * Note: in some cases, rule expansion may result in RTEs that are marked
-	 * with RowExclusiveLock even though they are not the target of the
-	 * current query; this happens if a DO ALSO rule simply scans the original
-	 * target table.  We leave such RTEs with their original lockmode so as to
-	 * avoid getting an additional, lesser lock.
+	 * 注意：在某些情况下，规则展开可能导致 RTE 被标记为
+	 * RowExclusiveLock，即使它们不是当前查询的目标；这是因为
+	 * DO ALSO 规则可能只是扫描原始目标表。为避免获取一个较低的锁，
+	 * 我们保留这些 RTE 的原始锁模式。
 	 */
-	Oid			relid;			/* OID of the relation */
-	char		relkind;		/* relation kind (see pg_class.relkind) */
-	int			rellockmode;	/* lock level that query requires on the rel */
-	struct TableSampleClause *tablesample;	/* sampling info, or NULL */
+	Oid			relid;			/* 关系的 OID ，来自 PG_CLASS 系统表*/
+	char		relkind;		/* 关系类型（参见 pg_class.relkind） */
+	int			rellockmode;	/* 查询要求的对该关系的锁级别 */
+	struct TableSampleClause *tablesample;	/* 抽样信息，或 NULL */
 
 	/*
-	 * Fields valid for a subquery RTE (else NULL):
+	 * 对于子查询 RTE 有效的字段（否则为 NULL）：
 	 */
-	Query	   *subquery;		/* the sub-query */
-	bool		security_barrier;	/* is from security_barrier view? */
+	Query	   *subquery;		/* 子查询的查询树 */
+	bool		security_barrier;	/* 是否来自 security_barrier 视图？ */
 
 	/*
-	 * Fields valid for a join RTE (else NULL/zero):
+	 * 对于 Join RTE 有效的字段（否则为 NULL/零）：
 	 *
-	 * joinaliasvars is a list of (usually) Vars corresponding to the columns
-	 * of the join result.  An alias Var referencing column K of the join
-	 * result can be replaced by the K'th element of joinaliasvars --- but to
-	 * simplify the task of reverse-listing aliases correctly, we do not do
-	 * that until planning time.  In detail: an element of joinaliasvars can
-	 * be a Var of one of the join's input relations, or such a Var with an
-	 * implicit coercion to the join's output column type, or a COALESCE
-	 * expression containing the two input column Vars (possibly coerced).
-	 * Within a Query loaded from a stored rule, it is also possible for
-	 * joinaliasvars items to be null pointers, which are placeholders for
-	 * (necessarily unreferenced) columns dropped since the rule was made.
-	 * Also, once planning begins, joinaliasvars items can be almost anything,
-	 * as a result of subquery-flattening substitutions.
+	 * joinaliasvars 是与连接结果列对应的（通常）Vars 列表。
+	 * 引用连接结果第 K 列的别名 Var 可以被替换为 joinaliasvars 的第 K 项，
+	 * 但为了简化正确反向列出别名的工作，我们直到规划阶段才这样做。
+	 * 具体而言：joinaliasvars 的元素可以是连接输入关系的 Var，
+	 * 或带有隐式类型强制转换以匹配连接输出列类型的 Var，
+	 * 或包含两个输入列 Var（可能带强制转换）的 COALESCE 表达式。
+	 * 对于从已存储规则加载的 Query，joinaliasvars 项也可能是空指针，
+	 * 作为自规则创建以来已删除（且未被引用）列的占位符。
+	 * 一旦规划开始，joinaliasvars 项可能变成几乎任意内容，
+	 * 这是子查询扁平化替换的结果。
 	 */
-	JoinType	jointype;		/* type of join */
-	List	   *joinaliasvars;	/* list of alias-var expansions */
+	JoinType	jointype;		/* JOIN 的类型 */
+	List	   *joinaliasvars;	/* JOIN 连接的表的所有列的结合 */
 
 	/*
-	 * Fields valid for a function RTE (else NIL/zero):
+	 * 对于函数 RTE 有效的字段（否则为 NIL/零）：
 	 *
-	 * When funcordinality is true, the eref->colnames list includes an alias
-	 * for the ordinality column.  The ordinality column is otherwise
-	 * implicit, and must be accounted for "by hand" in places such as
-	 * expandRTE().
+	 * 当 funcordinality 为 true 时，eref->colnames 列表包含 ordinality 列的别名。
+	 * ordinality 列否则是隐含的，必须在例如 expandRTE() 的地方手动考虑。
 	 */
-	List	   *functions;		/* list of RangeTblFunction nodes */
-	bool		funcordinality; /* is this called WITH ORDINALITY? */
+	List	   *functions;		/* RangeTblFunction 节点列表 */
+	bool		funcordinality; /* 是否带 WITH ORDINALITY? */
 
 	/*
-	 * Fields valid for a TableFunc RTE (else NULL):
+	 * 对于 TableFunc RTE 有效的字段（否则为 NULL）：
 	 */
 	TableFunc  *tablefunc;
 
 	/*
-	 * Fields valid for a values RTE (else NIL):
+	 * 对于 values RTE 有效的字段（否则为 NIL）：
 	 */
-	List	   *values_lists;	/* list of expression lists */
+	List	   *values_lists;	/* 表达式列表的列表 */
 
 	/*
-	 * Fields valid for a CTE RTE (else NULL/zero):
+	 * 对于 CTE RTE 有效的字段（否则为 NULL/零）：
 	 */
-	char	   *ctename;		/* name of the WITH list item */
-	Index		ctelevelsup;	/* number of query levels up */
-	bool		self_reference; /* is this a recursive self-reference? */
+	char	   *ctename;		/* WITH 列表项的名称 */
+	Index		ctelevelsup;	/* 向上查询层数 */
+	bool		self_reference; /* 是否为递归自引用？ */
 
 	/*
-	 * Fields valid for CTE, VALUES, ENR, and TableFunc RTEs (else NIL):
+	 * 对于 CTE、VALUES、ENR 和 TableFunc RTEs 有效的字段（否则为 NIL）：
 	 *
-	 * We need these for CTE RTEs so that the types of self-referential
-	 * columns are well-defined.  For VALUES RTEs, storing these explicitly
-	 * saves having to re-determine the info by scanning the values_lists. For
-	 * ENRs, we store the types explicitly here (we could get the information
-	 * from the catalogs if 'relid' was supplied, but we'd still need these
-	 * for TupleDesc-based ENRs, so we might as well always store the type
-	 * info here).  For TableFuncs, these fields are redundant with data in
-	 * the TableFunc node, but keeping them here allows some code sharing with
-	 * the other cases.
+	 * 我们需要这些信息以确保自引用 CTE 的列类型定义明确。
+	 * 对于 VALUES RTE，显式存储这些可以避免扫描 values_lists 来重新确定信息。
+	 * 对于 ENR（ephemeral named relation），我们在这里存储类型信息（尽管如果 relid 存在可以从系统表获得），
+	 * 对于 TableFunc，这些字段与 TableFunc 节点中的数据冗余，但保留在这里可与其他情况共享代码。
 	 *
-	 * For ENRs only, we have to consider the possibility of dropped columns.
-	 * A dropped column is included in these lists, but it will have zeroes in
-	 * all three lists (as well as an empty-string entry in eref).  Testing
-	 * for zero coltype is the standard way to detect a dropped column.
+	 * 仅对于 ENR，需要考虑已删除列的可能性。已删除列包含在这些列表中，
+	 * 但其三个列表中都将为零（并且 eref 中对应为空字符串）。
+	 * 检测已删除列的标准方法是检查 coltype 是否为零。
 	 */
-	List	   *coltypes;		/* OID list of column type OIDs */
-	List	   *coltypmods;		/* integer list of column typmods */
-	List	   *colcollations;	/* OID list of column collation OIDs */
+	List	   *coltypes;		/* 列类型 OID 列表 */
+	List	   *coltypmods;		/* 列 typmod 的整数列表 */
+	List	   *colcollations;	/* 列 collation OID 列表 */
 
 	/*
-	 * Fields valid for ENR RTEs (else NULL/zero):
+	 * 对于 ENR RTE 有效的字段（否则为 NULL/零）：
 	 */
-	char	   *enrname;		/* name of ephemeral named relation */
-	double		enrtuples;		/* estimated or actual from caller */
+	char	   *enrname;		/* 临时命名关系名 */
+	double		enrtuples;		/* 调用方估计或实际的行数 */
 
 	/*
-	 * Fields valid in all RTEs:
+	 * 所有 RTE 通用的字段：
 	 */
-	Alias	   *alias;			/* user-written alias clause, if any */
-	Alias	   *eref;			/* expanded reference names */
-	bool		lateral;		/* subquery, function, or values is LATERAL? */
-	bool		inh;			/* inheritance requested? */
-	bool		inFromCl;		/* present in FROM clause? */
-	AclMode		requiredPerms;	/* bitmask of required access permissions */
-	Oid			checkAsUser;	/* if valid, check access as this role */
-	Bitmapset  *selectedCols;	/* columns needing SELECT permission */
-	Bitmapset  *insertedCols;	/* columns needing INSERT permission */
-	Bitmapset  *updatedCols;	/* columns needing UPDATE permission */
-	Bitmapset  *extraUpdatedCols;	/* generated columns being updated */
-	List	   *securityQuals;	/* security barrier quals to apply, if any */
+	Alias	   *alias;			/* 用户写的别名子句（如果有） */
+	Alias	   *eref;			/* 展开后的引用名 */
+	bool		lateral;		/* 子查询/函数/values 是否为 LATERAL？ */
+	bool		inh;			/* 是否请求继承？ */
+	bool		inFromCl;		/* 是否出现在 FROM 子句？ */
+	AclMode		requiredPerms;	/* 需要的访问权限位掩码 */
+	Oid			checkAsUser;	/* 若有效，则以此角色检查访问权限 */
+	Bitmapset  *selectedCols;	/* 需要 SELECT 权限的列 */
+	Bitmapset  *insertedCols;	/* 需要 INSERT 权限的列 */
+	Bitmapset  *updatedCols;	/* 需要 UPDATE 权限的列 */
+	Bitmapset  *extraUpdatedCols;	/* 被更新的生成列 */
+	List	   *securityQuals;	/* 要应用的安全屏障谓词列表（如有） */
 } RangeTblEntry;
 
 /*

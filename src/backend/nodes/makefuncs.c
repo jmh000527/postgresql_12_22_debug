@@ -280,13 +280,17 @@ flatCopyTargetEntry(TargetEntry *src_tle)
  * makeFromExpr -
  *	  creates a FromExpr node
  */
+/*
+ * makeFromExpr -
+ *    创建一个 FromExpr 节点
+ */
 FromExpr *
 makeFromExpr(List *fromlist, Node *quals)
 {
 	FromExpr   *f = makeNode(FromExpr);
 
-	f->fromlist = fromlist;
-	f->quals = quals;
+	f->fromlist = fromlist; // FROM 子句中的表或子查询列表
+	f->quals = quals;       // WHERE 子句中的条件表达式
 	return f;
 }
 

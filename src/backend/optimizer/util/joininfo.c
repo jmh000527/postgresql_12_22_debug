@@ -21,16 +21,12 @@
 
 /*
  * have_relevant_joinclause
- *		Detect whether there is a joinclause that involves
- *		the two given relations.
+ *		检测是否存在涉及给定两个关系的连接子句。
  *
- * Note: the joinclause does not have to be evaluable with only these two
- * relations.  This is intentional.  For example consider
+ * 注意：连接子句不一定只能用这两个关系来计算。这是有意为之。例如考虑：
  *		SELECT * FROM a, b, c WHERE a.x = (b.y + c.z)
- * If a is much larger than the other tables, it may be worthwhile to
- * cross-join b and c and then use an inner indexscan on a.x.  Therefore
- * we should consider this joinclause as reason to join b to c, even though
- * it can't be applied at that join step.
+ * 如果 a 比其他表大很多，可能值得先对 b 和 c 做笛卡尔积，然后对 a.x 做索引扫描。
+ * 因此，即使该连接子句不能在这一步连接时应用，我们也应该认为它是连接 b 和 c 的理由。
  */
 bool
 have_relevant_joinclause(PlannerInfo *root,
@@ -42,8 +38,7 @@ have_relevant_joinclause(PlannerInfo *root,
 	ListCell   *l;
 
 	/*
-	 * We could scan either relation's joininfo list; may as well use the
-	 * shorter one.
+	 * 可以扫描任一关系的 joininfo 列表；选用较短的那个即可。
 	 */
 	if (list_length(rel1->joininfo) <= list_length(rel2->joininfo))
 	{
@@ -68,8 +63,7 @@ have_relevant_joinclause(PlannerInfo *root,
 	}
 
 	/*
-	 * We also need to check the EquivalenceClass data structure, which might
-	 * contain relationships not emitted into the joininfo lists.
+	 * 还需要检查 EquivalenceClass 数据结构，其中可能包含未被放入 joininfo 列表的关系。
 	 */
 	if (!result && rel1->has_eclass_joins && rel2->has_eclass_joins)
 		result = have_relevant_eclass_joinclause(root, rel1, rel2);

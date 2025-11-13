@@ -145,8 +145,8 @@ static void remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel);
 
 /*
  * make_one_rel
- *	  Finds all possible access paths for executing a query, returning a
- *	  single rel that represents the join of all base rels in the query.
+ *	  为执行查询查找所有可能的访问路径，返回表示查询中所有基表连接的单个 rel。
+ *    向 RelOptInfo 结构添加所有可行的路径。
  */
 RelOptInfo *
 make_one_rel(PlannerInfo *root, List *joinlist)
@@ -156,47 +156,48 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 	double		total_pages;
 
 	/*
-	 * Construct the all_baserels Relids set.
+	 * 构建 all_baserels Relids 集合（表示查询中所有的基表变元集）。
+	 * 遍历 simple_rel_array 数组，收集所有基表 relid
+	 * simple_rel_array 数组按 RT 索引存储 RelOptInfo 指针
+	 * 跳过 NULL 槽和非基表 reloptkind
 	 */
 	root->all_baserels = NULL;
+	
 	for (rti = 1; rti < root->simple_rel_array_size; rti++)
 	{
 		RelOptInfo *brel = root->simple_rel_array[rti];
 
-		/* there may be empty slots corresponding to non-baserel RTEs */
+		/* 可能有对应非基表 RTE 的空槽，跳过 */
 		if (brel == NULL)
 			continue;
 
-		Assert(brel->relid == rti); /* sanity check on array */
+		Assert(brel->relid == rti); /* 数组一致性断言 */
 
-		/* ignore RTEs that are "other rels" */
+		/* 忽略被标记为 "other rels" 的 RTE */
 		if (brel->reloptkind != RELOPT_BASEREL)
 			continue;
 
+		/* 将基表加入集合 */
 		root->all_baserels = bms_add_member(root->all_baserels, brel->relid);
 	}
 
-	/* Mark base rels as to whether we care about fast-start plans */
+	/* 标记基表是否需要考虑 fast-start（快速启动）计划 */
 	set_base_rel_consider_startup(root);
 
 	/*
-	 * Compute size estimates and consider_parallel flags for each base rel.
+	 * 为每个基表计算大小估计（行数、页数、宽度等）并设置 consider_parallel 标志
+	 * 这些信息随后会用于生成参数化路径和并行路径的判断。
 	 */
 	set_base_rel_sizes(root);
 
 	/*
-	 * We should now have size estimates for every actual table involved in
-	 * the query, and we also know which if any have been deleted from the
-	 * query by join removal, pruned by partition pruning, or eliminated by
-	 * constraint exclusion.  So we can now compute total_table_pages.
+	 * 此时我们应该对查询中涉及到的每个实际表都有了大小估计，并且知道哪些表
+	 * 被连接消除、分区剪枝或约束排除删除了。因此可以计算 total_table_pages。
 	 *
-	 * Note that appendrels are not double-counted here, even though we don't
-	 * bother to distinguish RelOptInfos for appendrel parents, because the
-	 * parents will have pages = 0.
+	 * 注意：对于 appendrel（继承/分区的父表），父表的 pages 保持为 0，避免重复计数。
 	 *
-	 * XXX if a table is self-joined, we will count it once per appearance,
-	 * which perhaps is the wrong thing ... but that's not completely clear,
-	 * and detecting self-joins here is difficult, so ignore it for now.
+	 * XXX: 如果表被自连接，这里会按出现次数重复计数，是否合适尚不明确，
+	 *      且在此处检测自连接比较困难，故暂不处理。
 	 */
 	total_pages = 0;
 	for (rti = 1; rti < root->simple_rel_array_size; rti++)
@@ -206,28 +207,36 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 		if (brel == NULL)
 			continue;
 
-		Assert(brel->relid == rti); /* sanity check on array */
+		Assert(brel->relid == rti); /* 数组一致性断言 */
 
+		/* 跳过已被证明为空的关系（dummy rel） */
 		if (IS_DUMMY_REL(brel))
 			continue;
 
+		/* 只统计简单基表（非 join/append 等）页数 */
 		if (IS_SIMPLE_REL(brel))
 			total_pages += (double) brel->pages;
 	}
 	root->total_table_pages = total_pages;
 
 	/*
-	 * Generate access paths for each base rel.
+	 * 生成扫描路径的阶段
+	 *
+	 * 为每个基表生成访问路径（顺序扫描、索引扫描、TID 扫描、外部表等）。
+	 * 这些路径会被添加到每个 RelOptInfo 的 pathlist / partial_pathlist 中。
 	 */
 	set_base_rel_pathlists(root);
 
 	/*
-	 * Generate access paths for the entire join tree.
+	 * 生成连接路径的阶段
+	 *
+	 * 针对整个连接树生成访问路径（即对 joinlist 中描述的连接项进行组合搜索）。
+	 * 返回的 rel 表示将所有基表连接起来的最终 joinrel。
 	 */
 	rel = make_rel_from_joinlist(root, joinlist);
 
 	/*
-	 * The result should join all and only the query's base rels.
+	 * 结果 rel 的 relids 应该正好等于查询的 all_baserels（所有基表集合）。
 	 */
 	Assert(bms_equal(rel->relids, root->all_baserels));
 
@@ -2736,32 +2745,31 @@ generate_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
 
 /*
  * make_rel_from_joinlist
- *	  Build access paths using a "joinlist" to guide the join path search.
+ *	  使用 "joinlist" 指导连接路径搜索，构建访问路径。
+ *    'joinlist' 中可能存在RangeTblRef节点（表示基表）或嵌套的 joinlist 节点。
  *
- * See comments for deconstruct_jointree() for definition of the joinlist
- * data structure.
+ * 参见 deconstruct_jointree() 的注释，了解 joinlist 数据结构的定义。
  */
 static RelOptInfo *
 make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 {
 	int			levels_needed;
-	List	   *initial_rels;
-	ListCell   *jl;
+	List* 		initial_rels;	/* joinlist 中每个节点对应的 RelOptInfo 列表 */
+	ListCell* 	jl;				/* 用于遍历 joinlist 的辅助指针 */
 
 	/*
-	 * Count the number of child joinlist nodes.  This is the depth of the
-	 * dynamic-programming algorithm we must employ to consider all ways of
-	 * joining the child nodes.
+	 * 统计 joinlist 子节点的数量。这是动态规划算法需要的深度，
+	 * 用于考虑所有可能的连接方式。
 	 */
 	levels_needed = list_length(joinlist);
 
 	if (levels_needed <= 0)
-		return NULL;			/* nothing to do? */
+		return NULL;			/* 没有要处理的内容？ */
 
 	/*
-	 * Construct a list of rels corresponding to the child joinlist nodes.
-	 * This may contain both base rels and rels constructed according to
-	 * sub-joinlists.
+	 * 构造与 joinlist 子节点对应的 rels 列表。
+	 * 其中可能包含基表 rel 和根据子 joinlist 构造的 rel。
+	 * 递归处理未拉平的子 joinlist 节点。
 	 */
 	initial_rels = NIL;
 	foreach(jl, joinlist)
@@ -2769,6 +2777,12 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		Node	   *jlnode = (Node *) lfirst(jl);
 		RelOptInfo *thisrel;
 
+		/*
+		 * 处理连接列表（joinlist）中的节点，根据节点类型执行不同的操作：
+		 * - 如果节点类型为 RangeTblRef，则通过 rtindex 查找对应的基本关系（base rel）对应的 RelOptInfo。
+		 * - 如果节点类型为 List，则递归处理子问题，生成对应的关系信息。
+		 * - 如果节点类型无法识别，则报错并返回 NULL（防止编译器警告）。
+		 */
 		if (IsA(jlnode, RangeTblRef))
 		{
 			int			varno = ((RangeTblRef *) jlnode)->rtindex;
@@ -2777,14 +2791,14 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		}
 		else if (IsA(jlnode, List))
 		{
-			/* Recurse to handle subproblem */
+			/* 递归处理子问题 */
 			thisrel = make_rel_from_joinlist(root, (List *) jlnode);
 		}
 		else
 		{
 			elog(ERROR, "unrecognized joinlist node type: %d",
 				 (int) nodeTag(jlnode));
-			thisrel = NULL;		/* keep compiler quiet */
+			thisrel = NULL;		/* 防止编译器警告 */
 		}
 
 		initial_rels = lappend(initial_rels, thisrel);
@@ -2793,19 +2807,20 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 	if (levels_needed == 1)
 	{
 		/*
-		 * Single joinlist node, so we're done.
+		 * 只有一个 joinlist 节点，直接返回。
 		 */
 		return (RelOptInfo *) linitial(initial_rels);
 	}
 	else
 	{
 		/*
-		 * Consider the different orders in which we could join the rels,
-		 * using a plugin, GEQO, or the regular join search code.
+		 * 使用插件、GEQO 或常规连接搜索代码，考虑不同的连接顺序。
 		 *
-		 * We put the initial_rels list into a PlannerInfo field because
-		 * has_legal_joinclause() needs to look at it (ugly :-().
+		 * 将 initial_rels 列表存入 PlannerInfo 字段，因为
+		 * has_legal_joinclause() 需要访问它（有点丑陋 :-()。
 		 */
+
+		/* 将 initial_rels 列表存入 PlannerInfo 字段，该字段存储基表的链表 */
 		root->initial_rels = initial_rels;
 
 		if (join_search_hook)
@@ -2819,96 +2834,79 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 
 /*
  * standard_join_search
- *	  Find possible joinpaths for a query by successively finding ways
- *	  to join component relations into join relations.
+ *	  通过逐步将组件关系连接成连接关系，为查询查找可能的连接路径。
  *
- * 'levels_needed' is the number of iterations needed, ie, the number of
- *		independent jointree items in the query.  This is > 1.
+ * 'levels_needed' 是所需的迭代次数，即查询中独立 jointree 项的数量。该值 > 1。
  *
- * 'initial_rels' is a list of RelOptInfo nodes for each independent
- *		jointree item.  These are the components to be joined together.
- *		Note that levels_needed == list_length(initial_rels).
+ * 'initial_rels' 是每个独立 jointree 项对应的基表的 RelOptInfo 节点列表。这些是需要连接的组件。
+ *		注意 levels_needed == list_length(initial_rels)。
  *
- * Returns the final level of join relations, i.e., the relation that is
- * the result of joining all the original relations together.
- * At least one implementation path must be provided for this relation and
- * all required sub-relations.
+ * 返回最终级别的连接关系，即所有原始关系连接后的结果关系。
+ * 必须为该关系及所有需要的子关系提供至少一种实现路径。
  *
- * To support loadable plugins that modify planner behavior by changing the
- * join searching algorithm, we provide a hook variable that lets a plugin
- * replace or supplement this function.  Any such hook must return the same
- * final join relation as the standard code would, but it might have a
- * different set of implementation paths attached, and only the sub-joinrels
- * needed for these paths need have been instantiated.
+ * 为了支持通过更改连接搜索算法来修改规划器行为的可加载插件，我们提供了一个钩子变量，
+ * 允许插件替换或补充此函数。任何这样的钩子必须返回与标准代码相同的最终连接关系，
+ * 但其附加的实现路径集合可能不同，并且只需实例化这些路径所需的子连接关系。
  *
- * Note to plugin authors: the functions invoked during standard_join_search()
- * modify root->join_rel_list and root->join_rel_hash.  If you want to do more
- * than one join-order search, you'll probably need to save and restore the
- * original states of those data structures.  See geqo_eval() for an example.
+ * 给插件作者的说明：standard_join_search() 调用的函数会修改 root->join_rel_list 和 root->join_rel_hash。
+ * 如果你想进行多次连接顺序搜索，可能需要保存和恢复这些数据结构的原始状态。可参考 geqo_eval() 的实现。
  */
 RelOptInfo *
 standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
-	int			lev;
+	int			lev; /* 当前处理的连接层级，辅助遍历 */
 	RelOptInfo *rel;
 
 	/*
-	 * This function cannot be invoked recursively within any one planning
-	 * problem, so join_rel_level[] can't be in use already.
+	 * 此函数在同一个规划问题中不能递归调用，因此 join_rel_level[] 不应已被使用。
 	 */
 	Assert(root->join_rel_level == NULL);
 
 	/*
-	 * We employ a simple "dynamic programming" algorithm: we first find all
-	 * ways to build joins of two jointree items, then all ways to build joins
-	 * of three items (from two-item joins and single items), then four-item
-	 * joins, and so on until we have considered all ways to join all the
-	 * items into one rel.
+	 * 采用简单的“动态规划”算法：首先找到所有两项连接的方式，然后找到三项连接的所有方式
+	 * （由两项连接和单项组成），然后是四项连接，依此类推，直到考虑所有将所有项连接成一个关系的方法。
 	 *
-	 * root->join_rel_level[j] is a list of all the j-item rels.  Initially we
-	 * set root->join_rel_level[1] to represent all the single-jointree-item
-	 * relations.
+	 * root->join_rel_level[j] 是所有 j 项连接关系的列表。最初我们将 root->join_rel_level[1]
+	 * 设置为所有单 jointree 项的关系。
+	 *
+	 * 创建一个链表的链表，多创建一个位置
+	 * 将基表的链表放到下表为1的位置，root->join_rel_level[0] 永远不会使用
 	 */
 	root->join_rel_level = (List **) palloc0((levels_needed + 1) * sizeof(List *));
-
 	root->join_rel_level[1] = initial_rels;
 
+	// 第一层已经初始化好，从第二层开始
 	for (lev = 2; lev <= levels_needed; lev++)
 	{
 		ListCell   *lc;
 
 		/*
-		 * Determine all possible pairs of relations to be joined at this
-		 * level, and build paths for making each one from every available
-		 * pair of lower-level relations.
+		 * 确定本级别所有可能的关系对，并为每个可用的低级别关系对构建连接路径。
+		 * 生成对应 lev 层的所有对应 RelOptInfo
 		 */
 		join_search_one_level(root, lev);
 
 		/*
-		 * Run generate_partitionwise_join_paths() and generate_gather_paths()
-		 * for each just-processed joinrel.  We could not do this earlier
-		 * because both regular and partial paths can get added to a
-		 * particular joinrel at multiple times within join_search_one_level.
+		 * 对刚处理过的每个 joinrel 运行 generate_partitionwise_join_paths() 和 generate_gather_paths()。
+		 * 之前不能做这些，因为常规路径和部分路径可能在 join_search_one_level 内多次添加到某个 joinrel。
 		 *
-		 * After that, we're done creating paths for the joinrel, so run
-		 * set_cheapest().
+		 * 此后，joinrel 的路径创建完成，因此运行 set_cheapest()。
 		 */
 		foreach(lc, root->join_rel_level[lev])
 		{
 			rel = (RelOptInfo *) lfirst(lc);
 
-			/* Create paths for partitionwise joins. */
+			/* 为分区连接创建路径。 */
 			generate_partitionwise_join_paths(root, rel);
 
 			/*
-			 * Except for the topmost scan/join rel, consider gathering
-			 * partial paths.  We'll do the same for the topmost scan/join rel
-			 * once we know the final targetlist (see grouping_planner).
+			 * 除了最顶层的扫描/连接关系外，考虑收集部分路径。对于最顶层的扫描/连接关系，
+			 * 会在确定最终目标列后再做（见 grouping_planner）。
 			 */
 			if (lev < levels_needed)
 				generate_gather_paths(root, rel, false);
 
-			/* Find and save the cheapest paths for this rel */
+			/* 查找并保存该关系的最优路径 */
 			set_cheapest(rel);
 
 #ifdef OPTIMIZER_DEBUG
@@ -2918,7 +2916,7 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	}
 
 	/*
-	 * We should have a single rel at the final level.
+	 * 最终级别应只有一个关系。
 	 */
 	if (root->join_rel_level[levels_needed] == NIL)
 		elog(ERROR, "failed to build any %d-way joins", levels_needed);

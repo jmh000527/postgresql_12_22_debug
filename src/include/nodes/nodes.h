@@ -14,21 +14,27 @@
 #ifndef NODES_H
 #define NODES_H
 
-/*
- * The first field of every node is NodeTag. Each node created (with makeNode)
- * will have one of the following tags as the value of its first field.
- *
- * Note that inserting or deleting node types changes the numbers of other
- * node types later in the list.  This is no problem during development, since
- * the node numbers are never stored on disk.  But don't do it in a released
- * branch, because that would represent an ABI break for extensions.
- */
+ /*
+	* The first field of every node is NodeTag. Each node created (with makeNode)
+	* will have one of the following tags as the value of its first field.
+	*
+	* Note that inserting or deleting node types changes the numbers of other
+	* node types later in the list.  This is no problem during development, since
+	* the node numbers are never stored on disk.  But don't do it in a released
+	* branch, because that would represent an ABI break for extensions.
+	*
+	* 中文注释：
+	* 每个节点的第一个字段都是 NodeTag。通过 makeNode 创建的节点其第一个字段
+	* 的值就是下面枚举中的某个标签。不要在已发布分支中随意插入或删除枚举项，
+	* 否则会造成二进制兼容性（ABI）中断。
+	*/
 typedef enum NodeTag
 {
-	T_Invalid = 0,
+	T_Invalid = 0,				/* 无效标签 */
 
 	/*
 	 * TAGS FOR EXECUTOR NODES (execnodes.h)
+	 * 执行器相关节点标签
 	 */
 	T_IndexInfo,
 	T_ExprContext,
@@ -41,6 +47,7 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR PLAN NODES (plannodes.h)
+	 * 计划节点标签（Plan 及其子类）
 	 */
 	T_Plan,
 	T_Result,
@@ -97,6 +104,7 @@ typedef enum NodeTag
 	 * TAGS FOR PLAN STATE NODES (execnodes.h)
 	 *
 	 * These should correspond one-to-one with Plan node types.
+	 * 计划状态节点，通常与 Plan 节点一一对应
 	 */
 	T_PlanState,
 	T_ResultState,
@@ -143,6 +151,7 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR PRIMITIVE NODES (primnodes.h)
+	 * 基本表达式与语法节点
 	 */
 	T_Alias,
 	T_RangeVar,
@@ -200,11 +209,7 @@ typedef enum NodeTag
 	/*
 	 * TAGS FOR EXPRESSION STATE NODES (execnodes.h)
 	 *
-	 * ExprState represents the evaluation state for a whole expression tree.
-	 * Most Expr-based plan nodes do not have a corresponding expression state
-	 * node, they're fully handled within execExpr* - but sometimes the state
-	 * needs to be shared with other parts of the executor, as for example
-	 * with AggrefExprState, which nodeAgg.c has to modify.
+	 * 表示表达式求值时的运行时状态节点
 	 */
 	T_ExprState,
 	T_AggrefExprState,
@@ -216,6 +221,7 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR PLANNER NODES (pathnodes.h)
+	 * 规划器相关节点（路径、代价估算等）
 	 */
 	T_PlannerInfo,
 	T_PlannerGlobal,
@@ -275,6 +281,7 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR MEMORY NODES (memnodes.h)
+	 * 内存上下文相关节点
 	 */
 	T_MemoryContext,
 	T_AllocSetContext,
@@ -283,6 +290,7 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR VALUE NODES (value.h)
+	 * 值节点（字面量等）
 	 */
 	T_Value,
 	T_Integer,
@@ -293,6 +301,7 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR LIST NODES (pg_list.h)
+	 * 列表节点类型
 	 */
 	T_List,
 	T_IntList,
@@ -300,11 +309,13 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR EXTENSIBLE NODES (extensible.h)
+	 * 可扩展节点
 	 */
 	T_ExtensibleNode,
 
 	/*
 	 * TAGS FOR STATEMENT NODES (mostly in parsenodes.h)
+	 * 语句节点（大多数在 parsenodes.h）
 	 */
 	T_RawStmt,
 	T_Query,
@@ -423,6 +434,7 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR PARSE TREE NODES (parsenodes.h)
+	 * 解析树节点
 	 */
 	T_A_Expr,
 	T_ColumnRef,
@@ -479,6 +491,7 @@ typedef enum NodeTag
 
 	/*
 	 * TAGS FOR REPLICATION GRAMMAR PARSE NODES (replnodes.h)
+	 * 复制相关的解析节点
 	 */
 	T_IdentifySystemCmd,
 	T_BaseBackupCmd,
@@ -495,6 +508,8 @@ typedef enum NodeTag
 	 * structures, but we give them NodeTags anyway for identification
 	 * purposes (usually because they are involved in APIs where we want to
 	 * pass multiple object types through the same pointer).
+	 *
+	 * 其他杂项对象，也使用 NodeTag 标识以便统一 API 传递
 	 */
 	T_TriggerData,				/* in commands/trigger.h */
 	T_EventTriggerData,			/* in commands/event_trigger.h */
@@ -516,14 +531,12 @@ typedef enum NodeTag
 } NodeTag;
 
 /*
- * The first field of a node of any type is guaranteed to be the NodeTag.
- * Hence the type of any node can be gotten by casting it to Node. Declaring
- * a variable to be of Node * (instead of void *) can also facilitate
- * debugging.
+ * 首字段保证为 NodeTag。将任意节点强制转换为 Node 即可获取其类型。
+ * 将变量声明为 Node *（而不是 void *）有助于调试。
  */
 typedef struct Node
 {
-	NodeTag		type;
+	NodeTag		type;		/* node type tag / 节点类型标识 */
 } Node;
 
 #define nodeTag(nodeptr)		(((const Node*)(nodeptr))->type)
@@ -541,7 +554,7 @@ typedef struct Node
  */
 #ifdef __GNUC__
 
-/* With GCC, we can use a compound statement within an expression */
+ /* With GCC, we can use a compound statement within an expression */
 #define newNode(size, tag) \
 ({	Node   *_result; \
 	AssertMacro((size) >= sizeof(Node));		/* need the tag, at least */ \
@@ -551,13 +564,13 @@ typedef struct Node
 })
 #else
 
-/*
- *	There is no way to dereference the palloc'ed pointer to assign the
- *	tag, and also return the pointer itself, so we need a holder variable.
- *	Fortunately, this macro isn't recursive so we just define
- *	a global variable for this purpose.
- */
-extern PGDLLIMPORT Node *newNodeMacroHolder;
+ /*
+  *	There is no way to dereference the palloc'ed pointer to assign the
+  *	tag, and also return the pointer itself, so we need a holder variable.
+  *	Fortunately, this macro isn't recursive so we just define
+  *	a global variable for this purpose.
+  */
+extern PGDLLIMPORT Node* newNodeMacroHolder;
 
 #define newNode(size, tag) \
 ( \
@@ -569,6 +582,18 @@ extern PGDLLIMPORT Node *newNodeMacroHolder;
 #endif							/* __GNUC__ */
 
 
+/*
+ * makeNode(_type_)
+ *   宏，用于分配并初始化指定类型的新节点。
+ *   使用 newNode() 分配内存并设置节点类型标签。
+ *
+ * NodeSetTag(nodeptr, t)
+ *   宏，将节点的类型标签设置为指定值。
+ *
+ * IsA(nodeptr, _type_)
+ *   宏，判断节点是否为指定类型。
+ *   如果节点类型标签等于 T__type_，则返回 true。
+ */
 #define makeNode(_type_)		((_type_ *) newNode(sizeof(_type_),T_##_type_))
 #define NodeSetTag(nodeptr,t)	(((Node*)(nodeptr))->type = (t))
 
@@ -582,11 +607,11 @@ extern PGDLLIMPORT Node *newNodeMacroHolder;
  * evaluations of the ptr argument (which could e.g. be a function call).
  */
 #ifdef USE_ASSERT_CHECKING
-static inline Node *
-castNodeImpl(NodeTag type, void *ptr)
+static inline Node*
+castNodeImpl(NodeTag type, void* ptr)
 {
 	Assert(ptr == NULL || nodeTag(ptr) == type);
-	return (Node *) ptr;
+	return (Node*)ptr;
 }
 #define castNode(_type_, nodeptr) ((_type_ *) castNodeImpl(T_##_type_, nodeptr))
 #else
@@ -594,44 +619,44 @@ castNodeImpl(NodeTag type, void *ptr)
 #endif							/* USE_ASSERT_CHECKING */
 
 
-/* ----------------------------------------------------------------
- *					  extern declarations follow
- * ----------------------------------------------------------------
- */
+ /* ----------------------------------------------------------------
+  *					  extern declarations follow
+  * ----------------------------------------------------------------
+  */
 
-/*
- * nodes/{outfuncs.c,print.c}
- */
+  /*
+   * nodes/{outfuncs.c,print.c}
+   */
 struct Bitmapset;				/* not to include bitmapset.h here */
 struct StringInfoData;			/* not to include stringinfo.h here */
 
-extern void outNode(struct StringInfoData *str, const void *obj);
-extern void outToken(struct StringInfoData *str, const char *s);
-extern void outBitmapset(struct StringInfoData *str,
-						 const struct Bitmapset *bms);
-extern void outDatum(struct StringInfoData *str, uintptr_t value,
-					 int typlen, bool typbyval);
-extern char *nodeToString(const void *obj);
-extern char *bmsToString(const struct Bitmapset *bms);
+extern void outNode(struct StringInfoData* str, const void* obj);
+extern void outToken(struct StringInfoData* str, const char* s);
+extern void outBitmapset(struct StringInfoData* str,
+	const struct Bitmapset* bms);
+extern void outDatum(struct StringInfoData* str, uintptr_t value,
+	int typlen, bool typbyval);
+extern char* nodeToString(const void* obj);
+extern char* bmsToString(const struct Bitmapset* bms);
 
 /*
  * nodes/{readfuncs.c,read.c}
  */
-extern void *stringToNode(const char *str);
+extern void* stringToNode(const char* str);
 #ifdef WRITE_READ_PARSE_PLAN_TREES
-extern void *stringToNodeWithLocations(const char *str);
+extern void* stringToNodeWithLocations(const char* str);
 #endif
-extern struct Bitmapset *readBitmapset(void);
+extern struct Bitmapset* readBitmapset(void);
 extern uintptr_t readDatum(bool typbyval);
-extern bool *readBoolCols(int numCols);
-extern int *readIntCols(int numCols);
-extern Oid *readOidCols(int numCols);
-extern int16 *readAttrNumberCols(int numCols);
+extern bool* readBoolCols(int numCols);
+extern int* readIntCols(int numCols);
+extern Oid* readOidCols(int numCols);
+extern int16* readAttrNumberCols(int numCols);
 
 /*
  * nodes/copyfuncs.c
  */
-extern void *copyObjectImpl(const void *obj);
+extern void* copyObjectImpl(const void* obj);
 
 /* cast result back to argument type, if supported by compiler */
 #ifdef HAVE_TYPEOF
@@ -643,7 +668,7 @@ extern void *copyObjectImpl(const void *obj);
 /*
  * nodes/equalfuncs.c
  */
-extern bool equal(const void *a, const void *b);
+extern bool equal(const void* a, const void* b);
 
 
 /*
@@ -680,46 +705,43 @@ typedef enum CmdType
 
 /*
  * JoinType -
- *	  enums for types of relation joins
+ *	  关系连接类型的枚举，用于 JoinExpr、JoinPath、Join 节点
  *
- * JoinType determines the exact semantics of joining two relations using
- * a matching qualification.  For example, it tells what to do with a tuple
- * that has no match in the other relation.
+ * JoinType 决定使用匹配谓词连接两个关系时的精确语义。例如，它决定对于在另一侧
+ * 没有匹配的元组应如何处理。
  *
- * This is needed in both parsenodes.h and plannodes.h, so put it here...
+ * 这个枚举在 parsenodes.h 和 plannodes.h 中都需要，所以放在此处...
  */
 typedef enum JoinType
 {
 	/*
-	 * The canonical kinds of joins according to the SQL JOIN syntax. Only
-	 * these codes can appear in parser output (e.g., JoinExpr nodes).
+	 * 根据 SQL JOIN 语法的规范连接类型。只有这些代码可以出现在解析器输出
+	 *（例如 JoinExpr 节点）中。
 	 */
-	JOIN_INNER,					/* matching tuple pairs only */
-	JOIN_LEFT,					/* pairs + unmatched LHS tuples */
-	JOIN_FULL,					/* pairs + unmatched LHS + unmatched RHS */
-	JOIN_RIGHT,					/* pairs + unmatched RHS tuples */
+	JOIN_INNER,					/* 仅包含匹配的元组对 */
+	JOIN_LEFT,					/* 包含匹配对 + 左侧未匹配元组 */
+	JOIN_FULL,					/* 包含匹配对 + 左侧未匹配 + 右侧未匹配 */
+	JOIN_RIGHT,					/* 包含匹配对 + 右侧未匹配元组 */
 
 	/*
-	 * Semijoins and anti-semijoins (as defined in relational theory) do not
-	 * appear in the SQL JOIN syntax, but there are standard idioms for
-	 * representing them (e.g., using EXISTS).  The planner recognizes these
-	 * cases and converts them to joins.  So the planner and executor must
-	 * support these codes.  NOTE: in JOIN_SEMI output, it is unspecified
-	 * which matching RHS row is joined to.  In JOIN_ANTI output, the row is
-	 * guaranteed to be null-extended.
+	 * 半连接（semijoin）和反半连接（antijoin）在关系理论中有明确定义，但不
+	 * 出现在 SQL JOIN 语法中。不过可以通过常见语法习惯（例如 EXISTS）来表示它们。
+	 * 规划器会识别这些情况并将其转换为连接。因此规划器和执行器必须支持这些代码。
+	 *
+	 * 注意：对于 JOIN_SEMI，哪个匹配的 RHS 行与之连接是不确定的（只保证有一份
+	 * 左侧行被输出）。对于 JOIN_ANTI，输出的行保证右侧部分为 NULL 扩展。
 	 */
-	JOIN_SEMI,					/* 1 copy of each LHS row that has match(es) */
-	JOIN_ANTI,					/* 1 copy of each LHS row that has no match */
+	JOIN_SEMI,					/* 对于有匹配的每个左侧行，返回一份 */
+	JOIN_ANTI,					/* 对于没有匹配的每个左侧行，返回一份（右侧扩展为 NULL） */
 
 	/*
-	 * These codes are used internally in the planner, but are not supported
-	 * by the executor (nor, indeed, by most of the planner).
+	 * 这些代码在规划器内部使用，但执行器（以及大多数规划器代码）并不支持它们。
 	 */
-	JOIN_UNIQUE_OUTER,			/* LHS path must be made unique */
-	JOIN_UNIQUE_INNER			/* RHS path must be made unique */
+	JOIN_UNIQUE_OUTER,			/* 需要使左侧路径唯一 */
+	JOIN_UNIQUE_INNER			/* 需要使右侧路径唯一 */
 
 	/*
-	 * We might need additional join types someday.
+	 * 将来可能需要额外的连接类型。
 	 */
 } JoinType;
 
@@ -744,12 +766,12 @@ typedef enum JoinType
 	   (1 << JOIN_RIGHT) | \
 	   (1 << JOIN_ANTI))) != 0)
 
-/*
- * AggStrategy -
- *	  overall execution strategies for Agg plan nodes
- *
- * This is needed in both pathnodes.h and plannodes.h, so put it here...
- */
+ /*
+  * AggStrategy -
+  *	  overall execution strategies for Agg plan nodes
+  *
+  * This is needed in both pathnodes.h and plannodes.h, so put it here...
+  */
 typedef enum AggStrategy
 {
 	AGG_PLAIN,					/* simple agg across all input rows */
@@ -765,7 +787,7 @@ typedef enum AggStrategy
  * This is needed in both pathnodes.h and plannodes.h, so put it here...
  */
 
-/* Primitive options supported by nodeAgg.c: */
+ /* Primitive options supported by nodeAgg.c: */
 #define AGGSPLITOP_COMBINE		0x01	/* substitute combinefn for transfn */
 #define AGGSPLITOP_SKIPFINAL	0x02	/* skip finalfn, return state as-is */
 #define AGGSPLITOP_SERIALIZE	0x04	/* apply serializefn to output */

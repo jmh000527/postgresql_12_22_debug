@@ -174,31 +174,24 @@ replace_empty_jointree(Query *parse)
 
 /*
  * pull_up_sublinks
- *		Attempt to pull up ANY and EXISTS SubLinks to be treated as
- *		semijoins or anti-semijoins.
+ *		尝试将 ANY 和 EXISTS 类型的 SubLink 上拉为半连接或反半连接处理。
  *
- * A clause "foo op ANY (sub-SELECT)" can be processed by pulling the
- * sub-SELECT up to become a rangetable entry and treating the implied
- * comparisons as quals of a semijoin.  However, this optimization *only*
- * works at the top level of WHERE or a JOIN/ON clause, because we cannot
- * distinguish whether the ANY ought to return FALSE or NULL in cases
- * involving NULL inputs.  Also, in an outer join's ON clause we can only
- * do this if the sublink is degenerate (ie, references only the nullable
- * side of the join).  In that case it is legal to push the semijoin
- * down into the nullable side of the join.  If the sublink references any
- * nonnullable-side variables then it would have to be evaluated as part
- * of the outer join, which makes things way too complicated.
+ * 例如 "foo op ANY (sub-SELECT)" 这种子查询，可以通过将 sub-SELECT 上拉为
+ * 一个 rangetable 条目，并将比较条件作为半连接的条件来处理。
+ * 但这种优化仅在 WHERE 或 JOIN/ON 子句的顶层有效，因为在涉及 NULL 输入的情况下，
+ * 无法区分 ANY 应返回 FALSE 还是 NULL。
+ * 并且在外连接的 ON 子句中，只有当子查询是退化的（即只引用连接的可空侧）时才允许，
+ * 这种情况下可以将半连接下推到连接的可空侧。如果子查询引用了不可空侧的变量，
+ * 则必须在外连接中进行评估，这会变得非常复杂。
  *
- * Under similar conditions, EXISTS and NOT EXISTS clauses can be handled
- * by pulling up the sub-SELECT and creating a semijoin or anti-semijoin.
+ * 类似地，EXISTS 和 NOT EXISTS 子句也可以在类似条件下通过上拉子查询，
+ * 创建半连接或反半连接来处理。
  *
- * This routine searches for such clauses and does the necessary parsetree
- * transformations if any are found.
+ * 本函数会搜索这些子句，并在发现时进行必要的语法树转换。
  *
- * This routine has to run before preprocess_expression(), so the quals
- * clauses are not yet reduced to implicit-AND format, and are not guaranteed
- * to be AND/OR-flat either.  That means we need to recursively search through
- * explicit AND clauses.  We stop as soon as we hit a non-AND item.
+ * 本函数必须在 preprocess_expression() 之前运行，因此 quals 子句尚未被
+ * 转换为隐式 AND 格式，也不保证是 AND/OR 平展的。因此需要递归搜索显式 AND 子句，
+ * 一旦遇到非 AND 项则停止。
  */
 void
 pull_up_sublinks(PlannerInfo *root)
@@ -206,14 +199,22 @@ pull_up_sublinks(PlannerInfo *root)
 	Node	   *jtnode;
 	Relids		relids;
 
-	/* Begin recursion through the jointree */
+	/*
+	 * 递归遍历连接树以提升子链接（Sublinks）。
+	 *
+	 * 参数:
+	 *   root    - 优化器的 PlannerInfo 结构体，包含查询的上下文信息。
+	 *   (Node *) root->parse->jointree - 查询的连接树（jointree），作为递归的起始节点。可能分析为 FromExpr、JoinExpr 或 RangeTblRef。
+	 *   &relids - 输出参数。指向 relids 的指针，用于收集涉及的 relid 集合。
+	 */
+	/* 开始递归遍历连接树 */
 	jtnode = pull_up_sublinks_jointree_recurse(root,
 											   (Node *) root->parse->jointree,
 											   &relids);
 
 	/*
-	 * root->parse->jointree must always be a FromExpr, so insert a dummy one
-	 * if we got a bare RangeTblRef or JoinExpr out of the recursion.
+	 * root->parse->jointree 必须始终为 FromExpr，
+	 * 如果递归结果是单独的 RangeTblRef 或 JoinExpr，则插入一个虚拟的 FromExpr。
 	 */
 	if (IsA(jtnode, FromExpr))
 		root->parse->jointree = (FromExpr *) jtnode;
@@ -222,43 +223,44 @@ pull_up_sublinks(PlannerInfo *root)
 }
 
 /*
- * Recurse through jointree nodes for pull_up_sublinks()
+ * 递归遍历连接树节点以提升子链接（Sublinks）
  *
- * In addition to returning the possibly-modified jointree node, we return
- * a relids set of the contained rels into *relids.
+ * 除了返回可能被修改的连接树节点外，还通过 *relids 返回该子树包含的 relids 集合。
  */
 static Node *
 pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 								  Relids *relids)
 {
-	/* Since this function recurses, it could be driven to stack overflow. */
+	/* 由于本函数递归调用，可能导致栈溢出，需检查栈深度 */
 	check_stack_depth();
 
 	if (jtnode == NULL)
 	{
 		*relids = NULL;
 	}
-	else if (IsA(jtnode, RangeTblRef))
+	else if (IsA(jtnode, RangeTblRef))	/* 一定是查询树的叶子节点，是递归结束的条件 */
 	{
-		int			varno = ((RangeTblRef *) jtnode)->rtindex;
+		int	varno = ((RangeTblRef *) jtnode)->rtindex;
 
 		*relids = bms_make_singleton(varno);
-		/* jtnode is returned unmodified */
+		/* 返回未修改的 jtnode */
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
+		/* 处理 FromExpr 节点（连接树的中间节点） */
 		FromExpr   *f = (FromExpr *) jtnode;
-		List	   *newfromlist = NIL;
-		Relids		frelids = NULL;
-		FromExpr   *newf;
-		Node	   *jtlink;
-		ListCell   *l;
+		List	   *newfromlist = NIL;	/* 新的 fromlist，用于保存递归处理后的子节点 */
+		Relids		frelids = NULL;		/* 当前 FromExpr 包含的所有 relids */
+		FromExpr   *newf;				/* 新构造的 FromExpr 节点 */
+		Node	   *jtlink;				/* 用于连接新节点的指针 */
+		ListCell   *l;					/* 用于遍历 fromlist 的链表指针 */
 
-		/* First, recurse to process children and collect their relids */
+		/* 首先递归处理子节点并收集它们的 relids */
 		foreach(l, f->fromlist)
 		{
-			Node	   *newchild;
-			Relids		childrelids;
+			/* 递归处理 fromlist 的每个子节点，并收集其 relids */
+			Node	   *newchild;		/* 递归处理后的新子节点 */
+			Relids		childrelids;	/* 当前子节点包含的 relids 集合 */
 
 			newchild = pull_up_sublinks_jointree_recurse(root,
 														 lfirst(l),
@@ -266,59 +268,53 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 			newfromlist = lappend(newfromlist, newchild);
 			frelids = bms_join(frelids, childrelids);
 		}
-		/* Build the replacement FromExpr; no quals yet */
+		/* 构造新的 FromExpr，暂时不处理 quals */
 		newf = makeFromExpr(newfromlist, NULL);
-		/* Set up a link representing the rebuilt jointree */
+		/* 设置代表重建连接树的 jtlink */
 		jtlink = (Node *) newf;
-		/* Now process qual --- all children are available for use */
+		/* 处理 quals，所有子节点都可用 */
 		newf->quals = pull_up_sublinks_qual_recurse(root, f->quals,
 													&jtlink, frelids,
 													NULL, NULL);
 
 		/*
-		 * Note that the result will be either newf, or a stack of JoinExprs
-		 * with newf at the base.  We rely on subsequent optimization steps to
-		 * flatten this and rearrange the joins as needed.
+		 * 返回结果可能是 newf，也可能是以 newf 为底的 JoinExpr 堆栈。
+		 * 后续优化步骤会进一步扁平化和重排这些连接。
 		 *
-		 * Although we could include the pulled-up subqueries in the returned
-		 * relids, there's no need since upper quals couldn't refer to their
-		 * outputs anyway.
+		 * 虽然可以将上拉的子查询包含在返回的 relids 中，但没有必要，
+		 * 因为上层 quals 不会引用它们的输出。
 		 */
 		*relids = frelids;
 		jtnode = jtlink;
 	}
 	else if (IsA(jtnode, JoinExpr))
 	{
-		JoinExpr   *j;
-		Relids		leftrelids;
-		Relids		rightrelids;
-		Node	   *jtlink;
+		/* 处理 JoinExpr 节点（连接树的中间节点） */
+		JoinExpr   *j;           /* 新构造的 JoinExpr 节点 */
+		Relids		leftrelids;   /* 左子树包含的 relids 集合 */
+		Relids		rightrelids;  /* 右子树包含的 relids 集合 */
+		Node	   *jtlink;       /* 用于连接新节点的指针 */
 
 		/*
-		 * Make a modifiable copy of join node, but don't bother copying its
-		 * subnodes (yet).
+		 * 构造可修改的 JoinExpr 节点，但暂时不复制其子节点
 		 */
 		j = (JoinExpr *) palloc(sizeof(JoinExpr));
 		memcpy(j, jtnode, sizeof(JoinExpr));
 		jtlink = (Node *) j;
 
-		/* Recurse to process children and collect their relids */
+		/* 递归处理左右子节点并收集 relids */
 		j->larg = pull_up_sublinks_jointree_recurse(root, j->larg,
 													&leftrelids);
 		j->rarg = pull_up_sublinks_jointree_recurse(root, j->rarg,
 													&rightrelids);
 
 		/*
-		 * Now process qual, showing appropriate child relids as available,
-		 * and attach any pulled-up jointree items at the right place. In the
-		 * inner-join case we put new JoinExprs above the existing one (much
-		 * as for a FromExpr-style join).  In outer-join cases the new
-		 * JoinExprs must go into the nullable side of the outer join. The
-		 * point of the available_rels machinations is to ensure that we only
-		 * pull up quals for which that's okay.
+		 * 处理 quals，展示合适的子节点 relids，并将上拉的连接节点插入正确位置。
+		 * 对于内连接，新 JoinExpr 节点放在现有连接之上（类似 FromExpr）。
+		 * 对于外连接，新 JoinExpr 节点必须插入到外连接的可空侧。
+		 * available_rels 的设计就是为了保证只上拉那些可以安全处理的 quals。
 		 *
-		 * We don't expect to see any pre-existing JOIN_SEMI or JOIN_ANTI
-		 * nodes here.
+		 * 这里不期望出现 JOIN_SEMI 或 JOIN_ANTI 类型的节点。
 		 */
 		switch (j->jointype)
 		{
@@ -336,7 +332,7 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 														 NULL, NULL);
 				break;
 			case JOIN_FULL:
-				/* can't do anything with full-join quals */
+				/* 全连接的 quals 无法处理 */
 				break;
 			case JOIN_RIGHT:
 				j->quals = pull_up_sublinks_qual_recurse(root, j->quals,
@@ -351,12 +347,10 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 		}
 
 		/*
-		 * Although we could include the pulled-up subqueries in the returned
-		 * relids, there's no need since upper quals couldn't refer to their
-		 * outputs anyway.  But we *do* need to include the join's own rtindex
-		 * because we haven't yet collapsed join alias variables, so upper
-		 * levels would mistakenly think they couldn't use references to this
-		 * join.
+		 * 虽然可以将上拉的子查询包含在返回的 relids 中，但没有必要，
+		 * 因为上层 quals 不会引用它们的输出。
+		 * 但需要包含连接自身的 rtindex，因为此时还未展开连接别名变量，
+		 * 上层可能会错误地认为不能引用该连接。
 		 */
 		*relids = bms_join(leftrelids, rightrelids);
 		if (j->rtindex)
@@ -364,7 +358,7 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 		jtnode = jtlink;
 	}
 	else
-		elog(ERROR, "unrecognized node type: %d",
+		elog(ERROR, "unrecognized join type: %d",
 			 (int) nodeTag(jtnode));
 	return jtnode;
 }
