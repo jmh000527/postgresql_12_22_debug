@@ -145,8 +145,8 @@ static void remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel);
 
 /*
  * make_one_rel
- *	  为执行查询查找所有可能的访问路径，返回表示查询中所有基表连接的单个 rel。
- *    向 RelOptInfo 结构添加所有可行的路径。
+ *	  Finds all possible access paths for executing a query, returning a
+ *	  single rel that represents the join of all base rels in the query.
  */
 RelOptInfo *
 make_one_rel(PlannerInfo *root, List *joinlist)
@@ -156,48 +156,47 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 	double		total_pages;
 
 	/*
-	 * 构建 all_baserels Relids 集合（表示查询中所有的基表变元集）。
-	 * 遍历 simple_rel_array 数组，收集所有基表 relid
-	 * simple_rel_array 数组按 RT 索引存储 RelOptInfo 指针
-	 * 跳过 NULL 槽和非基表 reloptkind
+	 * Construct the all_baserels Relids set.
 	 */
 	root->all_baserels = NULL;
-	
 	for (rti = 1; rti < root->simple_rel_array_size; rti++)
 	{
 		RelOptInfo *brel = root->simple_rel_array[rti];
 
-		/* 可能有对应非基表 RTE 的空槽，跳过 */
+		/* there may be empty slots corresponding to non-baserel RTEs */
 		if (brel == NULL)
 			continue;
 
-		Assert(brel->relid == rti); /* 数组一致性断言 */
+		Assert(brel->relid == rti); /* sanity check on array */
 
-		/* 忽略被标记为 "other rels" 的 RTE */
+		/* ignore RTEs that are "other rels" */
 		if (brel->reloptkind != RELOPT_BASEREL)
 			continue;
 
-		/* 将基表加入集合 */
 		root->all_baserels = bms_add_member(root->all_baserels, brel->relid);
 	}
 
-	/* 标记基表是否需要考虑 fast-start（快速启动）计划 */
+	/* Mark base rels as to whether we care about fast-start plans */
 	set_base_rel_consider_startup(root);
 
 	/*
-	 * 为每个基表计算大小估计（行数、页数、宽度等）并设置 consider_parallel 标志
-	 * 这些信息随后会用于生成参数化路径和并行路径的判断。
+	 * Compute size estimates and consider_parallel flags for each base rel.
 	 */
 	set_base_rel_sizes(root);
 
 	/*
-	 * 此时我们应该对查询中涉及到的每个实际表都有了大小估计，并且知道哪些表
-	 * 被连接消除、分区剪枝或约束排除删除了。因此可以计算 total_table_pages。
+	 * We should now have size estimates for every actual table involved in
+	 * the query, and we also know which if any have been deleted from the
+	 * query by join removal, pruned by partition pruning, or eliminated by
+	 * constraint exclusion.  So we can now compute total_table_pages.
 	 *
-	 * 注意：对于 appendrel（继承/分区的父表），父表的 pages 保持为 0，避免重复计数。
+	 * Note that appendrels are not double-counted here, even though we don't
+	 * bother to distinguish RelOptInfos for appendrel parents, because the
+	 * parents will have pages = 0.
 	 *
-	 * XXX: 如果表被自连接，这里会按出现次数重复计数，是否合适尚不明确，
-	 *      且在此处检测自连接比较困难，故暂不处理。
+	 * XXX if a table is self-joined, we will count it once per appearance,
+	 * which perhaps is the wrong thing ... but that's not completely clear,
+	 * and detecting self-joins here is difficult, so ignore it for now.
 	 */
 	total_pages = 0;
 	for (rti = 1; rti < root->simple_rel_array_size; rti++)
@@ -207,36 +206,28 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 		if (brel == NULL)
 			continue;
 
-		Assert(brel->relid == rti); /* 数组一致性断言 */
+		Assert(brel->relid == rti); /* sanity check on array */
 
-		/* 跳过已被证明为空的关系（dummy rel） */
 		if (IS_DUMMY_REL(brel))
 			continue;
 
-		/* 只统计简单基表（非 join/append 等）页数 */
 		if (IS_SIMPLE_REL(brel))
 			total_pages += (double) brel->pages;
 	}
 	root->total_table_pages = total_pages;
 
 	/*
-	 * 生成扫描路径的阶段
-	 *
-	 * 为每个基表生成访问路径（顺序扫描、索引扫描、TID 扫描、外部表等）。
-	 * 这些路径会被添加到每个 RelOptInfo 的 pathlist / partial_pathlist 中。
+	 * Generate access paths for each base rel.
 	 */
 	set_base_rel_pathlists(root);
 
 	/*
-	 * 生成连接路径的阶段
-	 *
-	 * 针对整个连接树生成访问路径（即对 joinlist 中描述的连接项进行组合搜索）。
-	 * 返回的 rel 表示将所有基表连接起来的最终 joinrel。
+	 * Generate access paths for the entire join tree.
 	 */
 	rel = make_rel_from_joinlist(root, joinlist);
 
 	/*
-	 * 结果 rel 的 relids 应该正好等于查询的 all_baserels（所有基表集合）。
+	 * The result should join all and only the query's base rels.
 	 */
 	Assert(bms_equal(rel->relids, root->all_baserels));
 
@@ -288,380 +279,309 @@ set_base_rel_consider_startup(PlannerInfo *root)
 
 /*
  * set_base_rel_sizes
- *	  设置每个基础关系条目的大小估计值（行数和宽度）。
- *	  同时确定是否为基础关系考虑并行路径。
+ *	  Set the size estimates (rows and widths) for each base-relation entry.
+ *	  Also determine whether to consider parallel paths for base relations.
  *
- * 我们在单独的遍历中执行此操作，以便行数估计值可用于参数化路径生成，
- * 并且在开始生成路径之前，每个关系的consider_parallel标志被正确设置。
- * 功能：为所有基础关系设置大小估计并确定并行执行的可行性
- * 参数：root - 规划器信息结构，包含查询的整体规划状态
+ * We do this in a separate pass over the base rels so that rowcount
+ * estimates are available for parameterized path generation, and also so
+ * that each rel's consider_parallel flag is set correctly before we begin to
+ * generate paths.
  */
 static void
 set_base_rel_sizes(PlannerInfo *root)
 {
-	/* 关系表索引，用于遍历所有关系 */
 	Index		rti;
 
-	/* 遍历所有可能的关系表索引（从1开始，因为索引0通常不使用） */
 	for (rti = 1; rti < root->simple_rel_array_size; rti++)
 	{
-		/* 获取当前索引对应的关系优化信息 */
 		RelOptInfo *rel = root->simple_rel_array[rti];
-		/* 范围表条目指针，稍后用于获取表的元数据 */
 		RangeTblEntry *rte;
 
-		/* 存在可能为空的槽位，对应非基础关系的RTE */
-		/* 说明：跳过数组中为空的关系槽位 */
+		/* there may be empty slots corresponding to non-baserel RTEs */
 		if (rel == NULL)
 			continue;
 
-		/* 对数组进行一致性检查，确保关系ID与数组索引匹配 */
-		Assert(rel->relid == rti);
+		Assert(rel->relid == rti);	/* sanity check on array */
 
-		/* 忽略那些属于"其他关系"类型的RTE */
-		/* 说明：只处理基础关系类型的条目 */
+		/* ignore RTEs that are "other rels" */
 		if (rel->reloptkind != RELOPT_BASEREL)
 			continue;
 
-		/* 获取当前关系对应的范围表条目 */
 		rte = root->simple_rte_array[rti];
 
 		/*
-		 * 如果查询总体上允许并行执行，检查特定于此关系是否允许并行执行。
-		 * 我们必须在set_rel_size()之前执行此操作，因为：
-		 * (a) 如果该关系是继承父表，set_append_rel_size()将使用并可能更改关系的
-		 *     consider_parallel标志；
-		 * (b) 对于某些RTE类型，set_rel_size()会立即生成路径。
+		 * If parallelism is allowable for this query in general, see whether
+		 * it's allowable for this rel in particular.  We have to do this
+		 * before set_rel_size(), because (a) if this rel is an inheritance
+		 * parent, set_append_rel_size() will use and perhaps change the rel's
+		 * consider_parallel flag, and (b) for some RTE types, set_rel_size()
+		 * goes ahead and makes paths immediately.
 		 */
-		/* 说明：确定当前表是否适合并行执行，这会影响后续的路径生成策略 */
 		if (root->glob->parallelModeOK)
 			set_rel_consider_parallel(root, rel, rte);
 
-		/* 设置关系的大小估计（行数和宽度） */
-		/* 说明：根据表的统计信息和约束条件估算关系的大小 */
 		set_rel_size(root, rel, rti, rte);
 	}
 }
 
-
 /*
  * set_base_rel_pathlists
- *    为每个基表生成所有可用的扫描路径（顺序扫描、索引扫描等）。
- *    每个可用路径都会被添加到对应关系的 pathlist 字段中。
- *
- * 这个函数是PostgreSQL查询优化器路径生成阶段的起点，负责初始化所有基表
- * 的访问路径。优化器后续会基于这些路径进行连接路径的构建和选择。
+ *	  Finds all paths available for scanning each base-relation entry.
+ *	  Sequential scan and any available indices are considered.
+ *	  Each useful path is attached to its relation's 'pathlist' field.
  */
 static void
-set_base_rel_pathlists(PlannerInfo *root) /* 规划器全局信息结构，包含查询的所有优化信息 */
+set_base_rel_pathlists(PlannerInfo *root)
 {
-    Index       rti; 	/* 关系表索引（Range Table Index），用于遍历关系表 */
+	Index		rti;
 
-    /*
-     * 遍历 simple_rel_array 数组，为每个基表生成访问路径。
-     * 跳过空槽和非基表类型的关系。
-     * 注意：数组从索引1开始遍历，因为PostgreSQL中关系索引从1开始计数
-     */
-    for (rti = 1; rti < root->simple_rel_array_size; rti++)
-    {
-        /* 获取当前索引对应的关系优化信息结构体 */
-        RelOptInfo *rel = root->simple_rel_array[rti];
+	for (rti = 1; rti < root->simple_rel_array_size; rti++)
+	{
+		RelOptInfo *rel = root->simple_rel_array[rti];
 
-        /* 可能有对应非基表 RTE 的空槽，跳过 */
-        if (rel == NULL)
-            continue;
+		/* there may be empty slots corresponding to non-baserel RTEs */
+		if (rel == NULL)
+			continue;
 
-        /* 数组一致性断言：确保关系ID与数组索引一致 */
-        Assert(rel->relid == rti);
+		Assert(rel->relid == rti);	/* sanity check on array */
 
-        /* 忽略被标记为 "other rels" 的 RTE，只处理基表 */
-        if (rel->reloptkind != RELOPT_BASEREL)
-            continue;
+		/* ignore RTEs that are "other rels" */
+		if (rel->reloptkind != RELOPT_BASEREL)
+			continue;
 
-        /*
-         * 为基表生成访问路径并添加到 pathlist
-         * 调用 set_rel_pathlist 进行实际的路径生成工作
-         * 参数包括：规划器信息、关系优化信息、关系索引和关系表条目
-         */
-        set_rel_pathlist(root, rel, rti, root->simple_rte_array[rti]);
-    }
+		set_rel_pathlist(root, rel, rti, root->simple_rte_array[rti]);
+	}
 }
-
 
 /*
  * set_rel_size
- *	  为基础关系设置大小估计值
- * 功能：根据关系类型设置相应的大小估计（行数和宽度），并针对不同类型的关系采取不同的处理策略
- * 参数：
- *    root - 规划器信息结构，包含查询的整体规划状态
- *    rel - 关系优化信息，代表要设置大小的关系
- *    rti - 关系表索引
- *    rte - 范围表条目，包含表的元数据信息
+ *	  Set size estimates for a base relation
  */
 static void
 set_rel_size(PlannerInfo *root, RelOptInfo *rel,
-		 Index rti, RangeTblEntry *rte)
+			 Index rti, RangeTblEntry *rte)
 {
-	/* 首先检查是否可以通过约束排除来跳过此关系 */
 	if (rel->reloptkind == RELOPT_BASEREL &&
 		relation_excluded_by_constraints(root, rel, rte))
 	{
 		/*
-		 * 我们通过约束排除证明不需要扫描该关系，因此为其设置单个dummy路径。
-		 * 这里我们只检查常规基础关系；如果是otherrel，CE已经在set_append_rel_size()中检查过。
+		 * We proved we don't need to scan the rel via constraint exclusion,
+		 * so set up a single dummy path for it.  Here we only check this for
+		 * regular baserels; if it's an otherrel, CE was already checked in
+		 * set_append_rel_size().
 		 *
-		 * 在这种情况下，我们立即设置关系的路径，而不是留给set_rel_pathlist去做。
-		 * 这是因为除了通过为其分配dummy路径外，我们没有其他方式标记关系为dummy。
+		 * In this case, we go ahead and set up the relation's path right away
+		 * instead of leaving it for set_rel_pathlist to do.  This is because
+		 * we don't have a convention for marking a rel as dummy except by
+		 * assigning a dummy path to it.
 		 */
-		/* 说明：设置空关系的路径列表，表明此关系不需要实际扫描 */
 		set_dummy_rel_pathlist(rel);
 	}
-	/* 处理继承关系（如分区表的父表） */
 	else if (rte->inh)
 	{
-		/* 这是一个"append relation"，相应地处理 */
-		/* 说明：处理继承表或分区表的大小估计 */
+		/* It's an "append relation", process accordingly */
 		set_append_rel_size(root, rel, rti, rte);
 	}
-	/* 处理所有其他类型的关系 */
 	else
 	{
-		/* 根据关系的类型进行不同的处理 */
 		switch (rel->rtekind)
 		{
 			case RTE_RELATION:
-				/* 根据具体的关系类型进一步区分处理 */
 				if (rte->relkind == RELKIND_FOREIGN_TABLE)
 				{
-					/* 外部表 */
-					/* 说明：处理外部数据源表的大小估计 */
+					/* Foreign table */
 					set_foreign_size(root, rel, rte);
 				}
 				else if (rte->relkind == RELKIND_PARTITIONED_TABLE)
 				{
 					/*
-					 * 如果使用ONLY关键字请求扫描分区表，则不应扫描任何分区，
-					 * 因此将其标记为dummy关系。
+					 * We could get here if asked to scan a partitioned table
+					 * with ONLY.  In that case we shouldn't scan any of the
+					 * partitions, so mark it as a dummy rel.
 					 */
-					/* 说明：对于使用ONLY关键字的分区表，将其视为空关系 */
 					set_dummy_rel_pathlist(rel);
 				}
 				else if (rte->tablesample != NULL)
 				{
-					/* 采样关系 */
-					/* 说明：处理使用TABLESAMPLE子句的表的大小估计 */
+					/* Sampled relation */
 					set_tablesample_rel_size(root, rel, rte);
 				}
 				else
 				{
-					/* 普通关系 */
-					/* 说明：处理普通基础表的大小估计 */
+					/* Plain relation */
 					set_plain_rel_size(root, rel, rte);
 				}
 				break;
 			case RTE_SUBQUERY:
 
-					/*
-					 * 子查询不支持在参数化和非参数化路径之间进行选择，
-					 * 所以直接立即构建它们的路径。
-					 */
-					/* 说明：为子查询构建访问路径 */
-					set_subquery_pathlist(root, rel, rti, rte);
+				/*
+				 * Subqueries don't support making a choice between
+				 * parameterized and unparameterized paths, so just go ahead
+				 * and build their paths immediately.
+				 */
+				set_subquery_pathlist(root, rel, rti, rte);
 				break;
 			case RTE_FUNCTION:
-				/* 说明：为函数关系设置大小估计 */
 				set_function_size_estimates(root, rel);
 				break;
 			case RTE_TABLEFUNC:
-				/* 说明：为表函数（如unnest）设置大小估计 */
 				set_tablefunc_size_estimates(root, rel);
 				break;
 			case RTE_VALUES:
-				/* 说明：为VALUES列表设置大小估计 */
 				set_values_size_estimates(root, rel);
 				break;
 			case RTE_CTE:
 
-					/*
-					 * CTE不支持在参数化和非参数化路径之间进行选择，
-					 * 所以直接立即构建它们的路径。
-					 */
-					/* 说明：区分自引用CTE和普通CTE进行处理 */
-					if (rte->self_reference)
-						set_worktable_pathlist(root, rel, rte);
-					else
-						set_cte_pathlist(root, rel, rte);
+				/*
+				 * CTEs don't support making a choice between parameterized
+				 * and unparameterized paths, so just go ahead and build their
+				 * paths immediately.
+				 */
+				if (rte->self_reference)
+					set_worktable_pathlist(root, rel, rte);
+				else
+					set_cte_pathlist(root, rel, rte);
 				break;
 			case RTE_NAMEDTUPLESTORE:
-				/* 说明：为命名元组存储设置路径（通常是临时结果集） */
+				/* Might as well just build the path immediately */
 				set_namedtuplestore_pathlist(root, rel, rte);
 				break;
 			case RTE_RESULT:
-				/* 说明：为结果节点设置路径（通常是常量表达式） */
+				/* Might as well just build the path immediately */
 				set_result_pathlist(root, rel, rte);
 				break;
 			default:
-				/* 错误处理：遇到未知的关系类型 */
 				elog(ERROR, "unexpected rtekind: %d", (int) rel->rtekind);
 				break;
 		}
 	}
 
 	/*
-	 * 我们确保所有非dummy关系都有非零的行数估计值。
+	 * We insist that all non-dummy rels have a nonzero rowcount estimate.
 	 */
-	/* 说明：断言检查，确保关系行数估计值的合理性 */
 	Assert(rel->rows > 0 || IS_DUMMY_REL(rel));
 }
 
 /*
  * set_rel_pathlist
- *    为基表构建访问路径
- *
- * 该函数是PostgreSQL查询优化器中的核心函数之一，根据关系类型为各种关系
- * （表、子查询、函数等）生成可能的访问路径。它是连接查询优化中路径生成
- * 过程的基础部分，为不同类型的数据源提供了统一的路径生成入口。
+ *	  Build access paths for a base relation
  */
 static void
-set_rel_pathlist(PlannerInfo *root,     /* 规划器全局信息结构 */
-                 RelOptInfo *rel,      /* 要生成路径的关系优化信息 */
-                 Index rti,            /* 关系表索引 */
-                 RangeTblEntry *rte)   /* 关系表条目，包含表的元数据 */
+set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
+				 Index rti, RangeTblEntry *rte)
 {
-    /*
-     * 根据关系类型选择不同的路径生成方式。
-     * - 如果是 dummy rel（已被证明为空），无需处理。
-     * - 如果是继承/分区表（append rel），调用 set_append_rel_pathlist。
-     * - 否则根据 rtekind 分别处理普通表、外部表、采样表、函数、VALUES、CTE 等。
-     *   部分类型（如子查询、CTE、tuplestore、Result）在 set_rel_size 阶段已处理，这里跳过。
-     */
-    if (IS_DUMMY_REL(rel))
-    {
-        /* 已经证明该关系为空，无需进一步处理 */
-    }
-    else if (rte->inh) /* 检查是否为继承表或分区表 */
-    {
-        /* 继承/分区表，需要特殊处理 - 递归处理子表并生成Append路径 */
-        set_append_rel_pathlist(root, rel, rti, rte);
-    }
-    else
-    {
-        /* 根据关系类型（rtekind）选择相应的路径生成函数 */
-        switch (rel->rtekind)
-        {
-            case RTE_RELATION: /* 普通关系（表） */
-                if (rte->relkind == RELKIND_FOREIGN_TABLE)
-                {
-                    /* 外部表 - 调用外部表专用路径生成函数 */
-                    set_foreign_pathlist(root, rel, rte);
-                }
-                else if (rte->tablesample != NULL)
-                {
-                    /* 采样表 - 需要处理表采样子句 */
-                    set_tablesample_rel_pathlist(root, rel, rte);
-                }
-                else
-                {
-                    /* 普通表 - 生成顺序扫描、索引扫描等路径 */
-                    set_plain_rel_pathlist(root, rel, rte);
-                }
-                break;
-            case RTE_SUBQUERY: /* 子查询 */
-                /* 子查询，已在 set_rel_size 阶段处理，此处跳过 */
-                break;
-            case RTE_FUNCTION: /* FROM 子句中的函数 */
-                /* 处理返回记录集的函数 */
-                set_function_pathlist(root, rel, rte);
-                break;
-            case RTE_TABLEFUNC: /* 表函数（如unnest等） */
-                /* 处理表函数 */
-                set_tablefunc_pathlist(root, rel, rte);
-                break;
-            case RTE_VALUES: /* VALUES 列表（如 VALUES (1,2), (3,4)） */
-                /* 为VALUES列表生成访问路径 */
-                set_values_pathlist(root, rel, rte);
-                break;
-            case RTE_CTE: /* CTE引用（WITH子句） */
-                /* CTE引用，已在 set_rel_size 阶段处理，此处跳过 */
-                break;
-            case RTE_NAMEDTUPLESTORE: /* 命名元组存储引用 */
-                /* tuplestore引用，已在 set_rel_size 阶段处理，此处跳过 */
-                break;
-            case RTE_RESULT: /* Result类型 */
-                /* Result RTE，已在 set_rel_size 阶段处理，此处跳过 */
-                break;
-            default:
-                /* 未预期的关系类型，报错 */
-                elog(ERROR, "unexpected rtekind: %d", (int) rel->rtekind);
-                break;
-        }
-    }
+	if (IS_DUMMY_REL(rel))
+	{
+		/* We already proved the relation empty, so nothing more to do */
+	}
+	else if (rte->inh)
+	{
+		/* It's an "append relation", process accordingly */
+		set_append_rel_pathlist(root, rel, rti, rte);
+	}
+	else
+	{
+		switch (rel->rtekind)
+		{
+			case RTE_RELATION:
+				if (rte->relkind == RELKIND_FOREIGN_TABLE)
+				{
+					/* Foreign table */
+					set_foreign_pathlist(root, rel, rte);
+				}
+				else if (rte->tablesample != NULL)
+				{
+					/* Sampled relation */
+					set_tablesample_rel_pathlist(root, rel, rte);
+				}
+				else
+				{
+					/* Plain relation */
+					set_plain_rel_pathlist(root, rel, rte);
+				}
+				break;
+			case RTE_SUBQUERY:
+				/* Subquery --- fully handled during set_rel_size */
+				break;
+			case RTE_FUNCTION:
+				/* RangeFunction */
+				set_function_pathlist(root, rel, rte);
+				break;
+			case RTE_TABLEFUNC:
+				/* Table Function */
+				set_tablefunc_pathlist(root, rel, rte);
+				break;
+			case RTE_VALUES:
+				/* Values list */
+				set_values_pathlist(root, rel, rte);
+				break;
+			case RTE_CTE:
+				/* CTE reference --- fully handled during set_rel_size */
+				break;
+			case RTE_NAMEDTUPLESTORE:
+				/* tuplestore reference --- fully handled during set_rel_size */
+				break;
+			case RTE_RESULT:
+				/* simple Result --- fully handled during set_rel_size */
+				break;
+			default:
+				elog(ERROR, "unexpected rtekind: %d", (int) rel->rtekind);
+				break;
+		}
+	}
 
-    /*
-     * 允许插件对该基表的路径进行编辑，可以通过 add_path/add_partial_path 添加自定义路径，
-     * 也可以删除或修改核心代码添加的路径。
-     * 这是PostgreSQL优化器的扩展点之一，允许第三方扩展自定义优化策略。
-     */
-    if (set_rel_pathlist_hook)
-        (*set_rel_pathlist_hook) (root, rel, rti, rte);
+	/*
+	 * Allow a plugin to editorialize on the set of Paths for this base
+	 * relation.  It could add new paths (such as CustomPaths) by calling
+	 * add_path(), or add_partial_path() if parallel aware.  It could also
+	 * delete or modify paths added by the core code.
+	 */
+	if (set_rel_pathlist_hook)
+		(*set_rel_pathlist_hook) (root, rel, rti, rte);
 
-    /*
-     * 如果是 baserel，且不是唯一基表（即存在连接），则考虑将 partial path 封装为 Gather 路径。
-     * 需要在 set_rel_pathlist_hook 之后调用，以便插件可以添加 partial path。
-     * 如果是继承子表则跳过，避免生成过多 Gather 节点，统一在父 appendrel 上处理。
-     * 如果是唯一基表（无连接），则推迟到最终 targetlist 可用时再处理（见 grouping_planner）。
-     *
-     * 这部分代码处理并行查询执行路径的生成，将部分路径（partial path）包装为Gather路径。
-     */
-    if (rel->reloptkind == RELOPT_BASEREL && /* 确保是基表 */
-        bms_membership(root->all_baserels) != BMS_SINGLETON) /* 确保不是唯一基表 */
-        generate_gather_paths(root, rel, false); /* 生成并行执行路径 */
+	/*
+	 * If this is a baserel, we should normally consider gathering any partial
+	 * paths we may have created for it.  We have to do this after calling the
+	 * set_rel_pathlist_hook, else it cannot add partial paths to be included
+	 * here.
+	 *
+	 * However, if this is an inheritance child, skip it.  Otherwise, we could
+	 * end up with a very large number of gather nodes, each trying to grab
+	 * its own pool of workers.  Instead, we'll consider gathering partial
+	 * paths for the parent appendrel.
+	 *
+	 * Also, if this is the topmost scan/join rel (that is, the only baserel),
+	 * we postpone gathering until the final scan/join targetlist is available
+	 * (see grouping_planner).
+	 */
+	if (rel->reloptkind == RELOPT_BASEREL &&
+		bms_membership(root->all_baserels) != BMS_SINGLETON)
+		generate_gather_paths(root, rel, false);
 
-    /*
-     * 选择该关系的最优路径
-     * 调用set_cheapest函数从所有生成的路径中选择成本最低的路径，
-     * 分别针对总代价、启动代价和排序后的路径进行选择。
-     */
-    set_cheapest(rel);
+	/* Now find the cheapest of the paths for this rel */
+	set_cheapest(rel);
 
 #ifdef OPTIMIZER_DEBUG
-    /* 调试模式下打印关系和路径信息 */
-    debug_print_rel(root, rel);
+	debug_print_rel(root, rel);
 #endif
 }
 
-
 /*
  * set_plain_rel_size
- *    设置普通关系（无派生表，无继承）的大小估计值
- *
- * 参数说明：
- *    root - 规划器的全局信息结构，包含查询的所有规划信息
- *    rel - 关系的优化信息结构，用于存储关系的路径和统计信息
- *    rte - 范围表条目，表示查询中引用的关系
- *
- * 函数功能：
- *    该函数负责计算并设置普通基表的大小估计值，包括行数、行宽等统计信息。
- *    它是PostgreSQL查询优化器中路径生成阶段的重要组成部分。
+ *	  Set size estimates for a plain relation (no subquery, no inheritance)
  */
 static void
 set_plain_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-    /*
-     * 测试该关系的所有部分索引的适用性。
-     * 我们必须首先执行此操作，因为部分唯一索引可能会影响大小估计结果。
-     * 例如，部分索引可以确保满足特定条件的行的唯一性，这会影响最终结果集的大小估计。
-     */
-    check_index_predicates(root, rel);
+	/*
+	 * Test any partial indexes of rel for applicability.  We must do this
+	 * first since partial unique indexes can affect size estimates.
+	 */
+	check_index_predicates(root, rel);
 
-    /*
-     * 使用基于统计信息的方法估计普通基表的输出行数、宽度等信息。
-     * 这一步将填充rel结构中的rows（估计行数）、width（平均行宽）
-     * 以及其他与关系大小相关的统计信息，这些信息对后续的路径生成和成本计算至关重要。
-     */
-    set_baserel_size_estimates(root, rel);
+	/* Mark rel with estimated output rows, width, etc */
+	set_baserel_size_estimates(root, rel);
 }
-
 
 /*
  * If this relation could possibly be scanned from within a worker, then set
@@ -840,101 +760,53 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * set_plain_rel_pathlist
- *	  为普通表（无子查询、无继承）生成访问路径
- * 功能：为普通基础表构建各种可能的扫描路径，包括顺序扫描、并行扫描、索引扫描和TID扫描
- * 参数：
- *    root - 规划器信息结构，包含查询的整体规划状态
- *    rel - 关系优化信息，代表要为其生成路径的表
- *    rte - 范围表条目，包含表的元数据信息
- * 说明：此函数负责生成普通表的所有可能访问路径，是查询优化过程中路径生成阶段的关键组件
+ *	  Build access paths for a plain relation (no subquery, no inheritance)
  */
 static void
 set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-	/* 存储需要作为参数提供的外部关系ID集合 */
 	Relids		required_outer;
 
 	/*
-	 * 顺序扫描不支持将连接条件下推到 quals，但如果 tlist 中有 LATERAL 引用，
-	 * 仍然可能需要参数化路径。
-	 * 说明：确定当前表是否依赖于其他关系（LATERAL连接中），如果依赖则需要参数化路径
+	 * We don't support pushing join clauses into the quals of a seqscan, but
+	 * it could still have required parameterization due to LATERAL refs in
+	 * its tlist.
 	 */
 	required_outer = rel->lateral_relids;
 
-	/* 添加顺序扫描路径 */
-	/* 说明：创建并添加顺序扫描路径，这是最基础的表访问方式，扫描表的所有行 */
+	/* Consider sequential scan */
 	add_path(rel, create_seqscan_path(root, rel, required_outer, 0));
 
-	/* 如果允许并行且无参数化，考虑并行顺序扫描路径 */
-	/* 说明：当表允许并行扫描且不需要外部参数时，创建并行执行的顺序扫描路径以提高性能 */
+	/* If appropriate, consider parallel sequential scan */
 	if (rel->consider_parallel && required_outer == NULL)
 		create_plain_partial_paths(root, rel);
 
-	/* 添加索引扫描路径 */
-	/* 说明：为表上的所有可用索引创建相应的索引扫描路径，利用索引加速数据访问 */
+	/* Consider index scans */
 	create_index_paths(root, rel);
 
-	/* 添加 TID 扫描路径 */
-	/* 说明：创建基于元组标识符(TID)的扫描路径，适用于直接通过ctid访问特定行的情况 */
+	/* Consider TID scans */
 	create_tidscan_paths(root, rel);
 }
 
-
 /*
  * create_plain_partial_paths
- *    为普通关系创建并行扫描的部分访问路径
- *
- * 功能说明：
- *    此函数为普通表关系（非分区表、非外部表等简单关系）生成并行顺序扫描的部分路径。
- *    部分路径(partial paths)是指可以并行执行的访问路径段，这些路径可以被Gather或
- *    Gather Merge节点收集和汇总，从而实现查询的并行执行。
- *
- * 参数：
- *    root - 规划器信息结构，包含查询的整体上下文和状态
- *    rel - 关系优化信息结构，表示要为其创建并行路径的关系
- *
- * 返回值：
- *    无返回值，通过修改rel结构中的partial_pathlist来添加生成的路径
+ *	  Build partial access paths for parallel scan of a plain relation
  */
 static void
 create_plain_partial_paths(PlannerInfo *root, RelOptInfo *rel)
 {
-    /* 用于存储计算得到的并行工作线程数 */
-    int         parallel_workers;
+	int			parallel_workers;
 
-    /*
-     * 计算需要的并行工作线程数
-     * 参数说明：
-     *   rel - 当前关系结构
-     *   rel->pages - 关系包含的数据页数，用于估算并行度
-     *   -1 - 表示使用默认的并行阈值
-     *   max_parallel_workers_per_gather - 每个Gather节点允许的最大工作线程数
-     */
-    parallel_workers = compute_parallel_worker(rel, rel->pages, -1,
-                                               max_parallel_workers_per_gather);
+	parallel_workers = compute_parallel_worker(rel, rel->pages, -1,
+											   max_parallel_workers_per_gather);
 
-    /*
-     * 如果并行工作线程数小于等于0，表示用户配置不允许并行扫描，
-     * 或者根据表大小/系统资源计算后不适合并行扫描。
-     * 在这种情况下，直接返回，不创建并行路径。
-     */
-    if (parallel_workers <= 0)
-        return;
+	/* If any limit was set to zero, the user doesn't want a parallel scan. */
+	if (parallel_workers <= 0)
+		return;
 
-    /*
-     * 添加一个基于并行顺序扫描的无序部分路径
-     * 参数说明：
-     *   root - 规划器信息
-     *   rel - 目标关系
-     *   NULL - 表示不指定特定的排序路径键（无序扫描）
-     *   parallel_workers - 执行扫描的并行工作线程数
-     *
-     * 注意：create_seqscan_path函数会根据parallel_workers参数自动区分是普通顺序扫描
-     * 还是并行顺序扫描。当parallel_workers>0时，创建的是并行顺序扫描路径。
-     */
-    add_partial_path(rel, create_seqscan_path(root, rel, NULL, parallel_workers));
+	/* Add an unordered partial path based on a parallel sequential scan. */
+	add_partial_path(rel, create_seqscan_path(root, rel, NULL, parallel_workers));
 }
-
 
 /*
  * set_tablesample_rel_size
@@ -978,105 +850,71 @@ set_tablesample_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 /*
  * set_tablesample_rel_pathlist
- *    为采样关系构建访问路径
- * 
- * 参数说明：
- *    root - 规划器全局信息结构体指针，包含查询优化过程中的所有上下文信息
- *    rel - 关系优化信息结构体指针，表示当前需要构建访问路径的采样关系
- *    rte - 范围表条目指针，包含采样关系的元数据信息
- * 
- * 返回值：
- *    void - 无返回值，直接修改传入的rel结构体的路径列表
- * 
- * 功能说明：
- *    此函数专门为使用TABLESAMPLE子句的关系构建访问路径。它处理采样扫描的特殊需求，
- *    包括LATERAL引用支持和不可重复采样方法的处理。
+ *	  Build access paths for a sampled relation
  */
 static void
 set_tablesample_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-    Relids      required_outer;  /* 存储LATERAL引用所需的外部关系ID集合 */
-    Path       *path;            /* 当前构建的采样扫描路径 */
+	Relids		required_outer;
+	Path	   *path;
 
-    /*
-     * 我们不支持将连接条件推入到采样扫描的quals中，
-     * 但由于其目标列表或TABLESAMPLE参数中的LATERAL引用，
-     * 采样扫描仍然可能需要参数化处理。
-     */
-    required_outer = rel->lateral_relids;  /* 获取LATERAL引用所需的外部关系ID */
+	/*
+	 * We don't support pushing join clauses into the quals of a samplescan,
+	 * but it could still have required parameterization due to LATERAL refs
+	 * in its tlist or TABLESAMPLE arguments.
+	 */
+	required_outer = rel->lateral_relids;
 
-    /* 考虑采样扫描路径 */
-    path = create_samplescan_path(root, rel, required_outer);  /* 创建采样扫描路径 */
+	/* Consider sampled scan */
+	path = create_samplescan_path(root, rel, required_outer);
 
-    /*
-     * 如果采样方法不支持可重复扫描，我们必须避免可能多次扫描该关系的计划。
-     * 理想情况下，我们只需避免将该关系放在嵌套循环连接的内部；但为了支持
-     * 次优采样方法的不常见用法，在规划器中添加这样的考虑似乎过于复杂。
-     * 相反，如果查询可能执行不安全的连接，只需将SampleScan包装在Materialize节点中。
-     * 我们可以通过计算all_baserels的成员数来检查连接（注意这正确地将继承树计为单个关系）。
-     * 如果我们在子查询内部，无法轻松检查外部查询是否可能发生连接，因此假设可能发生连接。
-     *
-     * GetTsmRoutine相对于这里的其他测试来说比较昂贵，所以最后检查repeatable_across_scans，
-     * 尽管这有点奇怪。
-     */
-    if ((root->query_level > 1 ||  /* 在子查询内部，假设可能发生连接 */
-         bms_membership(root->all_baserels) != BMS_SINGLETON) &&  /* 存在多个基础关系，可能发生连接 */
-        !(GetTsmRoutine(rte->tablesample->tsmhandler)->repeatable_across_scans))  /* 采样方法不支持跨扫描重复 */
-    {
-        path = (Path *) create_material_path(rel, path);  /* 创建物化路径包装采样扫描 */
-    }
+	/*
+	 * If the sampling method does not support repeatable scans, we must avoid
+	 * plans that would scan the rel multiple times.  Ideally, we'd simply
+	 * avoid putting the rel on the inside of a nestloop join; but adding such
+	 * a consideration to the planner seems like a great deal of complication
+	 * to support an uncommon usage of second-rate sampling methods.  Instead,
+	 * if there is a risk that the query might perform an unsafe join, just
+	 * wrap the SampleScan in a Materialize node.  We can check for joins by
+	 * counting the membership of all_baserels (note that this correctly
+	 * counts inheritance trees as single rels).  If we're inside a subquery,
+	 * we can't easily check whether a join might occur in the outer query, so
+	 * just assume one is possible.
+	 *
+	 * GetTsmRoutine is relatively expensive compared to the other tests here,
+	 * so check repeatable_across_scans last, even though that's a bit odd.
+	 */
+	if ((root->query_level > 1 ||
+		 bms_membership(root->all_baserels) != BMS_SINGLETON) &&
+		!(GetTsmRoutine(rte->tablesample->tsmhandler)->repeatable_across_scans))
+	{
+		path = (Path *) create_material_path(rel, path);
+	}
 
-    add_path(rel, path);  /* 将路径添加到关系的路径列表中 */
+	add_path(rel, path);
 
-    /* 目前，至少没有其他路径需要考虑 */
+	/* For the moment, at least, there are no other paths to consider */
 }
-
 
 /*
  * set_foreign_size
- *      为外部表范围表条目(RTE)设置大小估计值
- *      
- * 参数说明：
- *      root - 规划器全局信息结构体指针，包含查询优化过程中的所有上下文信息
- *      rel - 关系优化信息结构体指针，表示当前需要设置大小估计的外部表关系
- *      rte - 范围表条目指针，包含外部表的元数据信息
- *
- * 返回值：
- *      void - 无返回值，直接修改传入的rel结构体
- *
- * 功能说明：
- *      此函数负责初始化和调整外部表的统计信息估计，为查询优化器提供必要的大小信息，
- *      包括行数、宽度等估计值。这些估计值对于外部表查询计划的生成和成本计算至关重要。
+ *		Set size estimates for a foreign table RTE
  */
 static void
 set_foreign_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-    /* 
-     * 首先调用set_foreign_size_estimates设置外部表的基本大小估计信息，
-     * 包括估计的输出行数、元组宽度等统计数据
-     */
-    set_foreign_size_estimates(root, rel);
+	/* Mark rel with estimated output rows, width, etc */
+	set_foreign_size_estimates(root, rel);
 
-    /* 
-     * 允许外部数据包装器(FDW)通过GetForeignRelSize钩子函数调整大小估计值，
-     * 这为特定的FDW提供了机会来提供更准确的表大小估计，利用FDW可能拥有的特定数据源信息
-     */
-    rel->fdwroutine->GetForeignRelSize(root, rel, rte->relid);
+	/* Let FDW adjust the size estimates, if it can */
+	rel->fdwroutine->GetForeignRelSize(root, rel, rte->relid);
 
-    /* 
-     * 对行数估计值进行边界检查，确保行数不为零，避免后续计算中出现除零错误
-     * clamp_row_est函数会确保返回一个最小的合理行数估计值
-     */
-    rel->rows = clamp_row_est(rel->rows);
+	/* ... but do not let it set the rows estimate to zero */
+	rel->rows = clamp_row_est(rel->rows);
 
-    /* 
-     * 确保元组总数估计值(rel->tuples)不会小于行数估计值(rel->rows)，
-     * 因为元组总数通常表示表的完整大小，而行数表示经过过滤后预计返回的行数
-     * 这一约束保证了统计信息的逻辑一致性
-     */
-    rel->tuples = Max(rel->tuples, rel->rows);
+	/* also, make sure rel->tuples is not insane relative to rel->rows */
+	rel->tuples = Max(rel->tuples, rel->rows);
 }
-
 
 /*
  * set_foreign_pathlist
@@ -1091,269 +929,289 @@ set_foreign_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 /*
  * set_append_rel_size
- *      为简单的"append关系"（如分区表或继承表）设置大小估计值
- *      
- * 说明：
- *      传入的rel和RTE表示整个append关系。该关系的内容是通过将各个成员关系的输出
- *      附加（append）在一起计算的。注意，在非分区的继承情况下，第一个成员关系
- *      实际上与父RTE中提到的表相同，但它有不同的RTE和RelOptInfo。这是好事，
- *      因为它们的输出大小不同。
- *      
- * 参数说明：
- *      root - 规划器全局信息结构体指针，包含查询优化过程中的所有上下文信息
- *      rel - 关系优化信息结构体指针，表示需要设置大小估计的append关系
- *      rti - 关系表索引（Range Table Index），标识当前处理的关系
- *      rte - 范围表条目指针，包含关系的元数据信息
+ *	  Set size estimates for a simple "append relation"
  *
- * 返回值：
- *      void - 无返回值，直接修改传入的rel结构体
- *
- * 功能说明：
- *      此函数负责计算并设置append关系的大小估计信息，通过合并所有子关系的统计信息
- *      来获得整体估计值。它处理约束排除、并行执行设置、分区级连接等高级优化特性，
- *      为后续的访问路径生成提供必要的统计数据基础。
+ * The passed-in rel and RTE represent the entire append relation.  The
+ * relation's contents are computed by appending together the output of the
+ * individual member relations.  Note that in the non-partitioned inheritance
+ * case, the first member relation is actually the same table as is mentioned
+ * in the parent RTE ... but it has a different RTE and RelOptInfo.  This is
+ * a good thing because their outputs are not the same size.
  */
 static void
 set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
-                   Index rti, RangeTblEntry *rte)
+					Index rti, RangeTblEntry *rte)
 {
-    int			parentRTindex = rti;       /* 父关系的范围表索引 */
-    bool		has_live_children;        /* 是否存在至少一个有效（非排除）的子关系 */
-    double		parent_rows;             /* 父关系的总行数估计值 */
-    double		parent_size;             /* 父关系的总大小估计值 */
-    double	   *parent_attrsizes;       /* 存储每个属性的总大小估计值 */
-    int			nattrs;                   /* 关系中的属性数量 */
-    ListCell   *l;                     /* 列表遍历指针 */
+	int			parentRTindex = rti;
+	bool		has_live_children;
+	double		parent_rows;
+	double		parent_size;
+	double	   *parent_attrsizes;
+	int			nattrs;
+	ListCell   *l;
 
-    /* 防止由于过深的继承树导致栈溢出 */
-    check_stack_depth();
+	/* Guard against stack overflow due to overly deep inheritance tree. */
+	check_stack_depth();
 
-    Assert(IS_SIMPLE_REL(rel));        /* 确保处理的是简单关系 */
+	Assert(IS_SIMPLE_REL(rel));
 
-    /*
-     * 初始化partitioned_child_rels，包含当前RT索引
-     *
-     * 注意：在set_append_rel_pathlist()阶段，我们会将树中出现的分区关系
-     * 的索引向上冒泡，这样当我们为所有子关系创建路径后，根分区表的列表
-     * 将包含所有这些索引。
-     */
-    if (rte->relkind == RELKIND_PARTITIONED_TABLE)
-        rel->partitioned_child_rels = list_make1_int(rti);
+	/*
+	 * Initialize partitioned_child_rels to contain this RT index.
+	 *
+	 * Note that during the set_append_rel_pathlist() phase, we will bubble up
+	 * the indexes of partitioned relations that appear down in the tree, so
+	 * that when we've created Paths for all the children, the root
+	 * partitioned table's list will contain all such indexes.
+	 */
+	if (rte->relkind == RELKIND_PARTITIONED_TABLE)
+		rel->partitioned_child_rels = list_make1_int(rti);
 
-    /*
-     * 如果这是一个分区基本关系，设置consider_partitionwise_join标志
-     * 当前，只有当目标列表不包含整行Var时，才考虑与基本关系进行分区级连接
-     */
-    if (enable_partitionwise_join &&
-        rel->reloptkind == RELOPT_BASEREL &&
-        rte->relkind == RELKIND_PARTITIONED_TABLE &&
-        rel->attr_needed[InvalidAttrNumber - rel->min_attr] == NULL)
-        rel->consider_partitionwise_join = true;
+	/*
+	 * If this is a partitioned baserel, set the consider_partitionwise_join
+	 * flag; currently, we only consider partitionwise joins with the baserel
+	 * if its targetlist doesn't contain a whole-row Var.
+	 */
+	if (enable_partitionwise_join &&
+		rel->reloptkind == RELOPT_BASEREL &&
+		rte->relkind == RELKIND_PARTITIONED_TABLE &&
+		rel->attr_needed[InvalidAttrNumber - rel->min_attr] == NULL)
+		rel->consider_partitionwise_join = true;
 
-    /*
-     * 初始化以计算整个append关系的大小估计值
-     *
-     * 我们通过按子关系行数比例加权不同子关系的宽度来处理宽度估计。这是合理的，
-     * 因为宽度估计主要用于计算如果我们必须排序或哈希关系时的总关系"占用空间"。
-     * 为此，我们对总等效大小求和（使用"double"算术），然后除以总行数估计值。
-     * 这分别对总关系宽度和每个属性进行计算。
-     *
-     * 注意：如果考虑更改此逻辑，请注意子关系可能有零行和/或宽度，如果它们被约束排除。
-     */
-    has_live_children = false;
-    parent_rows = 0;
-    parent_size = 0;
-    nattrs = rel->max_attr - rel->min_attr + 1;
-    parent_attrsizes = (double *) palloc0(nattrs * sizeof(double));
+	/*
+	 * Initialize to compute size estimates for whole append relation.
+	 *
+	 * We handle width estimates by weighting the widths of different child
+	 * rels proportionally to their number of rows.  This is sensible because
+	 * the use of width estimates is mainly to compute the total relation
+	 * "footprint" if we have to sort or hash it.  To do this, we sum the
+	 * total equivalent size (in "double" arithmetic) and then divide by the
+	 * total rowcount estimate.  This is done separately for the total rel
+	 * width and each attribute.
+	 *
+	 * Note: if you consider changing this logic, beware that child rels could
+	 * have zero rows and/or width, if they were excluded by constraints.
+	 */
+	has_live_children = false;
+	parent_rows = 0;
+	parent_size = 0;
+	nattrs = rel->max_attr - rel->min_attr + 1;
+	parent_attrsizes = (double *) palloc0(nattrs * sizeof(double));
 
-    /* 遍历所有append关系信息，查找属于当前父关系的子关系 */
-    foreach(l, root->append_rel_list)
-    {
-        AppendRelInfo *appinfo = (AppendRelInfo *) lfirst(l);
-        int			childRTindex;
-        RangeTblEntry *childRTE;
-        RelOptInfo *childrel;
-        ListCell   *parentvars;
-        ListCell   *childvars;
+	foreach(l, root->append_rel_list)
+	{
+		AppendRelInfo *appinfo = (AppendRelInfo *) lfirst(l);
+		int			childRTindex;
+		RangeTblEntry *childRTE;
+		RelOptInfo *childrel;
+		ListCell   *parentvars;
+		ListCell   *childvars;
 
-        /* append_rel_list包含所有append关系；忽略其他关系 */
-        if (appinfo->parent_relid != parentRTindex)
-            continue;
+		/* append_rel_list contains all append rels; ignore others */
+		if (appinfo->parent_relid != parentRTindex)
+			continue;
 
-        childRTindex = appinfo->child_relid;
-        childRTE = root->simple_rte_array[childRTindex];
+		childRTindex = appinfo->child_relid;
+		childRTE = root->simple_rte_array[childRTindex];
 
-        /* 子关系的RelOptInfo已经在add_other_rels_to_query期间创建 */
-        childrel = find_base_rel(root, childRTindex);
-        Assert(childrel->reloptkind == RELOPT_OTHER_MEMBER_REL);
+		/*
+		 * The child rel's RelOptInfo was already created during
+		 * add_other_rels_to_query.
+		 */
+		childrel = find_base_rel(root, childRTindex);
+		Assert(childrel->reloptkind == RELOPT_OTHER_MEMBER_REL);
 
-        /* 我们可能已经证明该子关系是dummy（空）的 */
-        if (IS_DUMMY_REL(childrel))
-            continue;
+		/* We may have already proven the child to be dummy. */
+		if (IS_DUMMY_REL(childrel))
+			continue;
 
-        /*
-         * 我们必须将父关系的目标列表和条件复制到子关系，进行适当的变量替换。
-         * 但是，baserestrictinfo条件已经在构建子RelOptInfo时被复制/替换了。
-         * 因此，在应用约束排除之前，我们不需要任何额外的设置。
-         */
-        if (relation_excluded_by_constraints(root, childrel, childRTE))
-        {
-            /* 此子关系不需要扫描，因此可以将其从appendrel中省略 */
-            set_dummy_rel_pathlist(childrel);
-            continue;
-        }
+		/*
+		 * We have to copy the parent's targetlist and quals to the child,
+		 * with appropriate substitution of variables.  However, the
+		 * baserestrictinfo quals were already copied/substituted when the
+		 * child RelOptInfo was built.  So we don't need any additional setup
+		 * before applying constraint exclusion.
+		 */
+		if (relation_excluded_by_constraints(root, childrel, childRTE))
+		{
+			/*
+			 * This child need not be scanned, so we can omit it from the
+			 * appendrel.
+			 */
+			set_dummy_rel_pathlist(childrel);
+			continue;
+		}
 
-        /*
-         * 约束排除失败，因此将父关系的连接条件和目标列表复制到子关系，
-         * 进行适当的变量替换。
-         *
-         * 注意：生成的childrel->reltarget->exprs可能包含任意表达式，
-         * 否则不会出现在关系的目标列表中。可能查看appendrel子项的代码必须处理这种情况。
-         * （通常，关系的目标列表只包含Var和PlaceHolderVars。）
-         * 我们不费心更新childrel->reltarget的成本或宽度字段；尚不清楚是否有用。
-         */
-        childrel->joininfo = (List *)
-            adjust_appendrel_attrs(root,
-                                 (Node *) rel->joininfo,
-                                 1, &appinfo);
-        childrel->reltarget->exprs = (List *)
-            adjust_appendrel_attrs(root,
-                                 (Node *) rel->reltarget->exprs,
-                                 1, &appinfo);
+		/*
+		 * Constraint exclusion failed, so copy the parent's join quals and
+		 * targetlist to the child, with appropriate variable substitutions.
+		 *
+		 * NB: the resulting childrel->reltarget->exprs may contain arbitrary
+		 * expressions, which otherwise would not occur in a rel's targetlist.
+		 * Code that might be looking at an appendrel child must cope with
+		 * such.  (Normally, a rel's targetlist would only include Vars and
+		 * PlaceHolderVars.)  XXX we do not bother to update the cost or width
+		 * fields of childrel->reltarget; not clear if that would be useful.
+		 */
+		childrel->joininfo = (List *)
+			adjust_appendrel_attrs(root,
+								   (Node *) rel->joininfo,
+								   1, &appinfo);
+		childrel->reltarget->exprs = (List *)
+			adjust_appendrel_attrs(root,
+								   (Node *) rel->reltarget->exprs,
+								   1, &appinfo);
 
-        /*
-         * 我们还必须在EquivalenceClass数据结构中创建子条目。这是必要的，
-         * 要么是因为父关系参与一些eclass连接（因为我们会考虑对各个子关系
-         * 进行内索引扫描连接），要么是因为父关系有有用的路径键（因为我们应该
-         * 尝试构建产生这些排序顺序的MergeAppend路径）。
-         */
-        if (rel->has_eclass_joins || has_useful_pathkeys(root, rel))
-            add_child_rel_equivalences(root, appinfo, rel, childrel);
-        childrel->has_eclass_joins = rel->has_eclass_joins;
+		/*
+		 * We have to make child entries in the EquivalenceClass data
+		 * structures as well.  This is needed either if the parent
+		 * participates in some eclass joins (because we will want to consider
+		 * inner-indexscan joins on the individual children) or if the parent
+		 * has useful pathkeys (because we should try to build MergeAppend
+		 * paths that produce those sort orderings).
+		 */
+		if (rel->has_eclass_joins || has_useful_pathkeys(root, rel))
+			add_child_rel_equivalences(root, appinfo, rel, childrel);
+		childrel->has_eclass_joins = rel->has_eclass_joins;
 
-        /*
-         * 注意：我们可以为子关系的变量计算适当的attr_needed数据，
-         * 通过translated_vars映射转换父关系的attr_needed。但是，目前不需要，
-         * 因为attr_needed仅针对基本关系而非其他关系进行检查。因此，我们
-         * 只是将子关系的attr_needed留空。
-         */
+		/*
+		 * Note: we could compute appropriate attr_needed data for the child's
+		 * variables, by transforming the parent's attr_needed through the
+		 * translated_vars mapping.  However, currently there's no need
+		 * because attr_needed is only examined for base relations not
+		 * otherrels.  So we just leave the child's attr_needed empty.
+		 */
 
-        /*
-         * 如果我们考虑与父关系进行分区级连接，则对分区子关系也做同样的处理。
-         *
-         * 注意：我们在这里滥用consider_partitionwise_join标志，将其设置为
-         * 适用于本身未分区的子关系。我们这样做是为了告诉try_partitionwise_join()
-         * 该子关系足够有效，可以用作每个分区的输入，即使它后来被证明是dummy。
-         * （在我们设置好reltarget和EC条目之前，它是不可用的，我们刚刚完成了这些设置。）
-         */
-        if (rel->consider_partitionwise_join)
-            childrel->consider_partitionwise_join = true;
+		/*
+		 * If we consider partitionwise joins with the parent rel, do the same
+		 * for partitioned child rels.
+		 *
+		 * Note: here we abuse the consider_partitionwise_join flag by setting
+		 * it for child rels that are not themselves partitioned.  We do so to
+		 * tell try_partitionwise_join() that the child rel is sufficiently
+		 * valid to be used as a per-partition input, even if it later gets
+		 * proven to be dummy.  (It's not usable until we've set up the
+		 * reltarget and EC entries, which we just did.)
+		 */
+		if (rel->consider_partitionwise_join)
+			childrel->consider_partitionwise_join = true;
 
-        /*
-         * 如果查询一般允许并行性，则查看是否特别允许此childrel。但是，如果我们已经
-         * 确定整个appendrel不是并行安全的，则考虑此子关系的并行性没有意义。
-         * 为了保持一致性，请在调用set_rel_size()之前执行此操作。
-         */
-        if (root->glob->parallelModeOK && rel->consider_parallel)
-            set_rel_consider_parallel(root, childrel, childRTE);
+		/*
+		 * If parallelism is allowable for this query in general, see whether
+		 * it's allowable for this childrel in particular.  But if we've
+		 * already decided the appendrel is not parallel-safe as a whole,
+		 * there's no point in considering parallelism for this child.  For
+		 * consistency, do this before calling set_rel_size() for the child.
+		 */
+		if (root->glob->parallelModeOK && rel->consider_parallel)
+			set_rel_consider_parallel(root, childrel, childRTE);
 
-        /* 计算子关系的大小 */
-        set_rel_size(root, childrel, childRTindex, childRTE);
+		/*
+		 * Compute the child's size.
+		 */
+		set_rel_size(root, childrel, childRTindex, childRTE);
 
-        /*
-         * 即使我们上面没有证明，约束排除也可能检测到子查询中的矛盾。如果是这样，
-         * 我们可以跳过这个子关系。
-         */
-        if (IS_DUMMY_REL(childrel))
-            continue;
+		/*
+		 * It is possible that constraint exclusion detected a contradiction
+		 * within a child subquery, even though we didn't prove one above. If
+		 * so, we can skip this child.
+		 */
+		if (IS_DUMMY_REL(childrel))
+			continue;
 
-        /* 我们有至少一个有效的子关系 */
-        has_live_children = true;
+		/* We have at least one live child. */
+		has_live_children = true;
 
-        /*
-         * 如果任何有效子关系不是并行安全的，则将整个appendrel视为非并行安全的。
-         * 将来，我们可能能够生成这样的计划：一些子节点分配给工作进程，而其他子节点
-         * 则不分配；但我们今天没有这种能力，因此除非所有部分都安全，否则考虑appendrel
-         * 中任何地方的部分路径都是浪费的。
-         * （在此之前访问的子关系将在set_append_rel_pathlist()中取消标记。）
-         */
-        if (!childrel->consider_parallel)
-            rel->consider_parallel = false;
+		/*
+		 * If any live child is not parallel-safe, treat the whole appendrel
+		 * as not parallel-safe.  In future we might be able to generate plans
+		 * in which some children are farmed out to workers while others are
+		 * not; but we don't have that today, so it's a waste to consider
+		 * partial paths anywhere in the appendrel unless it's all safe.
+		 * (Child rels visited before this one will be unmarked in
+		 * set_append_rel_pathlist().)
+		 */
+		if (!childrel->consider_parallel)
+			rel->consider_parallel = false;
 
-        /* 从每个有效子关系累加大小信息 */
-        Assert(childrel->rows > 0);
+		/*
+		 * Accumulate size information from each live child.
+		 */
+		Assert(childrel->rows > 0);
 
-        parent_rows += childrel->rows;                           /* 累加行数 */
-        parent_size += childrel->reltarget->width * childrel->rows;  /* 累加总大小 */
+		parent_rows += childrel->rows;
+		parent_size += childrel->reltarget->width * childrel->rows;
 
-        /*
-         * 还累加每列的估计值。我们不需要为父列表中的PlaceHolderVars做任何事情。
-         * 如果子表达式不是Var，或者我们没有为其记录宽度估计，我们必须依靠基于数据类型的估计。
-         *
-         * 根据构造，子关系的目标列表与父关系的目标列表是一对一对应的。
-         */
-        forboth(parentvars, rel->reltarget->exprs,
-                childvars, childrel->reltarget->exprs)
-        {
-            Var	   *parentvar = (Var *) lfirst(parentvars);
-            Node	   *childvar = (Node *) lfirst(childvars);
+		/*
+		 * Accumulate per-column estimates too.  We need not do anything for
+		 * PlaceHolderVars in the parent list.  If child expression isn't a
+		 * Var, or we didn't record a width estimate for it, we have to fall
+		 * back on a datatype-based estimate.
+		 *
+		 * By construction, child's targetlist is 1-to-1 with parent's.
+		 */
+		forboth(parentvars, rel->reltarget->exprs,
+				childvars, childrel->reltarget->exprs)
+		{
+			Var		   *parentvar = (Var *) lfirst(parentvars);
+			Node	   *childvar = (Node *) lfirst(childvars);
 
-            if (IsA(parentvar, Var))
-            {
-                int		pndx = parentvar->varattno - rel->min_attr;
-                int32	child_width = 0;
+			if (IsA(parentvar, Var))
+			{
+				int			pndx = parentvar->varattno - rel->min_attr;
+				int32		child_width = 0;
 
-                if (IsA(childvar, Var) &&
-                    ((Var *) childvar)->varno == childrel->relid)
-                {
-                    int		cndx = ((Var *) childvar)->varattno - childrel->min_attr;
+				if (IsA(childvar, Var) &&
+					((Var *) childvar)->varno == childrel->relid)
+				{
+					int			cndx = ((Var *) childvar)->varattno - childrel->min_attr;
 
-                    child_width = childrel->attr_widths[cndx];
-                }
-                if (child_width <= 0)
-                    child_width = get_typavgwidth(exprType(childvar),
-                                                  exprTypmod(childvar));
-                Assert(child_width > 0);
-                parent_attrsizes[pndx] += child_width * childrel->rows; /* 累加属性宽度 */
-            }
-        }
-    }
+					child_width = childrel->attr_widths[cndx];
+				}
+				if (child_width <= 0)
+					child_width = get_typavgwidth(exprType(childvar),
+												  exprTypmod(childvar));
+				Assert(child_width > 0);
+				parent_attrsizes[pndx] += child_width * childrel->rows;
+			}
+		}
+	}
 
-    if (has_live_children)
-    {
-        /* 保存完成的大小估计值 */
-        int		i;
+	if (has_live_children)
+	{
+		/*
+		 * Save the finished size estimates.
+		 */
+		int			i;
 
-        Assert(parent_rows > 0);
-        rel->rows = parent_rows;                                  /* 设置总行数估计 */
-        rel->reltarget->width = rint(parent_size / parent_rows);   /* 计算平均行宽度 */
-        for (i = 0; i < nattrs; i++)
-            rel->attr_widths[i] = rint(parent_attrsizes[i] / parent_rows); /* 计算每个属性的平均宽度 */
+		Assert(parent_rows > 0);
+		rel->rows = parent_rows;
+		rel->reltarget->width = rint(parent_size / parent_rows);
+		for (i = 0; i < nattrs; i++)
+			rel->attr_widths[i] = rint(parent_attrsizes[i] / parent_rows);
 
-        /*
-         * 为appendrel设置"原始元组"计数等于"行数"；这是必要的，因为有些地方假设
-         * rel->tuples对于任何基本关系都是有效的。
-         */
-        rel->tuples = parent_rows;
+		/*
+		 * Set "raw tuples" count equal to "rows" for the appendrel; needed
+		 * because some places assume rel->tuples is valid for any baserel.
+		 */
+		rel->tuples = parent_rows;
 
-        /*
-         * 注意，我们将rel->pages保留为零；这对于避免在total_table_pages中重复计算
-         * appendrel树非常重要。
-         */
-    }
-    else
-    {
-        /*
-         * 所有子关系都被约束排除，因此将整个appendrel标记为dummy。我们必须在此阶段执行此操作，
-         * 以便在我们为其他关系生成路径时，该关系的dummy状态是可见的。
-         */
-        set_dummy_rel_pathlist(rel);
-    }
+		/*
+		 * Note that we leave rel->pages as zero; this is important to avoid
+		 * double-counting the appendrel tree in total_table_pages.
+		 */
+	}
+	else
+	{
+		/*
+		 * All children were excluded by constraints, so mark the whole
+		 * appendrel dummy.  We must do this in this phase so that the rel's
+		 * dummy-ness is visible when we generate paths for other rels.
+		 */
+		set_dummy_rel_pathlist(rel);
+	}
 
-    /* 释放分配的内存 */
-    pfree(parent_attrsizes);
+	pfree(parent_attrsizes);
 }
-
 
 /*
  * set_append_rel_pathlist
@@ -2091,85 +1949,77 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * get_cheapest_parameterized_child_path
- *    获取具有指定参数化的最便宜子路径
- * 
- * 参数说明：
- *    root - 规划器全局信息结构体指针，包含查询优化过程中的所有上下文信息
- *    rel - 关系优化信息结构体指针，表示当前需要获取路径的关系
- *    required_outer - 位图集合，表示路径所需的外部关系ID
- * 
- * 返回值：
- *    Path* - 返回满足指定参数化要求的最便宜路径，如果无法创建这样的路径则返回NULL
- * 
- * 功能说明：
- *    此函数在查询优化过程中用于为特定关系查找或创建具有精确参数化要求的最便宜路径。
- *    它首先尝试查找现有的匹配路径，如果不存在则通过重新参数化现有路径来满足要求。
+ *		Get cheapest path for this relation that has exactly the requested
+ *		parameterization.
+ *
+ * Returns NULL if unable to create such a path.
  */
 static Path *
 get_cheapest_parameterized_child_path(PlannerInfo *root, RelOptInfo *rel,
-                                      Relids required_outer)
+									  Relids required_outer)
 {
-    Path       *cheapest;  /* 当前找到的最便宜路径 */
-    ListCell   *lc;        /* 路径列表遍历指针 */
+	Path	   *cheapest;
+	ListCell   *lc;
 
-    /*
-     * 查找具有不超过所需参数化的现有最便宜路径。
-     * 如果它恰好具有所需的参数化，我们就完成了。
-     */
-    cheapest = get_cheapest_path_for_pathkeys(rel->pathlist,  /* 关系路径列表 */
-                                              NIL,            /* 空路径键列表 */
-                                              required_outer, /* 所需外部关系 */
-                                              TOTAL_COST,     /* 总成本比较 */
-                                              false);         /* 不要求精确匹配 */
-    Assert(cheapest != NULL);  /* 确保至少找到一个路径 */
-    if (bms_equal(PATH_REQ_OUTER(cheapest), required_outer))  /* 检查参数化是否精确匹配 */
-        return cheapest;  /* 如果匹配，直接返回该路径 */
+	/*
+	 * Look up the cheapest existing path with no more than the needed
+	 * parameterization.  If it has exactly the needed parameterization, we're
+	 * done.
+	 */
+	cheapest = get_cheapest_path_for_pathkeys(rel->pathlist,
+											  NIL,
+											  required_outer,
+											  TOTAL_COST,
+											  false);
+	Assert(cheapest != NULL);
+	if (bms_equal(PATH_REQ_OUTER(cheapest), required_outer))
+		return cheapest;
 
-    /*
-     * 否则，我们可以"重新参数化"现有路径以匹配给定的参数化，
-     * 这实际上意味着将额外的连接条件推入到路径的扫描中进行检查。
-     * 然而，一些现有路径可能已经检查了可用的连接条件，而其他路径可能没有；
-     * 因此，不清楚重新参数化后哪个现有路径将是最便宜的。
-     * 我们必须遍历所有路径来找出答案。
-     */
-    cheapest = NULL;  /* 重置最便宜路径指针 */
-    foreach(lc, rel->pathlist)  /* 遍历关系的所有路径 */
-    {
-        Path       *path = (Path *) lfirst(lc);  /* 获取当前路径 */
+	/*
+	 * Otherwise, we can "reparameterize" an existing path to match the given
+	 * parameterization, which effectively means pushing down additional
+	 * joinquals to be checked within the path's scan.  However, some existing
+	 * paths might check the available joinquals already while others don't;
+	 * therefore, it's not clear which existing path will be cheapest after
+	 * reparameterization.  We have to go through them all and find out.
+	 */
+	cheapest = NULL;
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
 
-        /* 如果路径需要比请求更多的参数化，则不能使用它 */
-        if (!bms_is_subset(PATH_REQ_OUTER(path), required_outer))
-            continue;  /* 跳过不满足条件的路径 */
+		/* Can't use it if it needs more than requested parameterization */
+		if (!bms_is_subset(PATH_REQ_OUTER(path), required_outer))
+			continue;
 
-        /*
-         * 重新参数化只能增加路径的成本，所以如果它已经比当前最便宜的路径更昂贵，就忽略它。
-         */
-        if (cheapest != NULL &&
-            compare_path_costs(cheapest, path, TOTAL_COST) <= 0)
-            continue;  /* 跳过成本更高的路径 */
+		/*
+		 * Reparameterization can only increase the path's cost, so if it's
+		 * already more expensive than the current cheapest, forget it.
+		 */
+		if (cheapest != NULL &&
+			compare_path_costs(cheapest, path, TOTAL_COST) <= 0)
+			continue;
 
-        /* 如果需要，重新参数化路径，然后重新检查成本 */
-        if (!bms_equal(PATH_REQ_OUTER(path), required_outer))  /* 检查是否需要重新参数化 */
-        {
-            path = reparameterize_path(root, path, required_outer, 1.0);  /* 重新参数化路径 */
-            if (path == NULL)
-                continue;        /* 重新参数化失败，跳过此路径 */
-            Assert(bms_equal(PATH_REQ_OUTER(path), required_outer));  /* 验证参数化结果 */
+		/* Reparameterize if needed, then recheck cost */
+		if (!bms_equal(PATH_REQ_OUTER(path), required_outer))
+		{
+			path = reparameterize_path(root, path, required_outer, 1.0);
+			if (path == NULL)
+				continue;		/* failed to reparameterize this one */
+			Assert(bms_equal(PATH_REQ_OUTER(path), required_outer));
 
-            /* 重新参数化后再次检查成本 */
-            if (cheapest != NULL &&
-                compare_path_costs(cheapest, path, TOTAL_COST) <= 0)
-                continue;  /* 重新参数化后成本仍然更高，跳过 */
-        }
+			if (cheapest != NULL &&
+				compare_path_costs(cheapest, path, TOTAL_COST) <= 0)
+				continue;
+		}
 
-        /* 我们找到了一个新的最佳路径 */
-        cheapest = path;  /* 更新最便宜路径 */
-    }
+		/* We have a new best path */
+		cheapest = path;
+	}
 
-    /* 返回最佳路径，如果没有找到合适的候选路径则返回NULL */
-    return cheapest;
+	/* Return the best path, or NULL if we found no suitable candidate */
+	return cheapest;
 }
-
 
 /*
  * accumulate_append_subpath
@@ -2265,56 +2115,39 @@ get_singleton_append_subpath(Path *path)
 
 /*
  * set_dummy_rel_pathlist
- *      为被约束排除的关系构建一个虚拟路径
+ *	  Build a dummy path for a relation that's been excluded by constraints
  *
- * 设计思路：
- * - 不创建特殊的"虚拟"路径类型，而是使用没有成员的AppendPath来表示这种状态
- *   （参见IS_DUMMY_APPEND/IS_DUMMY_REL宏）
- * - 当一个关系被约束排除（例如分区裁剪后确定某分区不包含所需数据）时，
- *   该函数为其设置特殊的虚拟路径表示
+ * Rather than inventing a special "dummy" path type, we represent this as an
+ * AppendPath with no members (see also IS_DUMMY_APPEND/IS_DUMMY_REL macros).
  *
- * 相关函数对比：
- * - 与mark_dummy_rel功能相似，但mark_dummy_rel通常用于在已经生成路径后
- *   将关系更改为虚拟状态
- * - 此函数主要在初始路径生成阶段使用
+ * (See also mark_dummy_rel, which does basically the same thing, but is
+ * typically used to change a rel into dummy state after we already made
+ * paths for it.)
  */
 static void
-set_dummy_rel_pathlist(RelOptInfo *rel)  /* 要设置为虚拟状态的关系优化信息结构 */
+set_dummy_rel_pathlist(RelOptInfo *rel)
 {
-    /* 设置虚拟大小估计值 - 属性宽度数组保持为0 */
-    rel->rows = 0;                 /* 将行数设置为0，表明关系没有数据 */
-    rel->reltarget->width = 0;     /* 将行宽设置为0，表明无需存储任何值 */
+	/* Set dummy size estimates --- we leave attr_widths[] as zeroes */
+	rel->rows = 0;
+	rel->reltarget->width = 0;
 
-    /* 丢弃任何预先存在的路径；不再需要它们 */
-    rel->pathlist = NIL;           /* 清空常规路径列表 */
-    rel->partial_pathlist = NIL;   /* 清空部分路径列表 */
+	/* Discard any pre-existing paths; no further need for them */
+	rel->pathlist = NIL;
+	rel->partial_pathlist = NIL;
 
-    /* 设置虚拟路径 - 创建一个没有子路径的AppendPath */
-    add_path(rel, (Path *) create_append_path(NULL, rel, NIL, NIL,
-                                              NIL, rel->lateral_relids,
-                                              0, false, NIL, -1));
-    /* 参数说明：
-     * - NULL: 没有子路径的Append路径
-     * - rel: 目标关系
-     * - NIL: 没有子路径列表
-     * - NIL: 没有分区边界信息
-     * - NIL: 没有分区表信息
-     * - rel->lateral_relids: 保留原始的lateral引用信息
-     * - 0: 成本为0（无需实际扫描）
-     * - false: 不是并行安全的（虚拟路径不参与实际执行）
-     * - NIL: 没有分区键表达式
-     * - -1: 无效的分区OID
-     */
+	/* Set up the dummy path */
+	add_path(rel, (Path *) create_append_path(NULL, rel, NIL, NIL,
+											  NIL, rel->lateral_relids,
+											  0, false, NIL, -1));
 
-    /*
-     * 立即设置最便宜路径字段，以防它们之前指向已丢弃的路径。
-     * 当从set_rel_size()调用时，这是冗余的，但从其他地方调用时不是，
-     * 并且这样做两次也无害。
-     * 这确保了后续优化器阶段能正确处理这个虚拟关系。
-     */
-    set_cheapest(rel);
+	/*
+	 * We set the cheapest-path fields immediately, just in case they were
+	 * pointing at some discarded path.  This is redundant when we're called
+	 * from set_rel_size(), but not when called from elsewhere, and doing it
+	 * twice is harmless anyway.
+	 */
+	set_cheapest(rel);
 }
-
 
 /* quick-and-dirty test to see if any joining is needed */
 static bool
@@ -2490,7 +2323,7 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	if (IS_DUMMY_REL(sub_final_rel))
 	{
-		 (rel);
+		set_dummy_rel_pathlist(rel);
 		return;
 	}
 
@@ -2552,501 +2385,390 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * set_function_pathlist
- *      为函数RTE（范围表条目）构建访问路径
- *
- * 参数说明：
- * - root: 规划器信息结构体指针，包含查询规划的全局上下文
- * - rel: 关系优化信息结构体指针，代表要处理的关系
- * - rte: 范围表条目，包含函数相关信息
- *
- * 函数功能：
- * 为函数调用（如返回行集的函数）生成单一的访问路径，并将该路径添加到关系的路径列表中。
- * 特别处理了带有ORDINALITY修饰符的函数，确保正确处理其排序特性。
+ *		Build the (single) access path for a function RTE
  */
 static void
 set_function_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-    Relids      required_outer;   /* 需要的外部关系ID集合 */
-    List       *pathkeys = NIL;   /* 排序键列表，默认为空（无序） */
+	Relids		required_outer;
+	List	   *pathkeys = NIL;
 
-    /*
-     * 函数扫描不支持将连接条件下推到其条件中，
-     * 但由于函数表达式中可能存在LATERAL引用，因此仍然可能需要参数化。
-     * LATERAL关键字允许函数引用FROM子句中前面表的列值。
-     */
-    required_outer = rel->lateral_relids;   /* 从关系中获取所需的外部关系ID */
+	/*
+	 * We don't support pushing join clauses into the quals of a function
+	 * scan, but it could still have required parameterization due to LATERAL
+	 * refs in the function expression.
+	 */
+	required_outer = rel->lateral_relids;
 
-    /*
-     * 函数结果默认被视为无序，除非使用了ORDINALITY修饰符。
-     * 使用ORDINALITY时，结果集按序号列（最后一列）排序。
-     * 通过检查该Var是否存在于等价类中来确定是否需要关注这个排序。
-     */
-    if (rte->funcordinality)   /* 检查函数是否使用了ORDINALITY修饰符 */
-    {
-        AttrNumber  ordattno = rel->max_attr;   /* 序号列的属性号（总是最后一列） */
-        Var         *var = NULL;                /* 指向序号列Var节点的指针 */
-        ListCell   *lc;
+	/*
+	 * The result is considered unordered unless ORDINALITY was used, in which
+	 * case it is ordered by the ordinal column (the last one).  See if we
+	 * care, by checking for uses of that Var in equivalence classes.
+	 */
+	if (rte->funcordinality)
+	{
+		AttrNumber	ordattno = rel->max_attr;
+		Var		   *var = NULL;
+		ListCell   *lc;
 
-        /*
-         * 检查关系的目标列表中是否包含该序号列的Var引用。
-         * 如果不存在，则表明查询未引用该序号列，或至少未以排序相关的方式引用。
-         */
-        foreach(lc, rel->reltarget->exprs)
-        {
-            Var         *node = (Var *) lfirst(lc);
+		/*
+		 * Is there a Var for it in rel's targetlist?  If not, the query did
+		 * not reference the ordinality column, or at least not in any way
+		 * that would be interesting for sorting.
+		 */
+		foreach(lc, rel->reltarget->exprs)
+		{
+			Var		   *node = (Var *) lfirst(lc);
 
-            /* 检查节点类型和属性，确认是否是我们要找的序号列Var */
-            /* varno/varlevelsup的检查是为了额外的安全验证 */
-            if (IsA(node, Var) &&
-                node->varattno == ordattno &&
-                node->varno == rel->relid &&
-                node->varlevelsup == 0)
-            {
-                var = node;   /* 找到了序号列的Var引用 */
-                break;
-            }
-        }
+			/* checking varno/varlevelsup is just paranoia */
+			if (IsA(node, Var) &&
+				node->varattno == ordattno &&
+				node->varno == rel->relid &&
+				node->varlevelsup == 0)
+			{
+				var = node;
+				break;
+			}
+		}
 
-        /*
-         * 尝试使用int8类型的排序操作符为该Var构建pathkeys。
-         * 我们告知build_expression_pathkey不要构建新的等价类；
-         * 如果Var未在任何等价类中提及，则表明没有任何地方关心这个排序。
-         */
-        if (var)   /* 如果找到了序号列Var */
-            pathkeys = build_expression_pathkey(root,
-                                                (Expr *) var,         /* 要构建排序键的表达式 */
-                                                NULL,                 /* 外层连接下方 */
-                                                Int8LessOperator,     /* 使用int8的小于操作符进行排序 */
-                                                rel->relids,          /* 表达式涉及的关系ID */
-                                                false);               /* 不创建新的等价类 */
-    }
+		/*
+		 * Try to build pathkeys for this Var with int8 sorting.  We tell
+		 * build_expression_pathkey not to build any new equivalence class; if
+		 * the Var isn't already mentioned in some EC, it means that nothing
+		 * cares about the ordering.
+		 */
+		if (var)
+			pathkeys = build_expression_pathkey(root,
+												(Expr *) var,
+												NULL,	/* below outer joins */
+												Int8LessOperator,
+												rel->relids,
+												false);
+	}
 
-    /* 生成适当的访问路径 */
-    add_path(rel, create_functionscan_path(root, rel,
-                                           pathkeys, required_outer));
-    /*
-     * create_functionscan_path创建函数扫描路径节点，传入排序键和所需外部关系
-     * add_path将创建的路径添加到关系的路径列表中
-     */
+	/* Generate appropriate path */
+	add_path(rel, create_functionscan_path(root, rel,
+										   pathkeys, required_outer));
 }
-
 
 /*
  * set_values_pathlist
- *    为VALUES表达式构建单一访问路径
- *    
- * 这个函数为SQL查询中的VALUES表达式（如SELECT * FROM (VALUES (1,2), (3,4)) AS t(a,b)）
- * 构建对应的访问路径。VALUES表达式作为一种特殊的关系类型，在执行计划中需要
- * 被表示为一个具体的扫描路径节点。
- *
- * 参数说明：
- * 'root' - 规划器信息结构体指针，包含查询相关的全局信息
- * 'rel' - 要处理的关系（RelOptInfo结构体指针），表示当前VALUES表达式对应的关系
- * 'rte' - 范围表项（RangeTblEntry结构体指针），包含VALUES表达式的原始信息
- *
- * 功能说明：
- * 此函数为VALUES表达式生成唯一的访问路径（ValuesScanPath），并将其添加到关系的路径列表中。
- * 与表扫描不同，VALUES表达式只有一种访问方式，因此只生成一个路径。
+ *		Build the (single) access path for a VALUES RTE
  */
 static void
 set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-    Relids    required_outer;  // 存储VALUES表达式所需的外部关系ID集合
+	Relids		required_outer;
 
-    /*
-     * 我们不支持将连接条件下推到VALUES扫描的条件中，
-     * 但由于VALUES表达式中可能包含LATERAL引用（引用外侧查询的列），
-     * 因此它仍然可能需要参数化。
-     * lateral_relids包含了此VALUES表达式依赖的外部关系ID
-     */
-    required_outer = rel->lateral_relids;
+	/*
+	 * We don't support pushing join clauses into the quals of a values scan,
+	 * but it could still have required parameterization due to LATERAL refs
+	 * in the values expressions.
+	 */
+	required_outer = rel->lateral_relids;
 
-    /* 生成适当的访问路径并添加到关系的路径列表中 */
-    add_path(rel, create_valuesscan_path(root, rel, required_outer));
+	/* Generate appropriate path */
+	add_path(rel, create_valuesscan_path(root, rel, required_outer));
 }
-
 
 /*
  * set_tablefunc_pathlist
- *      为表函数RTE（范围表条目）构建访问路径
- *
- * 参数说明：
- * - root: 规划器信息结构体指针，包含查询规划的全局上下文
- * - rel: 关系优化信息结构体指针，代表要处理的关系
- * - rte: 范围表条目，包含表函数相关信息
- *
- * 函数功能：
- * 为表函数（如unnest()、generate_series()等返回结果集的函数）生成单一的访问路径
- * 并将该路径添加到关系的路径列表中。表函数在查询计划中被视为特殊类型的关系。
+ *		Build the (single) access path for a table func RTE
  */
 static void
 set_tablefunc_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-    Relids      required_outer;   /* 需要的外部关系ID集合 */
+	Relids		required_outer;
 
-    /*
-     * 表函数扫描不支持将连接条件下推到其条件中，
-     * 但由于函数表达式中可能存在LATERAL引用，因此仍然可能需要参数化。
-     * LATERAL关键字允许函数引用FROM子句中前面表的列值。
-     */
-    required_outer = rel->lateral_relids;   /* 从关系中获取所需的外部关系ID */
+	/*
+	 * We don't support pushing join clauses into the quals of a tablefunc
+	 * scan, but it could still have required parameterization due to LATERAL
+	 * refs in the function expression.
+	 */
+	required_outer = rel->lateral_relids;
 
-    /* 生成适当的访问路径 */
-    add_path(rel, create_tablefuncscan_path(root, rel,
-                                            required_outer));
-    /*
-     * create_tablefuncscan_path创建表函数扫描路径节点
-     * add_path将创建的路径添加到关系的路径列表中
-     */
+	/* Generate appropriate path */
+	add_path(rel, create_tablefuncscan_path(root, rel,
+											required_outer));
 }
-
-
 
 /*
  * set_cte_pathlist
- *      为非自引用的CTE（公共表表达式）范围表条目(RTE)构建单一的访问路径
- *      
- * 说明：
- *      对于CTE，不需要单独的set_cte_size阶段，因为PostgreSQL不支持对CTE使用
- *      连接条件参数化的路径。
- *      
- * 参数说明：
- *      root - 规划器全局信息结构体指针，包含查询优化过程中的所有上下文信息
- *      rel - 关系优化信息结构体指针，表示当前需要设置访问路径的CTE关系
- *      rte - 范围表条目指针，包含CTE的元数据信息
+ *		Build the (single) access path for a non-self-reference CTE RTE
  *
- * 返回值：
- *      void - 无返回值，直接修改传入的rel结构体
- *
- * 功能说明：
- *      此函数负责为CTE构建访问路径，主要通过定位已预先规划好的CTE执行计划，
- *      设置必要的大小估计信息，并创建CTE扫描路径。在PostgreSQL查询优化器中，
- *      CTE被视为物化的中间结果，所以只需要构建单一的扫描路径。
+ * There's no need for a separate set_cte_size phase, since we don't
+ * support join-qual-parameterized paths for CTEs.
  */
 static void
 set_cte_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-    Plan	   		*cteplan;           /* CTE的执行计划 */
-    PlannerInfo 	*cteroot;           /* CTE所属的规划器信息结构体 */
-    Index			levelsup;          	/* CTE在嵌套层级中的深度 */
-    int				ndx;               	/* CTE在列表中的索引 */
-    ListCell   		*lc;                /* 列表遍历指针 */ 
-    int				plan_id;          	/* CTE计划的ID */
-    Relids			required_outer;    	/* 必需的外部关系ID集合 */
+	Plan	   *cteplan;
+	PlannerInfo *cteroot;
+	Index		levelsup;
+	int			ndx;
+	ListCell   *lc;
+	int			plan_id;
+	Relids		required_outer;
 
-    /*
-     * 查找被引用的CTE，并定位之前为其生成的执行计划
-     */
-    levelsup = rte->ctelevelsup;    /* 获取CTE嵌套的层级深度 */
-    cteroot = root;                 /* 从当前规划器信息开始 */
-    
-    /* 沿着父规划器链向上查找，直到找到CTE定义所在的层级 */
-    while (levelsup-- > 0)
-    {
-        cteroot = cteroot->parent_root;
-        if (!cteroot)               /* 这种情况理论上不应该发生 */
-            elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
-    }
+	/*
+	 * Find the referenced CTE, and locate the plan previously made for it.
+	 */
+	levelsup = rte->ctelevelsup;
+	cteroot = root;
+	while (levelsup-- > 0)
+	{
+		cteroot = cteroot->parent_root;
+		if (!cteroot)			/* shouldn't happen */
+			elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
+	}
 
-    /*
-     * 注意：当我们仍在处理CTE规划时（例如，这是来自另一个CTE的引用），
-     * cte_plan_ids列表可能比cteList短。因此，我们不能使用forboth来遍历这两个列表。
-     */
-    ndx = 0;
-    
-    /* 遍历CTE列表，查找与当前RTE名称匹配的CTE */
-    foreach(lc, cteroot->parse->cteList)
-    {
-        CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+	/*
+	 * Note: cte_plan_ids can be shorter than cteList, if we are still working
+	 * on planning the CTEs (ie, this is a side-reference from another CTE).
+	 * So we mustn't use forboth here.
+	 */
+	ndx = 0;
+	foreach(lc, cteroot->parse->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
 
-        if (strcmp(cte->ctename, rte->ctename) == 0)
-            break;                  /* 找到匹配的CTE */
-        ndx++;                      /* 递增索引，继续查找 */
-    }
-    
-    /* 进行各种错误检查，确保CTE定义和计划存在 */
-    if (lc == NULL)                 /* 找不到CTE定义（不应该发生） */
-        elog(ERROR, "could not find CTE \"%s\"", rte->ctename);
-    
-    if (ndx >= list_length(cteroot->cte_plan_ids))  /* 找不到CTE计划ID（不应该发生） */
-        elog(ERROR, "could not find plan for CTE \"%s\"", rte->ctename);
-    
-    /* 获取CTE计划ID */
-    plan_id = list_nth_int(cteroot->cte_plan_ids, ndx);
-    
-    if (plan_id <= 0)               /* 计划ID无效（不应该发生） */
-        elog(ERROR, "no plan was made for CTE \"%s\"", rte->ctename);
-    
-    /* 根据计划ID从全局子计划列表中获取CTE的执行计划 */
-    cteplan = (Plan *) list_nth(root->glob->subplans, plan_id - 1);
+		if (strcmp(cte->ctename, rte->ctename) == 0)
+			break;
+		ndx++;
+	}
+	if (lc == NULL)				/* shouldn't happen */
+		elog(ERROR, "could not find CTE \"%s\"", rte->ctename);
+	if (ndx >= list_length(cteroot->cte_plan_ids))
+		elog(ERROR, "could not find plan for CTE \"%s\"", rte->ctename);
+	plan_id = list_nth_int(cteroot->cte_plan_ids, ndx);
+	if (plan_id <= 0)
+		elog(ERROR, "no plan was made for CTE \"%s\"", rte->ctename);
+	cteplan = (Plan *) list_nth(root->glob->subplans, plan_id - 1);
 
-    /*
-     * 设置关系的估计输出行数、宽度等统计信息
-     * 使用CTE计划中已计算好的行数估计值
-     */
-    set_cte_size_estimates(root, rel, cteplan->plan_rows);
+	/* Mark rel with estimated output rows, width, etc */
+	set_cte_size_estimates(root, rel, cteplan->plan_rows);
 
-    /*
-     * 虽然PostgreSQL不支持将连接条件下推到CTE扫描的条件中，
-     * 但由于CTE的目标列表中可能包含对外部关系的LATERAL引用，
-     * 因此CTE扫描仍可能需要参数化
-     */
-    required_outer = rel->lateral_relids;    /* 获取必需的外部关系ID集合 */
+	/*
+	 * We don't support pushing join clauses into the quals of a CTE scan, but
+	 * it could still have required parameterization due to LATERAL refs in
+	 * its tlist.
+	 */
+	required_outer = rel->lateral_relids;
 
-    /* 生成适当的访问路径并添加到关系的路径列表中 */
-    add_path(rel, create_ctescan_path(root, rel, required_outer));
+	/* Generate appropriate path */
+	add_path(rel, create_ctescan_path(root, rel, required_outer));
 }
-
 
 /*
  * set_namedtuplestore_pathlist
- *      为命名元组存储(named tuplestore)类型的范围表条目构建访问路径
+ *		Build the (single) access path for a named tuplestore RTE
  *
- * 说明：
- * 不需要单独的set_namedtuplestore_size阶段，因为我们不支持为元组存储设置连接条件参数化的路径。
- *
- * 参数说明：
- * - root: 规划器信息结构体指针，包含查询规划的全局上下文
- * - rel: 关系优化信息结构体指针，代表要处理的关系
- * - rte: 范围表条目，具体是命名元组存储类型（如WITH子句中的临时结果集）
- *
- * 函数功能：
- * 为命名元组存储（如WITH子句中定义的公共表表达式CTE）生成单一的访问路径，
- * 设置估计的输出行数和宽度，并将路径添加到关系的路径列表中。
+ * There's no need for a separate set_namedtuplestore_size phase, since we
+ * don't support join-qual-parameterized paths for tuplestores.
  */
 static void
 set_namedtuplestore_pathlist(PlannerInfo *root, RelOptInfo *rel,
-                             RangeTblEntry *rte)
+							 RangeTblEntry *rte)
 {
-    Relids      required_outer;   /* 需要的外部关系ID集合 */
+	Relids		required_outer;
 
-    /* 设置关系的估计输出行数、宽度等统计信息 */
-    set_namedtuplestore_size_estimates(root, rel);
+	/* Mark rel with estimated output rows, width, etc */
+	set_namedtuplestore_size_estimates(root, rel);
 
-    /*
-     * 元组存储扫描不支持将连接条件下推到其条件中，
-     * 但由于其目标列表中可能存在LATERAL引用，因此仍然可能需要参数化。
-     */
-    required_outer = rel->lateral_relids;   /* 从关系中获取所需的外部关系ID */
+	/*
+	 * We don't support pushing join clauses into the quals of a tuplestore
+	 * scan, but it could still have required parameterization due to LATERAL
+	 * refs in its tlist.
+	 */
+	required_outer = rel->lateral_relids;
 
-    /* 生成适当的访问路径 */
-    add_path(rel, create_namedtuplestorescan_path(root, rel, required_outer));
-    /*
-     * create_namedtuplestorescan_path创建命名元组存储扫描路径节点
-     * add_path将创建的路径添加到关系的路径列表中
-     */
+	/* Generate appropriate path */
+	add_path(rel, create_namedtuplestorescan_path(root, rel, required_outer));
 
-    /* 选择最便宜的路径（在这种情况下很简单，因为只有一条路径） */
-    set_cheapest(rel);
+	/* Select cheapest path (pretty easy in this case...) */
+	set_cheapest(rel);
 }
-
 
 /*
  * set_result_pathlist
- *      为RTE_RESULT类型的范围表条目构建访问路径
+ *		Build the (single) access path for an RTE_RESULT RTE
  *
- * 说明：
- * 不需要单独的set_result_size阶段，因为我们不支持为这些RTE设置连接条件参数化的路径。
- *
- * 参数说明：
- * - root: 规划器信息结构体指针，包含查询规划的全局上下文
- * - rel: 关系优化信息结构体指针，代表要处理的关系
- * - rte: 范围表条目，具体是RTE_RESULT类型（表示如VALUES子句等结果集）
- *
- * 函数功能：
- * 为结果集关系（如VALUES子句、没有FROM子句的SELECT查询等）生成单一的访问路径，
- * 设置估计的输出行数和宽度，并将路径添加到关系的路径列表中。
+ * There's no need for a separate set_result_size phase, since we
+ * don't support join-qual-parameterized paths for these RTEs.
  */
 static void
 set_result_pathlist(PlannerInfo *root, RelOptInfo *rel,
-                    RangeTblEntry *rte)
+					RangeTblEntry *rte)
 {
-    Relids      required_outer;   /* 需要的外部关系ID集合 */
+	Relids		required_outer;
 
-    /* 设置关系的估计输出行数、宽度等统计信息 */
-    set_result_size_estimates(root, rel);
+	/* Mark rel with estimated output rows, width, etc */
+	set_result_size_estimates(root, rel);
 
-    /*
-     * 结果扫描不支持将连接条件下推到其条件中，
-     * 但由于其目标列表中可能存在LATERAL引用，因此仍然可能需要参数化。
-     */
-    required_outer = rel->lateral_relids;   /* 从关系中获取所需的外部关系ID */
+	/*
+	 * We don't support pushing join clauses into the quals of a Result scan,
+	 * but it could still have required parameterization due to LATERAL refs
+	 * in its tlist.
+	 */
+	required_outer = rel->lateral_relids;
 
-    /* 生成适当的访问路径 */
-    add_path(rel, create_resultscan_path(root, rel, required_outer));
-    /*
-     * create_resultscan_path创建结果扫描路径节点
-     * add_path将创建的路径添加到关系的路径列表中
-     */
+	/* Generate appropriate path */
+	add_path(rel, create_resultscan_path(root, rel, required_outer));
 
-    /* 选择最便宜的路径（在这种情况下很简单，因为只有一条路径） */
-    set_cheapest(rel);
+	/* Select cheapest path (pretty easy in this case...) */
+	set_cheapest(rel);
 }
-
 
 /*
  * set_worktable_pathlist
- *      为自引用CTE（Common Table Expression）范围表项构建访问路径
- *      此函数构建单个访问路径，用于处理自引用的CTE
+ *		Build the (single) access path for a self-reference CTE RTE
  *
- * 由于不支持对CTE使用基于连接条件的参数化路径，因此不需要单独的set_worktable_size阶段。
+ * There's no need for a separate set_worktable_size phase, since we don't
+ * support join-qual-parameterized paths for CTEs.
  */
 static void
 set_worktable_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
-    Path       *ctepath;          	/* CTE的非递归部分路径 */
-    PlannerInfo *cteroot;         	/* CTE所在层次的规划器信息 */
-    Index       levelsup;          	/* CTE层次深度 */
-    Relids      required_outer;    	/* 所需的外部关系ID集合 */
+	Path	   *ctepath;
+	PlannerInfo *cteroot;
+	Index		levelsup;
+	Relids		required_outer;
 
-    /*
-     * 需要找到非递归项的路径，它位于处理递归UNION的计划层次中，
-     * 这个层次比CTE来源的层次低一级。
-     */
-    levelsup = rte->ctelevelsup;  /* 获取CTE相对于当前查询的层次深度 */
-    if (levelsup == 0)            /* 不应该发生的情况 */
-        elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
-    levelsup--;                   /* 减1以指向递归UNION的层次 */
-    cteroot = root;
-    while (levelsup-- > 0)        /* 遍历找到对应的父规划器层次 */
-    {
-        cteroot = cteroot->parent_root;
-        if (!cteroot)              /* 不应该发生的情况 */
-            elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
-    }
-    ctepath = cteroot->non_recursive_path;  /* 获取非递归路径 */
-    if (!ctepath)                 /* 不应该发生的情况 */
-        elog(ERROR, "could not find path for CTE \"%s\"", rte->ctename);
+	/*
+	 * We need to find the non-recursive term's path, which is in the plan
+	 * level that's processing the recursive UNION, which is one level *below*
+	 * where the CTE comes from.
+	 */
+	levelsup = rte->ctelevelsup;
+	if (levelsup == 0)			/* shouldn't happen */
+		elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
+	levelsup--;
+	cteroot = root;
+	while (levelsup-- > 0)
+	{
+		cteroot = cteroot->parent_root;
+		if (!cteroot)			/* shouldn't happen */
+			elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
+	}
+	ctepath = cteroot->non_recursive_path;
+	if (!ctepath)				/* shouldn't happen */
+		elog(ERROR, "could not find path for CTE \"%s\"", rte->ctename);
 
-    /* 为关系设置估计的输出行数、宽度等统计信息 */
-    set_cte_size_estimates(root, rel, ctepath->rows);
+	/* Mark rel with estimated output rows, width, etc */
+	set_cte_size_estimates(root, rel, ctepath->rows);
 
-    /*
-     * 不支持将连接条件推入工作表扫描的条件中，但由于目标列表中的LATERAL引用，
-     * 它仍然可能需要参数化。
-     * （考虑到递归引用的限制，我不确定这是否实际可行，但支持起来很简单。）
-     */
-    required_outer = rel->lateral_relids;  /* 设置所需的外部关系 */
+	/*
+	 * We don't support pushing join clauses into the quals of a worktable
+	 * scan, but it could still have required parameterization due to LATERAL
+	 * refs in its tlist.  (I'm not sure this is actually possible given the
+	 * restrictions on recursive references, but it's easy enough to support.)
+	 */
+	required_outer = rel->lateral_relids;
 
-    /* 生成适当的访问路径并添加到关系的路径列表中 */
-    add_path(rel, create_worktablescan_path(root, rel, required_outer));
+	/* Generate appropriate path */
+	add_path(rel, create_worktablescan_path(root, rel, required_outer));
 }
-
 
 /*
  * generate_gather_paths
- *    为关系生成并行访问路径，通过在部分路径(partial path)上添加Gather或Gather Merge操作。
- *    该函数是PostgreSQL并行查询优化的核心组件，负责将并行工作进程生成的中间结果
- *    整合为最终的查询结果。
+ *		Generate parallel access paths for a relation by pushing a Gather or
+ *		Gather Merge on top of a partial path.
  *
- * 注意事项：
- *    - 必须在为指定关系创建完所有部分路径(partial paths)之后调用此函数
- *    - 否则，add_partial_path可能会删除被GatherPath或GatherMergePath引用的路径
+ * This must not be called until after we're done creating all partial paths
+ * for the specified relation.  (Otherwise, add_partial_path might delete a
+ * path that some GatherPath or GatherMergePath has a reference to.)
  *
- * 行数估计处理逻辑：
- *    - 当为扫描或连接关系生成路径时，override_rows为false，直接使用关系的大小估计
- *    - 当为部分分组路径(partially-grouped path)调用时，需要覆盖行数估计值
- *    - 当前使用的特定值可能不是最佳选择，但底层关系没有估计值，必须提供一个合理值
+ * If we're generating paths for a scan or join relation, override_rows will
+ * be false, and we'll just use the relation's size estimate.  When we're
+ * being called for a partially-grouped path, though, we need to override
+ * the rowcount estimate.  (It's not clear that the particular value we're
+ * using here is actually best, but the underlying rel has no estimate so
+ * we must do something.)
  */
 void
 generate_gather_paths(PlannerInfo *root, RelOptInfo *rel, bool override_rows)
 {
-    /* 声明所需变量 */
-    Path       *cheapest_partial_path;  /* 成本最低的部分路径 */
-    Path       *simple_gather_path;     /* 普通Gather路径 */
-    ListCell   *lc;                     /* 遍历列表的指针 */
-    double      rows;                   /* 行数估计值 */
-    double     *rowsp = NULL;           /* 指向行数估计值的指针，用于覆盖估计 */
+	Path	   *cheapest_partial_path;
+	Path	   *simple_gather_path;
+	ListCell   *lc;
+	double		rows;
+	double	   *rowsp = NULL;
 
-    /* 如果没有部分路径，则无需处理 */
-    if (rel->partial_pathlist == NIL)
-        return;
+	/* If there are no partial paths, there's nothing to do here. */
+	if (rel->partial_pathlist == NIL)
+		return;
 
-    /* 确定是否需要覆盖行数估计 */
-    if (override_rows)
-        rowsp = &rows;
+	/* Should we override the rel's rowcount estimate? */
+	if (override_rows)
+		rowsp = &rows;
 
-    /*
-     * Gather操作的输出总是未排序的，因此只需要考虑一个部分路径：成本最低的那个。
-     * 由于add_partial_path的工作方式，成本最低的路径位于partial_pathlist的头部。
-     */
-    cheapest_partial_path = linitial(rel->partial_pathlist);
-    /* 计算总估计行数：工作进程数乘以单个工作进程处理的行数 */
-    rows = cheapest_partial_path->rows * cheapest_partial_path->parallel_workers;
-    /* 创建普通Gather路径 */
-    simple_gather_path = (Path *)
-        create_gather_path(root, rel, cheapest_partial_path, rel->reltarget,
-                          NULL, rowsp);
-    /* 将创建的路径添加到关系的路径列表中 */
-    add_path(rel, simple_gather_path);
+	/*
+	 * The output of Gather is always unsorted, so there's only one partial
+	 * path of interest: the cheapest one.  That will be the one at the front
+	 * of partial_pathlist because of the way add_partial_path works.
+	 */
+	cheapest_partial_path = linitial(rel->partial_pathlist);
+	rows =
+		cheapest_partial_path->rows * cheapest_partial_path->parallel_workers;
+	simple_gather_path = (Path *)
+		create_gather_path(root, rel, cheapest_partial_path, rel->reltarget,
+						   NULL, rowsp);
+	add_path(rel, simple_gather_path);
 
-    /*
-     * 对于每个有用的排序顺序，我们可以考虑使用保持顺序的Gather Merge操作。
-     * Gather Merge允许合并来自多个工作进程的已排序结果，保持整体有序性。
-     */
-    foreach(lc, rel->partial_pathlist)
-    {
-        Path       *subpath = (Path *) lfirst(lc);  /* 当前遍历的部分路径 */
-        GatherMergePath *path;                      /* Gather Merge路径 */
+	/*
+	 * For each useful ordering, we can consider an order-preserving Gather
+	 * Merge.
+	 */
+	foreach(lc, rel->partial_pathlist)
+	{
+		Path	   *subpath = (Path *) lfirst(lc);
+		GatherMergePath *path;
 
-        /* 跳过没有排序键的路径，因为它们不适合Gather Merge */
-        if (subpath->pathkeys == NIL)
-            continue;
+		if (subpath->pathkeys == NIL)
+			continue;
 
-        /* 计算总估计行数 */
-        rows = subpath->rows * subpath->parallel_workers;
-        /* 创建Gather Merge路径，保持子路径的排序顺序 */
-        path = create_gather_merge_path(root, rel, subpath, rel->reltarget,
-                                      subpath->pathkeys, NULL, rowsp);
-        /* 将Gather Merge路径添加到关系的路径列表中 */
-        add_path(rel, &path->path);
-    }
+		rows = subpath->rows * subpath->parallel_workers;
+		path = create_gather_merge_path(root, rel, subpath, rel->reltarget,
+										subpath->pathkeys, NULL, rowsp);
+		add_path(rel, &path->path);
+	}
 }
-
 
 /*
  * make_rel_from_joinlist
- *	  使用 "joinlist" 指导连接路径搜索，构建访问路径。
- *    'joinlist' 中可能存在RangeTblRef节点（表示基表）或嵌套的 joinlist 节点，
- *	  不一定是完全拉平的。
+ *	  Build access paths using a "joinlist" to guide the join path search.
  *
- * 参见 deconstruct_jointree() 的注释，了解 joinlist 数据结构的定义。
+ * See comments for deconstruct_jointree() for definition of the joinlist
+ * data structure.
  */
 static RelOptInfo *
 make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 {
 	int			levels_needed;
-	List* 		initial_rels;	/* joinlist 中每个节点对应的 RelOptInfo 列表 */
-	ListCell* 	jl;				/* 用于遍历 joinlist 的辅助指针 */
+	List	   *initial_rels;
+	ListCell   *jl;
 
 	/*
-	 * 统计 joinlist 子节点的数量。这是动态规划算法需要的深度，
-	 * 用于考虑所有可能的连接方式。
-	 * 基表的数量等于 joinlist 中 RangeTblRef 节点的数量，
-	 * levels_needed 则是 joinlist 中节点的总数量（包括基表和子 joinlist）。
+	 * Count the number of child joinlist nodes.  This is the depth of the
+	 * dynamic-programming algorithm we must employ to consider all ways of
+	 * joining the child nodes.
 	 */
 	levels_needed = list_length(joinlist);
 
 	if (levels_needed <= 0)
-		return NULL;			/* 没有要处理的内容？ */
+		return NULL;			/* nothing to do? */
 
 	/*
-	 * 构造与 joinlist 子节点对应的 rels 列表。
-	 * 其中可能包含基表 rel 和根据子 joinlist 构造的 rel。
-	 * 递归处理未拉平的子 joinlist 节点。
+	 * Construct a list of rels corresponding to the child joinlist nodes.
+	 * This may contain both base rels and rels constructed according to
+	 * sub-joinlists.
 	 */
 	initial_rels = NIL;
 	foreach(jl, joinlist)
 	{
-		Node	   *jlnode = (Node *) lfirst(jl);	/* joinlist 中的当前节点 */
-		RelOptInfo *thisrel;						/* 当前节点对应的 RelOptInfo */
+		Node	   *jlnode = (Node *) lfirst(jl);
+		RelOptInfo *thisrel;
 
-		/*
-		 * 处理连接列表（joinlist）中的节点，根据节点类型执行不同的操作：
-		 * - 如果节点类型为 RangeTblRef，则通过 rtindex 查找对应的基本关系（base rel）对应的 RelOptInfo。
-		 * - 如果节点类型为 List，则递归处理子问题，生成对应的关系信息。
-		 * - 如果节点类型无法识别，则报错并返回 NULL（防止编译器警告）。
-		 */
 		if (IsA(jlnode, RangeTblRef))
 		{
 			int			varno = ((RangeTblRef *) jlnode)->rtindex;
@@ -3055,43 +2777,35 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		}
 		else if (IsA(jlnode, List))
 		{
-			/* 递归处理子问题 */
+			/* Recurse to handle subproblem */
 			thisrel = make_rel_from_joinlist(root, (List *) jlnode);
 		}
 		else
 		{
 			elog(ERROR, "unrecognized joinlist node type: %d",
 				 (int) nodeTag(jlnode));
-			thisrel = NULL;		/* 防止编译器警告 */
+			thisrel = NULL;		/* keep compiler quiet */
 		}
 
-		/* 将当前 joinlist 节点对应的 RelOptInfo 添加到初始关系列表中 */
 		initial_rels = lappend(initial_rels, thisrel);
 	}
 
-	/*
-	 * 如果 joinlist 长度，说明只有一个基表或子 joinlist，直接返回对应的 RelOptInfo。
-	 * 否则，使用连接搜索算法（插件、GEQO 或标准动态规划方法）来考虑不同的连接顺序。
-	 */
 	if (levels_needed == 1)
 	{
 		/*
-		 * 只有一个 joinlist 节点，直接返回。
+		 * Single joinlist node, so we're done.
 		 */
 		return (RelOptInfo *) linitial(initial_rels);
 	}
 	else
 	{
 		/*
-		 * 多个 joinlist 节点，使用连接搜索算法考虑不同的连接顺序。
+		 * Consider the different orders in which we could join the rels,
+		 * using a plugin, GEQO, or the regular join search code.
 		 *
-		 * 使用插件、GEQO 或常规连接搜索代码，考虑不同的连接顺序。
-		 *
-		 * 将 initial_rels 列表存入 PlannerInfo 字段，因为
-		 * has_legal_joinclause() 需要访问它（有点丑陋 :-()。
+		 * We put the initial_rels list into a PlannerInfo field because
+		 * has_legal_joinclause() needs to look at it (ugly :-().
 		 */
-
-		/* 将 initial_rels 列表存入 PlannerInfo 字段，该字段存储基表的链表 */
 		root->initial_rels = initial_rels;
 
 		if (join_search_hook)
@@ -3105,79 +2819,96 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 
 /*
  * standard_join_search
- *	  通过逐步将组件关系连接成连接关系，为查询查找可能的连接路径。
+ *	  Find possible joinpaths for a query by successively finding ways
+ *	  to join component relations into join relations.
  *
- * 'levels_needed' 是所需的迭代次数，即查询中独立 jointree 项的数量。该值 > 1。
+ * 'levels_needed' is the number of iterations needed, ie, the number of
+ *		independent jointree items in the query.  This is > 1.
  *
- * 'initial_rels' 是每个独立 jointree 项对应的基表的 RelOptInfo 节点列表。这些是需要连接的组件。
- *		注意 levels_needed == list_length(initial_rels)。
+ * 'initial_rels' is a list of RelOptInfo nodes for each independent
+ *		jointree item.  These are the components to be joined together.
+ *		Note that levels_needed == list_length(initial_rels).
  *
- * 返回最终级别的连接关系，即所有原始关系连接后的结果关系。
- * 必须为该关系及所有需要的子关系提供至少一种实现路径。
+ * Returns the final level of join relations, i.e., the relation that is
+ * the result of joining all the original relations together.
+ * At least one implementation path must be provided for this relation and
+ * all required sub-relations.
  *
- * 为了支持通过更改连接搜索算法来修改规划器行为的可加载插件，我们提供了一个钩子变量，
- * 允许插件替换或补充此函数。任何这样的钩子必须返回与标准代码相同的最终连接关系，
- * 但其附加的实现路径集合可能不同，并且只需实例化这些路径所需的子连接关系。
+ * To support loadable plugins that modify planner behavior by changing the
+ * join searching algorithm, we provide a hook variable that lets a plugin
+ * replace or supplement this function.  Any such hook must return the same
+ * final join relation as the standard code would, but it might have a
+ * different set of implementation paths attached, and only the sub-joinrels
+ * needed for these paths need have been instantiated.
  *
- * 给插件作者的说明：standard_join_search() 调用的函数会修改 root->join_rel_list 和 root->join_rel_hash。
- * 如果你想进行多次连接顺序搜索，可能需要保存和恢复这些数据结构的原始状态。可参考 geqo_eval() 的实现。
+ * Note to plugin authors: the functions invoked during standard_join_search()
+ * modify root->join_rel_list and root->join_rel_hash.  If you want to do more
+ * than one join-order search, you'll probably need to save and restore the
+ * original states of those data structures.  See geqo_eval() for an example.
  */
 RelOptInfo *
 standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 {
-	int			lev; /* 当前处理的连接层级，辅助遍历 */
+	int			lev;
 	RelOptInfo *rel;
 
 	/*
-	 * 此函数在同一个规划问题中不能递归调用，因此 join_rel_level[] 不应已被使用。
+	 * This function cannot be invoked recursively within any one planning
+	 * problem, so join_rel_level[] can't be in use already.
 	 */
 	Assert(root->join_rel_level == NULL);
 
 	/*
-	 * 采用简单的“动态规划”算法：首先找到所有两项连接的方式，然后找到三项连接的所有方式
-	 * （由两项连接和单项组成），然后是四项连接，依此类推，直到考虑所有将所有项连接成一个关系的方法。
+	 * We employ a simple "dynamic programming" algorithm: we first find all
+	 * ways to build joins of two jointree items, then all ways to build joins
+	 * of three items (from two-item joins and single items), then four-item
+	 * joins, and so on until we have considered all ways to join all the
+	 * items into one rel.
 	 *
-	 * root->join_rel_level[j] 是所有 j 项连接关系的列表。最初我们将 root->join_rel_level[1]
-	 * 设置为所有单 jointree 项的关系。
-	 *
-	 * 创建一个链表的链表，多创建一个位置
-	 * 将基表的链表放到下表为1的位置，root->join_rel_level[0] 永远不会使用
+	 * root->join_rel_level[j] is a list of all the j-item rels.  Initially we
+	 * set root->join_rel_level[1] to represent all the single-jointree-item
+	 * relations.
 	 */
 	root->join_rel_level = (List **) palloc0((levels_needed + 1) * sizeof(List *));
+
 	root->join_rel_level[1] = initial_rels;
 
-	// 第一层已经初始化好，从第二层开始
 	for (lev = 2; lev <= levels_needed; lev++)
 	{
 		ListCell   *lc;
 
 		/*
-		 * 确定本级别所有可能的关系对，并为每个可用的低级别关系对构建连接路径。
-		 * 生成对应 lev 层的所有对应 RelOptInfo
+		 * Determine all possible pairs of relations to be joined at this
+		 * level, and build paths for making each one from every available
+		 * pair of lower-level relations.
 		 */
 		join_search_one_level(root, lev);
 
 		/*
-		 * 对刚处理过的每个 joinrel 运行 generate_partitionwise_join_paths() 和 generate_gather_paths()。
-		 * 之前不能做这些，因为常规路径和部分路径可能在 join_search_one_level 内多次添加到某个 joinrel。
+		 * Run generate_partitionwise_join_paths() and generate_gather_paths()
+		 * for each just-processed joinrel.  We could not do this earlier
+		 * because both regular and partial paths can get added to a
+		 * particular joinrel at multiple times within join_search_one_level.
 		 *
-		 * 此后，joinrel 的路径创建完成，因此运行 set_cheapest()。
+		 * After that, we're done creating paths for the joinrel, so run
+		 * set_cheapest().
 		 */
 		foreach(lc, root->join_rel_level[lev])
 		{
 			rel = (RelOptInfo *) lfirst(lc);
 
-			/* 为分区连接创建路径。 */
+			/* Create paths for partitionwise joins. */
 			generate_partitionwise_join_paths(root, rel);
 
 			/*
-			 * 除了最顶层的扫描/连接关系外，考虑收集部分路径。对于最顶层的扫描/连接关系，
-			 * 会在确定最终目标列后再做（见 grouping_planner）。
+			 * Except for the topmost scan/join rel, consider gathering
+			 * partial paths.  We'll do the same for the topmost scan/join rel
+			 * once we know the final targetlist (see grouping_planner).
 			 */
 			if (lev < levels_needed)
 				generate_gather_paths(root, rel, false);
 
-			/* 查找并保存该关系的最优路径 */
+			/* Find and save the cheapest paths for this rel */
 			set_cheapest(rel);
 
 #ifdef OPTIMIZER_DEBUG
@@ -3187,7 +2918,7 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	}
 
 	/*
-	 * 最终级别应只有一个关系。
+	 * We should have a single rel at the final level.
 	 */
 	if (root->join_rel_level[levels_needed] == NIL)
 		elog(ERROR, "failed to build any %d-way joins", levels_needed);

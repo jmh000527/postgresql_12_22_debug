@@ -605,23 +605,25 @@ IndexSupportsBackwardScan(Oid indexid)
 }
 
 /*
- * ExecMaterializesOutput - 判断计划节点类型是否会物化输出
+ * ExecMaterializesOutput - does a plan type materialize its output?
  *
- * 如果计划节点类型会自动物化其输出（通常通过 tuplestore 保存），则返回 true。
- * 对于这种计划节点，如果没有参数变化，重新扫描时启动成本为零，每元组成本极低。
+ * Returns true if the plan node type is one that automatically materializes
+ * its output (typically by keeping it in a tuplestore).  For such plans,
+ * a rescan without any parameter change will have zero startup cost and
+ * very low per-tuple cost.
  */
 bool
 ExecMaterializesOutput(NodeTag plantype)
 {
 	switch (plantype)
 	{
-		case T_Material:               // 物化节点
-		case T_FunctionScan:           // 函数扫描节点
-		case T_TableFuncScan:          // 表函数扫描节点
-		case T_CteScan:                // CTE扫描节点
-		case T_NamedTuplestoreScan:    // 命名tuplestore扫描节点
-		case T_WorkTableScan:          // 工作表扫描节点
-		case T_Sort:                   // 排序节点
+		case T_Material:
+		case T_FunctionScan:
+		case T_TableFuncScan:
+		case T_CteScan:
+		case T_NamedTuplestoreScan:
+		case T_WorkTableScan:
+		case T_Sort:
 			return true;
 
 		default:

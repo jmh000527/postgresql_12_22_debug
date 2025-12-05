@@ -255,107 +255,93 @@ extract_or_clause(RestrictInfo *or_rinfo, RelOptInfo *rel)
 }
 
 /*
- * 考虑一个成功提取的限制条件OR子句是否值得使用。如果值得，将其添加到
- * 规划器的数据结构中，并调整原始连接子句(join_or_rinfo)以进行补偿。
- * 此函数是PostgreSQL查询优化器中OR子句优化的关键部分，用于提取可下推
- * 到基础关系的OR条件，从而提高查询性能。
+ * Consider whether a successfully-extracted restriction OR clause is
+ * actually worth using.  If so, add it to the planner's data structures,
+ * and adjust the original join clause (join_or_rinfo) to compensate.
  */
 static void
-consider_new_or_clause(PlannerInfo *root,      // 规划器信息指针
-                       RelOptInfo *rel,        // 关系优化信息指针（目标关系）
-                       Expr *orclause,         // 提取出的OR子句表达式
-                       RestrictInfo *join_or_rinfo)  // 原始连接OR子句的限制信息
+consider_new_or_clause(PlannerInfo *root, RelOptInfo *rel,
+					   Expr *orclause, RestrictInfo *join_or_rinfo)
 {
-	RestrictInfo *or_rinfo;      // 新创建的OR子句限制信息
-	Selectivity or_selec,        // OR子句的选择性（影响行数的比例）
-			  orig_selec;       // 原始连接子句的选择性
+	RestrictInfo *or_rinfo;
+	Selectivity or_selec,
+				orig_selec;
 
 	/*
-	 * 从新的OR子句构建RestrictInfo结构。我们可以假设它作为基础
-	 * 限制子句是有效的，因为前面的代码已经验证了它只引用了单个关系。
-	 * 
-	 * 参数说明：
-	 * - root: 规划器信息
-	 * - orclause: 要处理的OR表达式
-	 * - true: 标记为可被安全下推
-	 * - false: 不是一个推入子查询的表达式
-	 * - false: 不是一个被延迟评估的表达式
-	 * - 安全级别: 继承自原始连接子句
-	 * - 其余参数: NULL（不需要额外信息）
+	 * Build a RestrictInfo from the new OR clause.  We can assume it's valid
+	 * as a base restriction clause.
 	 */
 	or_rinfo = make_restrictinfo(root,
-					     orclause,
-					     true,
-					     false,
-					     false,
-					     join_or_rinfo->security_level,
-					     NULL,
-					     NULL,
-					     NULL);
+								 orclause,
+								 true,
+								 false,
+								 false,
+								 join_or_rinfo->security_level,
+								 NULL,
+								 NULL,
+								 NULL);
 
 	/*
-	 * 估计OR子句的选择性。选择性表示子句会选择多少比例的行，
-	 * 值越接近1表示选择越多的行。在RestrictInfo表示上进行计算可以
-	 * 缓存结果，避免后续重复计算。
-	 * 
-	 * 参数说明：
-	 * - root: 规划器信息
-	 * - (Node *)or_rinfo: 转换为节点指针的限制信息
-	 * - 0: 未使用的参数
-	 * - JOIN_INNER: 内部连接语义
-	 * - NULL: 无特殊连接信息
+	 * Estimate its selectivity.  (We could have done this earlier, but doing
+	 * it on the RestrictInfo representation allows the result to get cached,
+	 * saving work later.)
 	 */
 	or_selec = clause_selectivity(root, (Node *) or_rinfo,
-					      0, JOIN_INNER, NULL);
+								  0, JOIN_INNER, NULL);
 
 	/*
-	 * 只有当子句能有效过滤掉基础关系中的大量行时，才值得添加到查询中。
-	 * 否则，它只会导致重复计算（因为在连接形成时我们仍需要检查原始OR子句）。
-	 * 这里设定了一个阈值：选择性大于0.9（即过滤掉少于10%的行）时，
-	 * 不添加该子句。这个阈值是经验性的。
+	 * The clause is only worth adding to the query if it rejects a useful
+	 * fraction of the base relation's rows; otherwise, it's just going to
+	 * cause duplicate computation (since we will still have to check the
+	 * original OR clause when the join is formed).  Somewhat arbitrarily, we
+	 * set the selectivity threshold at 0.9.
 	 */
 	if (or_selec > 0.9)
-		return;                    // 过滤效果不佳，放弃添加
+		return;					/* forget it */
 
 	/*
-	 * 将OR子句添加到关系的限制子句列表中。这使优化器可以考虑在
-	 * 扫描基础关系时应用此过滤条件，减少需要处理的行数。
+	 * OK, add it to the rel's restriction-clause list.
 	 */
 	rel->baserestrictinfo = lappend(rel->baserestrictinfo, or_rinfo);
-	// 更新关系的最小安全级别，确保安全策略得到正确应用
 	rel->baserestrict_min_security = Min(rel->baserestrict_min_security,
-						    or_rinfo->security_level);
+										 or_rinfo->security_level);
 
 	/*
-	 * 调整原始连接OR子句的缓存选择性，以补偿已添加的（冗余的）低级条件。
-	 * 这确保连接关系获得与没有这些优化时大致相同的行数估计。
-	 * 
-	 * 注意事项：
-	 * 1. 这依赖于选择性将保持缓存的假设
-	 * 2. 我们只调整norm_selec（JOIN_INNER语义的缓存选择性），
-	 *    即使连接子句可能是外部连接子句，因为：
-	 *    - 难以在此处识别相关的SpecialJoinInfo
-	 *    - 由于线性假设可能不成立，特别是当"rel"位于可空侧时
-	 *    - 此时连接大小的计算与"rel"大小的关系非常非线性
+	 * Adjust the original join OR clause's cached selectivity to compensate
+	 * for the selectivity of the added (but redundant) lower-level qual. This
+	 * should result in the join rel getting approximately the same rows
+	 * estimate as it would have gotten without all these shenanigans.
+	 *
+	 * XXX major hack alert: this depends on the assumption that the
+	 * selectivity will stay cached.
+	 *
+	 * XXX another major hack: we adjust only norm_selec, the cached
+	 * selectivity for JOIN_INNER semantics, even though the join clause
+	 * might've been an outer-join clause.  This is partly because we can't
+	 * easily identify the relevant SpecialJoinInfo here, and partly because
+	 * the linearity assumption we're making would fail anyway.  (If it is an
+	 * outer-join clause, "rel" must be on the nullable side, else we'd not
+	 * have gotten here.  So the computation of the join size is going to be
+	 * quite nonlinear with respect to the size of "rel", so it's not clear
+	 * how we ought to adjust outer_selec even if we could compute its
+	 * original value correctly.)
 	 */
-	if (or_selec > 0)  // 避免除以零的情况
+	if (or_selec > 0)
 	{
-		SpecialJoinInfo sjinfo;  // 特殊连接信息结构
+		SpecialJoinInfo sjinfo;
 
 		/*
-		 * 为JOIN_INNER语义创建一个SpecialJoinInfo。
-		 * 这里手动构建了连接信息，与costsize.c中的approx_tuple_count()函数类似。
+		 * Make up a SpecialJoinInfo for JOIN_INNER semantics.  (Compare
+		 * approx_tuple_count() in costsize.c.)
 		 */
-		sjinfo.type = T_SpecialJoinInfo;  // 标记结构类型
-		// 计算连接左侧关系ID（原始连接子句关系ID减去当前关系ID）
+		sjinfo.type = T_SpecialJoinInfo;
 		sjinfo.min_lefthand = bms_difference(join_or_rinfo->clause_relids,
-							    rel->relids);
-		sjinfo.min_righthand = rel->relids;  // 右侧是当前关系
-		// 同义词关系集与最小关系集相同（简化处理）
+											 rel->relids);
+		sjinfo.min_righthand = rel->relids;
 		sjinfo.syn_lefthand = sjinfo.min_lefthand;
 		sjinfo.syn_righthand = sjinfo.min_righthand;
-		sjinfo.jointype = JOIN_INNER;  // 设置为内部连接类型
-		/* 以下字段未初始化，因为在此上下文中不需要它们 */
+		sjinfo.jointype = JOIN_INNER;
+		/* we don't bother trying to make the remaining fields valid */
 		sjinfo.lhs_strict = false;
 		sjinfo.delay_upper_joins = false;
 		sjinfo.semi_can_btree = false;
@@ -363,17 +349,15 @@ consider_new_or_clause(PlannerInfo *root,      // 规划器信息指针
 		sjinfo.semi_operators = NIL;
 		sjinfo.semi_rhs_exprs = NIL;
 
-		/* 计算原始连接子句在内部连接语义下的选择性 */
+		/* Compute inner-join size */
 		orig_selec = clause_selectivity(root, (Node *) join_or_rinfo,
-						 0, JOIN_INNER, &sjinfo);
+										0, JOIN_INNER, &sjinfo);
 
-		/* 调整缓存的选择性，使连接大小保持不变 */
-		// 将原始选择性除以OR子句的选择性，补偿已应用的过滤
+		/* And hack cached selectivity so join size remains the same */
 		join_or_rinfo->norm_selec = orig_selec / or_selec;
-		/* 确保结果在合理范围内，特别是不能超过1（表示无过滤效果） */
+		/* ensure result stays in sane range, in particular not "redundant" */
 		if (join_or_rinfo->norm_selec > 1)
 			join_or_rinfo->norm_selec = 1;
-		/* 如上所述，我们不修改outer_selec */
+		/* as explained above, we don't touch outer_selec */
 	}
 }
-

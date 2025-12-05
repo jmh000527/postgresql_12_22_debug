@@ -198,7 +198,7 @@ make_restrictinfo_internal(PlannerInfo *root,
 		restrictinfo->clause_relids = pull_varnos(root, (Node *) clause);
 	}
 
-/* required_relids defaults to clause_relids */
+	/* required_relids defaults to clause_relids */
 	if (required_relids != NULL)
 		restrictinfo->required_relids = required_relids;
 	else
@@ -390,75 +390,36 @@ commute_restrictinfo(RestrictInfo *rinfo, Oid comm_op)
 /*
  * restriction_is_or_clause
  *
- * 检查RestrictInfo节点是否包含OR子句条件
- * 当restrictinfo节点表示一个OR条件时返回true，否则返回false
- *
- * 参数说明：
- * - restrictinfo: RestrictInfo类型的指针，表示一个查询条件的优化信息结构
- *
- * 返回值：
- * - bool类型：如果条件是OR子句返回true，否则返回false
- *
- * 功能说明：
- * 该函数是查询优化器中用于识别条件类型的辅助函数，通过检查RestrictInfo结构中的orclause字段
- * 是否为非空来判断条件是否是OR子句。这对于查询优化器决定如何处理特定条件至关重要，
- * 因为OR条件通常需要特殊的优化策略（如位图索引扫描）
+ * Returns t iff the restrictinfo node contains an 'or' clause.
  */
 bool
 restriction_is_or_clause(RestrictInfo *restrictinfo)
 {
-    /* 检查restrictinfo结构的orclause字段是否非空
-     * orclause字段存储了原始的OR表达式，当条件是OR子句时该字段被设置
-     */
-    if (restrictinfo->orclause != NULL)
-        return true;  /* 是OR子句，返回true */
-    else
-        return false; /* 不是OR子句，返回false */
+	if (restrictinfo->orclause != NULL)
+		return true;
+	else
+		return false;
 }
 
 /*
  * restriction_is_securely_promotable
  *
- * 判断该限制条件是否可以“提前”执行，即在指定关系上的其他限制条件之前执行。
- *
- * 这段代码涉及 PostgreSQL 的行级安全（Row-Level Security, RLS）和安全屏障视图（Security Barrier Views）机制。
- * 它的核心目的是防止侧信道攻击（Side-channel attacks），
- * 即防止用户通过执行报错的函数或观察执行时间，推断出他们本不该看到的行的数据。
- *
- * 简单总结
- * 这个函数判断：能不能把这个过滤条件（restrictinfo）拿到更早的阶段去执行？
- * 如果返回 true：可以提前执行。说明这个条件是“安全”的，或者它本身就属于当前必须执行的安全检查层级。
- * 如果返回 false：不能提前执行。说明这个条件可能包含用户自定义的不安全函数，
- * 必须等更底层的安全检查（如 RLS 策略）先过滤完数据后，才能执行这个条件。
+ * Returns true if it's okay to evaluate this clause "early", that is before
+ * other restriction clauses attached to the specified relation.
  */
 bool
 restriction_is_securely_promotable(RestrictInfo *restrictinfo,
-                                   RelOptInfo *rel)
+								   RelOptInfo *rel)
 {
-    /*
-     * 条件 1: restrictinfo->security_level <= rel->baserestrict_min_security
-     * 
-     * 含义：如果当前条件的层级 <= 表上所有剩余限制条件的最小层级。
-     * 解释：这意味着当前条件本身就是目前优先级最高（或同级）的安全检查之一，
-     *       或者它比剩下的所有安全检查都更"外层"。
-     *       在这种情况下，按顺序执行它没有问题，因为它没有试图跳过任何必须先执行的检查。
-     */
-    
-    /*
-     * 条件 2: restrictinfo->leakproof
-     * 
-     * 含义：如果这个条件是"防泄漏"的。
-     * 解释：即使这个条件原本应该在 RLS 检查之后执行（比如它是用户写的 WHERE 子句），
-     *       但因为它被证明是无害的（不会抛出带数据的错误），优化器可以为了性能
-     *       把它"提升"（Promote）到 RLS 检查之前执行。
-     *       这通常能利用索引快速过滤掉大量数据，从而提升性能。
-     */
-
-    if (restrictinfo->security_level <= rel->baserestrict_min_security ||
-        restrictinfo->leakproof)
-        return true;  // 可以安全地提前执行
-    else
-        return false; // 必须等待更底层的安全检查先执行
+	/*
+	 * It's okay if there are no baserestrictinfo clauses for the rel that
+	 * would need to go before this one, *or* if this one is leakproof.
+	 */
+	if (restrictinfo->security_level <= rel->baserestrict_min_security ||
+		restrictinfo->leakproof)
+		return true;
+	else
+		return false;
 }
 
 /*
@@ -489,51 +450,35 @@ get_actual_clauses(List *restrictinfo_list)
 /*
  * extract_actual_clauses
  *
- * 从 'restrictinfo_list' 中提取原始子句，根据 'pseudoconstant' 参数返回普通子句或伪常量子句。
- * 若 pseudoconstant = false，则返回普通子句；若为 true，则返回伪常量子句。
- *
- * 参数:
- * - restrictinfo_list: 要处理的RestrictInfo节点列表
- * - pseudoconstant: 布尔标志，指示要提取的子句类型
- *   - true: 提取伪常量子句
- *   - false: 提取普通子句
- *
- * 返回值:
- * - 返回符合条件的Clause节点列表
+ * Extract bare clauses from 'restrictinfo_list', returning either the
+ * regular ones or the pseudoconstant ones per 'pseudoconstant'.
  */
 List *
 extract_actual_clauses(List *restrictinfo_list,
-						   bool pseudoconstant)
+					   bool pseudoconstant)
 {
-	List	   *result = NIL;  // 初始化结果列表为空
-	ListCell   *l;              // 用于遍历restrictinfo_list的列表指针
+	List	   *result = NIL;
+	ListCell   *l;
 
-	// 遍历每个RestrictInfo节点
 	foreach(l, restrictinfo_list)
 	{
-		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);  // 获取当前节点
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
 
-		// 根据pseudoconstant参数筛选子句
 		if (rinfo->pseudoconstant == pseudoconstant)
-			result = lappend(result, rinfo->clause);  // 将符合条件的子句添加到结果列表
+			result = lappend(result, rinfo->clause);
 	}
-	return result;  // 返回筛选后的子句列表
+	return result;
 }
-
 
 /*
  * extract_actual_join_clauses
  *
- * 从'restrictinfo_list'中提取原始子句，将那些语义上匹配连接级别的子句与被下推的子句分开。
- * 伪常量子句会被排除在结果之外。
+ * Extract bare clauses from 'restrictinfo_list', separating those that
+ * semantically match the join level from those that were pushed down.
+ * Pseudoconstant clauses are excluded from the results.
  *
- * 此函数仅用于外连接，因为对于普通连接我们不关心子句是否被下推。
- *
- * 参数:
- * - restrictinfo_list: 要处理的RestrictInfo节点列表
- * - joinrelids: 当前连接级别的关系ID集合
- * - joinquals: 输出参数，用于存储语义上属于当前连接级别的子句
- * - otherquals: 输出参数，用于存储被下推到当前连接级别的子句
+ * This is only used at outer joins, since for plain joins we don't care
+ * about pushed-down-ness.
  */
 void
 extract_actual_join_clauses(List *restrictinfo_list,
@@ -541,30 +486,24 @@ extract_actual_join_clauses(List *restrictinfo_list,
 							List **joinquals,
 							List **otherquals)
 {
-	ListCell   *l;  // 用于遍历restrictinfo_list的列表指针
+	ListCell   *l;
 
-	// 初始化输出参数为空列表
 	*joinquals = NIL;
 	*otherquals = NIL;
 
-	// 遍历每个RestrictInfo节点
 	foreach(l, restrictinfo_list)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
 
-		// 检查当前子句是否被下推到当前连接级别
 		if (RINFO_IS_PUSHED_DOWN(rinfo, joinrelids))
 		{
-			// 如果不是伪常量子句，则将其添加到otherquals列表
 			if (!rinfo->pseudoconstant)
 				*otherquals = lappend(*otherquals, rinfo->clause);
 		}
 		else
 		{
-			// 对于属于当前连接级别的子句，确保它们不是伪常量
 			/* joinquals shouldn't have been marked pseudoconstant */
 			Assert(!rinfo->pseudoconstant);
-			// 将子句添加到joinquals列表
 			*joinquals = lappend(*joinquals, rinfo->clause);
 		}
 	}

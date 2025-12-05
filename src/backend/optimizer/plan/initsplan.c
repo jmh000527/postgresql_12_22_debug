@@ -178,149 +178,105 @@ add_other_rels_to_query(PlannerInfo *root)
 
 /*
  * build_base_rel_tlists
- *      功能：将查询最终目标列表(final_tlist)和HAVING子句中所需的所有变量添加到相应的基本关系(base relations)中
+ *	  Add targetlist entries for each var needed in the query's final tlist
+ *	  (and HAVING clause, if any) to the appropriate base relations.
  *
- * 参数：
- *      root       - 查询规划器根节点，包含查询状态信息
- *      final_tlist - 查询的最终目标列表，包含查询要输出的所有列
- *
- * 实现说明：
- *      该函数识别查询结果中需要的所有变量，并将它们标记为"由关系0所需"，以确保这些变量在整个连接计划过程中
- *      能够被正确地向上传播，最终出现在查询结果中。
- *      关系0(relation 0)是一个特殊的标识符，表示这些变量是最终查询结果所需要的，而不仅仅是中间计算需要。
+ * We mark such vars as needed by "relation 0" to ensure that they will
+ * propagate up through all join plan steps.
  */
 void
 build_base_rel_tlists(PlannerInfo *root, List *final_tlist)
 {
-    /*
-     * 从最终目标列表中提取所有变量，包括聚合函数内部的变量、窗口函数内部的变量和占位符变量
-     * PVC_RECURSE_AGGREGATES - 递归到聚合函数内部查找变量
-     * PVC_RECURSE_WINDOWFUNCS - 递归到窗口函数内部查找变量
-     * PVC_INCLUDE_PLACEHOLDERS - 包含占位符变量
-     */
-    List   *tlist_vars = pull_var_clause((Node *) final_tlist,
-                                         PVC_RECURSE_AGGREGATES |
-                                         PVC_RECURSE_WINDOWFUNCS |
-                                         PVC_INCLUDE_PLACEHOLDERS);
+	List	   *tlist_vars = pull_var_clause((Node *) final_tlist,
+											 PVC_RECURSE_AGGREGATES |
+											 PVC_RECURSE_WINDOWFUNCS |
+											 PVC_INCLUDE_PLACEHOLDERS);
 
-    /* 如果目标列表中存在变量，则将它们添加到相应基本关系的目标列表中 */
-    if (tlist_vars != NIL)
-    {
-        /*
-         * 添加变量到目标列表，标记为由关系0所需
-         * bms_make_singleton(0) - 创建一个只包含0的位掩码，表示这些变量由顶层查询需要
-         * true - 强制将变量添加到基本关系的目标列表中
-         */
-        add_vars_to_targetlist(root, tlist_vars, bms_make_singleton(0), true);
-        list_free(tlist_vars); /* 释放提取出的变量列表 */
-    }
+	if (tlist_vars != NIL)
+	{
+		add_vars_to_targetlist(root, tlist_vars, bms_make_singleton(0), true);
+		list_free(tlist_vars);
+	}
 
-    /*
-     * 处理HAVING子句中的变量
-     * 注意：HAVING子句可以包含聚合引用(Aggrefs)，但不能包含窗口函数
-     */
-    if (root->parse->havingQual)
-    {
-        /* 从HAVING子句中提取所有变量，包括聚合函数内部的变量和占位符变量 */
-        List   *having_vars = pull_var_clause(root->parse->havingQual,
-                                              PVC_RECURSE_AGGREGATES |
-                                              PVC_INCLUDE_PLACEHOLDERS);
+	/*
+	 * If there's a HAVING clause, we'll need the Vars it uses, too.  Note
+	 * that HAVING can contain Aggrefs but not WindowFuncs.
+	 */
+	if (root->parse->havingQual)
+	{
+		List	   *having_vars = pull_var_clause(root->parse->havingQual,
+												  PVC_RECURSE_AGGREGATES |
+												  PVC_INCLUDE_PLACEHOLDERS);
 
-        /* 如果HAVING子句中存在变量，则将它们添加到相应基本关系的目标列表中 */
-        if (having_vars != NIL)
-        {
-            /* 添加变量到目标列表，同样标记为由关系0所需 */
-            add_vars_to_targetlist(root, having_vars,
-                                   bms_make_singleton(0), true);
-            list_free(having_vars); /* 释放提取出的变量列表 */
-        }
-    }
+		if (having_vars != NIL)
+		{
+			add_vars_to_targetlist(root, having_vars,
+								   bms_make_singleton(0), true);
+			list_free(having_vars);
+		}
+	}
 }
-
 
 /*
  * add_vars_to_targetlist
- *      功能：为变量列表中的每个变量添加到其所属关系的目标列表中（如果尚未存在），
- *            并标记该变量被哪些连接需要（如果where_needed包含"关系0"，表示被最终输出需要）
+ *	  For each variable appearing in the list, add it to the owning
+ *	  relation's targetlist if not already present, and mark the variable
+ *	  as being needed for the indicated join (or for final output if
+ *	  where_needed includes "relation 0").
  *
- * 参数：
- *      root         - 查询规划器根节点，包含查询状态和关系信息
- *      vars         - 变量列表，包含需要处理的Var和PlaceHolderVar节点
- *      where_needed - 需要这些变量的关系ID集合(位掩码)
- *      create_new_ph - 是否允许创建新的PlaceHolderInfo结构
- *
- * 说明：
- *      列表中可能包含PlaceHolderVars（占位符变量）。这些变量不一定属于单个关系，
- *      因此我们将它们的需求信息保存在root->placeholder_list中。
- *      如果create_new_ph为true，则允许创建新的PlaceHolderInfo；
- *      否则，PlaceHolderInfo必须已经存在，我们只更新它们的ph_needed字段。
- *      （在deconstruct_jointree开始前应为true，之后应为false）
+ *	  The list may also contain PlaceHolderVars.  These don't necessarily
+ *	  have a single owning relation; we keep their attr_needed info in
+ *	  root->placeholder_list instead.  If create_new_ph is true, it's OK
+ *	  to create new PlaceHolderInfos; otherwise, the PlaceHolderInfos must
+ *	  already exist, and we should only update their ph_needed.  (This should
+ *	  be true before deconstruct_jointree begins, and false after that.)
  */
 void
 add_vars_to_targetlist(PlannerInfo *root, List *vars,
-                       Relids where_needed, bool create_new_ph)
+					   Relids where_needed, bool create_new_ph)
 {
-    ListCell   *temp;  /* 用于遍历变量列表的临时指针 */
+	ListCell   *temp;
 
-    /* 断言：where_needed不能为空，表示至少有一个地方需要这些变量 */
-    Assert(!bms_is_empty(where_needed));
+	Assert(!bms_is_empty(where_needed));
 
-    /* 遍历变量列表中的每个节点 */
-    foreach(temp, vars)
-    {
-        Node   *node = (Node *) lfirst(temp);  /* 获取当前节点 */
+	foreach(temp, vars)
+	{
+		Node	   *node = (Node *) lfirst(temp);
 
-        /* 处理普通变量(Var) */
-        if (IsA(node, Var))
-        {
-            Var   *var = (Var *) node;  /* 转换为Var类型 */
-            /* 查找变量所属的基本关系 */
-            RelOptInfo *rel = find_base_rel(root, var->varno);
-            int         attno = var->varattno;  /* 变量的属性编号 */
+		if (IsA(node, Var))
+		{
+			Var		   *var = (Var *) node;
+			RelOptInfo *rel = find_base_rel(root, var->varno);
+			int			attno = var->varattno;
 
-            /* 如果where_needed是rel->relids的子集，则无需处理，跳过 */
-            /* 这表示变量的需求已经被关系自身覆盖 */
-            if (bms_is_subset(where_needed, rel->relids))
-                continue;
-                
-            /* 断言：属性编号必须在关系的有效范围内 */
-            Assert(attno >= rel->min_attr && attno <= rel->max_attr);
-            
-            /* 调整属性编号为相对于关系最小属性的偏移量 */
-            attno -= rel->min_attr;
-            
-            /* 如果该属性尚未被请求，则添加到关系的目标列表中 */
-            if (rel->attr_needed[attno] == NULL)
-            {
-                /* 变量尚未被请求，添加到关系的目标列表中 */
-                /* XXX 这里是否真的需要copyObject？ */
-                rel->reltarget->exprs = lappend(rel->reltarget->exprs,
-                                              copyObject(var));
-                /* 注意：reltarget的成本和宽度将在后续计算 */
-            }
-            
-            /* 更新该属性的需求信息，添加新的需求关系到现有需求中 */
-            rel->attr_needed[attno] = bms_add_members(rel->attr_needed[attno],
-                                                      where_needed);
-        }
-        /* 处理占位符变量(PlaceHolderVar) */
-        else if (IsA(node, PlaceHolderVar))
-        {
-            PlaceHolderVar *phv = (PlaceHolderVar *) node;  /* 转换为PlaceHolderVar类型 */
-            /* 查找或创建占位符信息 */
-            PlaceHolderInfo *phinfo = find_placeholder_info(root, phv,
-                                                          create_new_ph);
+			if (bms_is_subset(where_needed, rel->relids))
+				continue;
+			Assert(attno >= rel->min_attr && attno <= rel->max_attr);
+			attno -= rel->min_attr;
+			if (rel->attr_needed[attno] == NULL)
+			{
+				/* Variable not yet requested, so add to rel's targetlist */
+				/* XXX is copyObject necessary here? */
+				rel->reltarget->exprs = lappend(rel->reltarget->exprs,
+												copyObject(var));
+				/* reltarget cost and width will be computed later */
+			}
+			rel->attr_needed[attno] = bms_add_members(rel->attr_needed[attno],
+													  where_needed);
+		}
+		else if (IsA(node, PlaceHolderVar))
+		{
+			PlaceHolderVar *phv = (PlaceHolderVar *) node;
+			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv,
+															create_new_ph);
 
-            /* 更新占位符的需求信息 */
-            phinfo->ph_needed = bms_add_members(phinfo->ph_needed,
-                                              where_needed);
-        }
-        /* 处理无法识别的节点类型 */
-        else
-            elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
-    }
+			phinfo->ph_needed = bms_add_members(phinfo->ph_needed,
+												where_needed);
+		}
+		else
+			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
+	}
 }
-
 
 
 /*****************************************************************************
@@ -1439,179 +1395,179 @@ make_outerjoininfo(PlannerInfo *root,
 
 /*
  * compute_semijoin_info
- *    填充新创建的SpecialJoinInfo结构中与半连接相关的字段
- * 
- * 注意：此函数仅依赖于SpecialJoinInfo的jointype和syn_righthand字段；
- * 其余字段可能尚未设置。该函数是PostgreSQL查询优化器中实现半连接优化的
- * 关键部分，用于确定半连接的右侧(RHS)是否可以通过排序或哈希进行唯一性处理。
+ *	  Fill semijoin-related fields of a new SpecialJoinInfo
+ *
+ * Note: this relies on only the jointype and syn_righthand fields of the
+ * SpecialJoinInfo; the rest may not be set yet.
  */
 static void
-compute_semijoin_info(PlannerInfo *root,     // 规划器信息指针
-                     SpecialJoinInfo *sjinfo, // 特殊连接信息结构（输出参数）
-                     List *clause)           // 与半连接相关的条件列表
+compute_semijoin_info(PlannerInfo *root, SpecialJoinInfo *sjinfo, List *clause)
 {
-	List	   *semi_operators;  // 存储半连接条件中的操作符
-	List	   *semi_rhs_exprs;  // 存储右侧表达式列表
-	bool		all_btree;        // 标记是否所有操作符都支持B树连接
-	bool		all_hash;         // 标记是否所有操作符都支持哈希连接
-	ListCell   *lc;             // 用于遍历条件列表的指针
+	List	   *semi_operators;
+	List	   *semi_rhs_exprs;
+	bool		all_btree;
+	bool		all_hash;
+	ListCell   *lc;
 
-	/* 初始化半连接相关字段，以防无法进行唯一性处理 */
-	sjinfo->semi_can_btree = false;  // 默认不支持B树唯一性处理
-	sjinfo->semi_can_hash = false;   // 默认不支持哈希唯一性处理
-	sjinfo->semi_operators = NIL;    // 清空操作符列表
-	sjinfo->semi_rhs_exprs = NIL;    // 清空右侧表达式列表
+	/* Initialize semijoin-related fields in case we can't unique-ify */
+	sjinfo->semi_can_btree = false;
+	sjinfo->semi_can_hash = false;
+	sjinfo->semi_operators = NIL;
+	sjinfo->semi_rhs_exprs = NIL;
 
-	/* 如果不是半连接类型，则无需进一步处理 */
+	/* Nothing more to do if it's not a semijoin */
 	if (sjinfo->jointype != JOIN_SEMI)
 		return;
 
 	/*
-	 * 检查半连接的连接条件是否由AND连接的等值操作符组成，
-	 * 并且每个操作符的一侧只包含右侧(RHS)变量。如果是这样，
-	 * 我们可以确定如何对右侧应用唯一性处理。
-	 * 
-	 * 注意：输入的clause列表是在语法上与半连接相关联的条件列表，
-	 * 实际上这意味着IN语句的比较列表或EXISTS子查询的WHERE条件。
-	 * 特别是在EXISTS情况下，列表可能包含语义上不与连接关联的条件，
-	 * 而只引用一侧或另一侧。我们可以在此忽略这些条件，因为它们会在
-	 * 各自的一侧处理。
-	 * 
-	 * semi_operators列表由连接条件操作符本身组成（必要时交换顺序以
-	 * 将右侧值放在右侧）。这些可能是跨类型操作符，在这种情况下，
-	 * 唯一性处理实际需要的是相关的单类型操作符。我们假设在需要时，
-	 * 该操作符将从btree或hash操作符类中可用，否则create_unique_plan()
-	 * 将失败。
+	 * Look to see whether the semijoin's join quals consist of AND'ed
+	 * equality operators, with (only) RHS variables on only one side of each
+	 * one.  If so, we can figure out how to enforce uniqueness for the RHS.
+	 *
+	 * Note that the input clause list is the list of quals that are
+	 * *syntactically* associated with the semijoin, which in practice means
+	 * the synthesized comparison list for an IN or the WHERE of an EXISTS.
+	 * Particularly in the latter case, it might contain clauses that aren't
+	 * *semantically* associated with the join, but refer to just one side or
+	 * the other.  We can ignore such clauses here, as they will just drop
+	 * down to be processed within one side or the other.  (It is okay to
+	 * consider only the syntactically-associated clauses here because for a
+	 * semijoin, no higher-level quals could refer to the RHS, and so there
+	 * can be no other quals that are semantically associated with this join.
+	 * We do things this way because it is useful to have the set of potential
+	 * unique-ification expressions before we can extract the list of quals
+	 * that are actually semantically associated with the particular join.)
+	 *
+	 * Note that the semi_operators list consists of the joinqual operators
+	 * themselves (but commuted if needed to put the RHS value on the right).
+	 * These could be cross-type operators, in which case the operator
+	 * actually needed for uniqueness is a related single-type operator. We
+	 * assume here that that operator will be available from the btree or hash
+	 * opclass when the time comes ... if not, create_unique_plan() will fail.
 	 */
 	semi_operators = NIL;
 	semi_rhs_exprs = NIL;
-	all_btree = true;            // 初始假设所有操作符都支持B树
-	all_hash = enable_hashagg;   // 如果未启用哈希聚合，则不考虑哈希方式
-	
-	// 遍历所有连接条件
+	all_btree = true;
+	all_hash = enable_hashagg;	/* don't consider hash if not enabled */
 	foreach(lc, clause)
 	{
-		OpExpr	   *op = (OpExpr *) lfirst(lc);  // 当前操作符表达式
-		Oid		opno;              // 操作符OID
-		Node	   *left_expr;     // 左表达式
-		Node	   *right_expr;    // 右表达式
-		Relids		left_varnos;    // 左表达式引用的关系ID
-		Relids		right_varnos;   // 右表达式引用的关系ID
-		Relids		all_varnos;     // 所有引用的关系ID
-		Oid		opinputtype;      // 操作符输入类型
+		OpExpr	   *op = (OpExpr *) lfirst(lc);
+		Oid			opno;
+		Node	   *left_expr;
+		Node	   *right_expr;
+		Relids		left_varnos;
+		Relids		right_varnos;
+		Relids		all_varnos;
+		Oid			opinputtype;
 
-		/* 检查是否为二元操作符子句 */
+		/* Is it a binary opclause? */
 		if (!IsA(op, OpExpr) ||
 			list_length(op->args) != 2)
 		{
-			/* 不是二元操作符，但检查是否引用了两侧 */
+			/* No, but does it reference both sides? */
 			all_varnos = pull_varnos(root, (Node *) op);
 			if (!bms_overlap(all_varnos, sjinfo->syn_righthand) ||
 				bms_is_subset(all_varnos, sjinfo->syn_righthand))
 			{
 				/*
-				 * 条件仅引用一侧关系，忽略它 - 除非它包含易失性函数，
-				 * 在这种情况下我们最好放弃。
+				 * Clause refers to only one rel, so ignore it --- unless it
+				 * contains volatile functions, in which case we'd better
+				 * punt.
 				 */
 				if (contain_volatile_functions((Node *) op))
 					return;
 				continue;
 			}
-			/* 引用两侧的非操作符条件，必须放弃 */
+			/* Non-operator clause referencing both sides, must punt */
 			return;
 		}
 
-		/* 从二元操作符子句中提取数据 */
-		opno = op->opno;                    // 获取操作符OID
-		left_expr = linitial(op->args);     // 获取左操作数
-		right_expr = lsecond(op->args);     // 获取右操作数
-		left_varnos = pull_varnos(root, left_expr);  // 分析左操作数引用的关系
-		right_varnos = pull_varnos(root, right_expr); // 分析右操作数引用的关系
-		all_varnos = bms_union(left_varnos, right_varnos); // 合并所有引用的关系
-		opinputtype = exprType(left_expr);  // 获取左操作数的数据类型
+		/* Extract data from binary opclause */
+		opno = op->opno;
+		left_expr = linitial(op->args);
+		right_expr = lsecond(op->args);
+		left_varnos = pull_varnos(root, left_expr);
+		right_varnos = pull_varnos(root, right_expr);
+		all_varnos = bms_union(left_varnos, right_varnos);
+		opinputtype = exprType(left_expr);
 
-		/* 检查是否引用了两侧 */
+		/* Does it reference both sides? */
 		if (!bms_overlap(all_varnos, sjinfo->syn_righthand) ||
 			bms_is_subset(all_varnos, sjinfo->syn_righthand))
 		{
 			/*
-			 * 条件仅引用一侧关系，忽略它 - 除非它包含易失性函数，
-			 * 在这种情况下我们最好放弃。
+			 * Clause refers to only one rel, so ignore it --- unless it
+			 * contains volatile functions, in which case we'd better punt.
 			 */
 			if (contain_volatile_functions((Node *) op))
 				return;
 			continue;
 		}
 
-		/* 检查参数的关系归属 */
+		/* check rel membership of arguments */
 		if (!bms_is_empty(right_varnos) &&
 			bms_is_subset(right_varnos, sjinfo->syn_righthand) &&
 			!bms_overlap(left_varnos, sjinfo->syn_righthand))
 		{
-			/* 典型情况，右表达式是右侧(RHS)变量 */
+			/* typical case, right_expr is RHS variable */
 		}
 		else if (!bms_is_empty(left_varnos) &&
 				 bms_is_subset(left_varnos, sjinfo->syn_righthand) &&
 				 !bms_overlap(right_varnos, sjinfo->syn_righthand))
 		{
-			/* 翻转情况，左表达式是右侧(RHS)变量 */
-			opno = get_commutator(opno);  // 获取交换操作符
-			if (!OidIsValid(opno))        // 如果交换操作符不存在，则放弃
+			/* flipped case, left_expr is RHS variable */
+			opno = get_commutator(opno);
+			if (!OidIsValid(opno))
 				return;
-			right_expr = left_expr;       // 交换表达式，使右侧变量始终在右侧
+			right_expr = left_expr;
 		}
 		else
 		{
-			/* 参数的关系归属混合，无法确定唯一性，放弃 */
+			/* mixed membership of args, punt */
 			return;
 		}
 
-		/* 所有操作符必须支持B树等值或哈希等值操作 */
+		/* all operators must be btree equality or hash equality */
 		if (all_btree)
 		{
-			/* oprcanmerge被视为提示... */
-			// 检查是否支持合并连接，如果不支持则all_btree设为false
+			/* oprcanmerge is considered a hint... */
 			if (!op_mergejoinable(opno, opinputtype) ||
 				get_mergejoin_opfamilies(opno) == NIL)
 				all_btree = false;
 		}
 		if (all_hash)
 		{
-			/* ...但oprcanhash最好是正确的 */
-			// 检查是否支持哈希连接，如果不支持则all_hash设为false
+			/* ... but oprcanhash had better be correct */
 			if (!op_hashjoinable(opno, opinputtype))
 				all_hash = false;
 		}
-		
-		// 如果两种方法都不支持，则无法进行唯一性处理，放弃
 		if (!(all_btree || all_hash))
 			return;
 
-		/* 一切正常，继续构建列表 */
-		semi_operators = lappend_oid(semi_operators, opno); // 添加操作符到列表
-		semi_rhs_exprs = lappend(semi_rhs_exprs, copyObject(right_expr)); // 添加右侧表达式
+		/* so far so good, keep building lists */
+		semi_operators = lappend_oid(semi_operators, opno);
+		semi_rhs_exprs = lappend(semi_rhs_exprs, copyObject(right_expr));
 	}
 
-	/* 如果没有找到至少一个可用于唯一性处理的列，则放弃 */
+	/* Punt if we didn't find at least one column to unique-ify */
 	if (semi_rhs_exprs == NIL)
 		return;
 
 	/*
-	 * 用于唯一性处理的表达式不能是易失性的，因为这会导致每次评估结果可能不同
+	 * The expressions we'd need to unique-ify mustn't be volatile.
 	 */
 	if (contain_volatile_functions((Node *) semi_rhs_exprs))
 		return;
 
 	/*
-	 * 如果我们到达这里，说明可以使用排序（B树）或哈希中的至少一种方法
-	 * 对右侧(RHS)进行唯一性处理。保存相关信息供后续使用。
+	 * If we get here, we can unique-ify the semijoin's RHS using at least one
+	 * of sorting and hashing.  Save the information about how to do that.
 	 */
-	sjinfo->semi_can_btree = all_btree;    // 保存是否支持B树方法
-	sjinfo->semi_can_hash = all_hash;      // 保存是否支持哈希方法
-	sjinfo->semi_operators = semi_operators; // 保存操作符列表
-	sjinfo->semi_rhs_exprs = semi_rhs_exprs; // 保存右侧表达式列表
+	sjinfo->semi_can_btree = all_btree;
+	sjinfo->semi_can_hash = all_hash;
+	sjinfo->semi_operators = semi_operators;
+	sjinfo->semi_rhs_exprs = semi_rhs_exprs;
 }
-
 
 
 /*****************************************************************************
@@ -2243,76 +2199,67 @@ check_redundant_nullability_qual(PlannerInfo *root, Node *clause)
 	return false;
 }
 
-
 /*
  * distribute_restrictinfo_to_rels
- *    将一个处理完成的RestrictInfo对象分发到适当的限制条件或连接条件列表中
+ *	  Push a completed RestrictInfo into the proper restriction or join
+ *	  clause list(s).
  *
- * 这是distribute_qual_to_rels()函数处理普通限定条件的最后一步
- * 对于等价类处理有意义的条件会被转发到EC(等价类)处理机制，但最终可能仍会回到此处
- *
- * 参数:
- *   root - 规划器信息结构体指针，包含查询优化的全局信息
- *   restrictinfo - 已处理完成的限定条件信息结构体指针
- *
- * 函数作用:
- *   根据限定条件引用的关系数量，将其分类为单表限制条件或多表连接条件
- *   并添加到相应的关系或连接条件列表中，为后续查询计划生成做准备
+ * This is the last step of distribute_qual_to_rels() for ordinary qual
+ * clauses.  Clauses that are interesting for equivalence-class processing
+ * are diverted to the EC machinery, but may ultimately get fed back here.
  */
 void
 distribute_restrictinfo_to_rels(PlannerInfo *root,
-                               RestrictInfo *restrictinfo)
+								RestrictInfo *restrictinfo)
 {
-    // 获取限定条件引用的关系ID集合
-    Relids      relids = restrictinfo->required_relids;
-    RelOptInfo *rel;  // 用于存储单表限制条件对应的关系
+	Relids		relids = restrictinfo->required_relids;
+	RelOptInfo *rel;
 
-    // 根据关系ID集合的成员数量决定如何处理限定条件
-    switch (bms_membership(relids))
-    {
-        case BMS_SINGLETON:  // 单关系情况
+	switch (bms_membership(relids))
+	{
+		case BMS_SINGLETON:
 
-            /*
-             * 限定条件只涉及一个关系，因此它是该关系的限制条件(WHERE子句中的单表条件)
-             */
-            // 查找对应的基础关系
-            rel = find_base_rel(root, bms_singleton_member(relids));
+			/*
+			 * There is only one relation participating in the clause, so it
+			 * is a restriction clause for that relation.
+			 */
+			rel = find_base_rel(root, bms_singleton_member(relids));
 
-            /* 将限定条件添加到关系的限制条件列表中 */
-            rel->baserestrictinfo = lappend(rel->baserestrictinfo,
-                                           restrictinfo);
-            /* 更新该关系的最小安全级别信息 */
-            rel->baserestrict_min_security = Min(rel->baserestrict_min_security,
-                                                restrictinfo->security_level);
-            break;
-        case BMS_MULTIPLE:  // 多关系情况
+			/* Add clause to rel's restriction list */
+			rel->baserestrictinfo = lappend(rel->baserestrictinfo,
+											restrictinfo);
+			/* Update security level info */
+			rel->baserestrict_min_security = Min(rel->baserestrict_min_security,
+												 restrictinfo->security_level);
+			break;
+		case BMS_MULTIPLE:
 
-            /*
-             * 限定条件涉及多个关系，因此它是一个连接条件(JOIN条件或WHERE中的多表条件)
-             */
+			/*
+			 * The clause is a join clause, since there is more than one rel
+			 * in its relid set.
+			 */
 
-            /*
-             * 检查是否可以用于哈希连接
-             * (我们只为真正的连接条件设置哈希连接信息)
-             */
-            check_hashjoinable(restrictinfo);
+			/*
+			 * Check for hashjoinable operators.  (We don't bother setting the
+			 * hashjoin info except in true join clauses.)
+			 */
+			check_hashjoinable(restrictinfo);
 
-            /*
-             * 将连接条件添加到所有相关关系的连接条件列表中
-             */
-            add_join_clause_to_rels(root, restrictinfo, relids);
-            break;
-        default:  // 无关系情况
+			/*
+			 * Add clause to the join lists of all the relevant relations.
+			 */
+			add_join_clause_to_rels(root, restrictinfo, relids);
+			break;
+		default:
 
-            /*
-             * 限定条件不引用任何关系，因此我们没有地方附加它
-             * 如果调用者正确工作，不应该到达这里
-             */
-            elog(ERROR, "cannot cope with variable-free clause");
-            break;
-    }
+			/*
+			 * clause references no rels, and therefore we have no place to
+			 * attach it.  Shouldn't get here if callers are working properly.
+			 */
+			elog(ERROR, "cannot cope with variable-free clause");
+			break;
+	}
 }
-
 
 /*
  * process_implied_equality

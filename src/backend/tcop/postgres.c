@@ -3276,12 +3276,15 @@ restore_stack_base(pg_stack_base_t base)
 }
 
 /*
- * check_stack_depth/stack_is_too_deep: 检查递归是否过深导致栈溢出
+ * check_stack_depth/stack_is_too_deep: check for excessively deep recursion
  *
- * 应在任何可能递归过深导致栈溢出的递归函数中调用此函数。大多数 Unix 系统在栈溢出时会触发不可恢复的 SIGSEGV，
- * 因此我们希望在达到硬件限制之前主动报错。
+ * This should be called someplace in any recursive routine that might possibly
+ * recurse deep enough to overflow the stack.  Most Unixen treat stack
+ * overflow as an unrecoverable SIGSEGV, so we want to error out ourselves
+ * before hitting the hardware limit.
  *
- * check_stack_depth() 会直接抛出错误。stack_is_too_deep() 可用于需要自行处理错误条件的代码。
+ * check_stack_depth() just throws an error summarily.  stack_is_too_deep()
+ * can be used by code that wants to handle the error condition itself.
  */
 void
 check_stack_depth(void)
@@ -3297,12 +3300,6 @@ check_stack_depth(void)
 	}
 }
 
-/*
- * stack_is_too_deep: 判断当前递归栈是否超过限制
- *
- * 如果当前栈深度超过 max_stack_depth_bytes，则返回 true，否则返回 false。
- * 应在递归函数中用于主动检测栈溢出风险。
- */
 bool
 stack_is_too_deep(void)
 {
@@ -3310,30 +3307,35 @@ stack_is_too_deep(void)
 	long		stack_depth;
 
 	/*
-	 * 计算当前栈顶距离参考点（stack_base_ptr）的字节数
+	 * Compute distance from reference point to my local variables
 	 */
 	stack_depth = (long) (stack_base_ptr - &stack_top_loc);
 
 	/*
-	 * 取绝对值，因为有些平台栈向上增长，有些向下增长
+	 * Take abs value, since stacks grow up on some machines, down on others
 	 */
 	if (stack_depth < 0)
 		stack_depth = -stack_depth;
 
 	/*
-	 * 是否超过限制？
+	 * Trouble?
 	 *
-	 * stack_base_ptr 判空用于避免在进程初始化或非后端进程时误报。
-	 * 理论上应先判空，但放在这里可减少正常情况下的性能损耗。
+	 * The test on stack_base_ptr prevents us from erroring out if called
+	 * during process setup or in a non-backend process.  Logically it should
+	 * be done first, but putting it here avoids wasting cycles during normal
+	 * cases.
 	 */
 	if (stack_depth > max_stack_depth_bytes &&
 		stack_base_ptr != NULL)
 		return true;
 
 	/*
-	 * IA64 架构有独立的“寄存器栈”，也需要单独检查。
-	 * 这里测量 BSP 指针的变化，逻辑同上，且 IA64 的寄存器栈总是向上增长。
-	 * 注意：假定 max_stack_depth 对两种栈都适用。
+	 * On IA64 there is a separate "register" stack that requires its own
+	 * independent check.  For this, we have to measure the change in the
+	 * "BSP" pointer from PostgresMain to here.  Logic is just as above,
+	 * except that we know IA64's register stack grows up.
+	 *
+	 * Note we assume that the same max_stack_depth applies to both stacks.
 	 */
 #if defined(__ia64__) || defined(__ia64)
 	stack_depth = (long) (ia64_get_bsp() - register_stack_base_ptr);

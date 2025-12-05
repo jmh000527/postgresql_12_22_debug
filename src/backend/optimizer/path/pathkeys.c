@@ -95,68 +95,61 @@ make_canonical_pathkey(PlannerInfo *root,
 }
 
 /*
- * pathkey_is_redundant - 检查路径键是否在给定列表中冗余
+ * pathkey_is_redundant
+ *	   Is a pathkey redundant with one already in the given list?
  *
- * 该函数用于判断一个新的路径键是否与路径键列表中已有的路径键冗余。
- * 如果冗余，则可以在排序或索引匹配时忽略该路径键，从而优化查询执行计划。
+ * We detect two cases:
  *
- * 参数说明:
- * - new_pathkey: 要检查的新路径键
- * - pathkeys: 现有的路径键列表
+ * 1. If the new pathkey's equivalence class contains a constant, and isn't
+ * below an outer join, then we can disregard it as a sort key.  An example:
+ *			SELECT ... WHERE x = 42 ORDER BY x, y;
+ * We may as well just sort by y.  Note that because of opfamily matching,
+ * this is semantically correct: we know that the equality constraint is one
+ * that actually binds the variable to a single value in the terms of any
+ * ordering operator that might go with the eclass.  This rule not only lets
+ * us simplify (or even skip) explicit sorts, but also allows matching index
+ * sort orders to a query when there are don't-care index columns.
  *
- * 返回值:
- * - bool: 如果路径键冗余则返回true，否则返回false
+ * 2. If the new pathkey's equivalence class is the same as that of any
+ * existing member of the pathkey list, then it is redundant.  Some examples:
+ *			SELECT ... ORDER BY x, x;
+ *			SELECT ... ORDER BY x, x DESC;
+ *			SELECT ... WHERE x = y ORDER BY x, y;
+ * In all these cases the second sort key cannot distinguish values that are
+ * considered equal by the first, and so there's no point in using it.
+ * Note in particular that we need not compare opfamily (all the opfamilies
+ * of the EC have the same notion of equality) nor sort direction.
  *
- * 冗余检测的两种情况:
+ * Both the given pathkey and the list members must be canonical for this
+ * to work properly, but that's okay since we no longer ever construct any
+ * non-canonical pathkeys.  (Note: the notion of a pathkey *list* being
+ * canonical includes the additional requirement of no redundant entries,
+ * which is exactly what we are checking for here.)
  *
- * 1. 如果新路径键的等价类包含常量且不在外连接之下，则可以忽略它作为排序键。
- *    示例: SELECT ... WHERE x = 42 ORDER BY x, y;
- *    我们可以直接按y排序即可。由于操作符族匹配，这在语义上是正确的：
- *    我们知道等式约束实际上将变量绑定到单个值，对于与等价类相关的任何排序操作符都是如此。
- *    这个规则不仅让我们简化（甚至跳过）显式排序，还允许在存在无关紧要的索引列时，
- *    将索引排序顺序与查询匹配。
- *
- * 2. 如果新路径键的等价类与路径键列表中任何现有成员的等价类相同，则它是冗余的。
- *    示例:
- *      SELECT ... ORDER BY x, x;           -- 第二个x无法区分第一个x认为相等的值
- *      SELECT ... ORDER BY x, x DESC;      -- 同样无法提供更多区分信息
- *      SELECT ... WHERE x = y ORDER BY x, y; -- x和y相等，第二个排序键无意义
- *    特别注意的是，我们不需要比较操作符族（等价类的所有操作符族都有相同的相等概念）
- *    也不需要比较排序方向。
- *
- * 要求:
- * 给定的路径键和列表成员都必须是规范化的(canonical)，这样才能正常工作。
- * 但由于我们现在不再构造任何非规范化的路径键，所以这不是问题。
- * (注意：路径键列表被认为是规范化的，还包括没有冗余条目的额外要求，
- * 这正是我们在这里检查的内容。)
- *
- * 由于equivclass.c机制为每个查询只形成一个EC副本，
- * 指针比较就足够判断规范化的EC是否相同。
+ * Because the equivclass.c machinery forms only one copy of any EC per query,
+ * pointer comparison is enough to decide whether canonical ECs are the same.
  */
 static bool
 pathkey_is_redundant(PathKey *new_pathkey, List *pathkeys)
 {
-	EquivalenceClass *new_ec = new_pathkey->pk_eclass;  /* 新路径键的等价类 */
-	ListCell   *lc;  /* 列表遍历指针 */
+	EquivalenceClass *new_ec = new_pathkey->pk_eclass;
+	ListCell   *lc;
 
-	/* 检查等价类是否包含常量 --- 无条件冗余 */
+	/* Check for EC containing a constant --- unconditionally redundant */
 	if (EC_MUST_BE_REDUNDANT(new_ec))
 		return true;
 
-	/* 如果列表中已使用相同的等价类，则冗余 */
+	/* If same EC already used in list, then redundant */
 	foreach(lc, pathkeys)
 	{
 		PathKey    *old_pathkey = (PathKey *) lfirst(lc);
 
-		/* 通过指针比较等价类是否相同 */
 		if (new_ec == old_pathkey->pk_eclass)
 			return true;
 	}
 
-	/* 不冗余 */
 	return false;
 }
-
 
 /*
  * make_pathkey_from_sortinfo
@@ -280,9 +273,11 @@ make_pathkey_from_sortop(PlannerInfo *root,
 
 /*
  * compare_pathkeys
- *	  比较两个 pathkeys 列表，判断它们是否等价，如果不等价则判断哪一个“更好”。
+ *	  Compare two pathkeys to see if they are equivalent, and if not whether
+ *	  one is "better" than the other.
  *
- *	  假设 pathkeys 都是规范化的，因此可以通过指针比较来判断是否相等。
+ *	  We assume the pathkeys are canonical, and so they can be checked for
+ *	  equality by simple pointer comparison.
  */
 PathKeysComparison
 compare_pathkeys(List *keys1, List *keys2)
@@ -291,36 +286,30 @@ compare_pathkeys(List *keys1, List *keys2)
 			   *key2;
 
 	/*
-	 * 如果传入的是同一个列表，直接返回相等。主要用于处理两个都是 NIL 的情况，这种情况很常见。
+	 * Fall out quickly if we are passed two identical lists.  This mostly
+	 * catches the case where both are NIL, but that's common enough to
+	 * warrant the test.
 	 */
 	if (keys1 == keys2)
 		return PATHKEYS_EQUAL;
 
-	/*
-	 * 遍历两个列表，比较每个 PathKey 是否相等。
-	 * 如果发现有不同的 PathKey，直接返回不同。
-	 */
 	forboth(key1, keys1, key2, keys2)
 	{
 		PathKey    *pathkey1 = (PathKey *) lfirst(key1);
 		PathKey    *pathkey2 = (PathKey *) lfirst(key2);
 
 		if (pathkey1 != pathkey2)
-			return PATHKEYS_DIFFERENT;	/* 不需要继续比较，直接返回不同 */
+			return PATHKEYS_DIFFERENT;	/* no need to keep looking */
 	}
 
 	/*
-	 * 如果只到达了其中一个列表的末尾，说明另一个更长，因此不是子集关系。
-	 * 返回相应的“更好”结果。
+	 * If we reached the end of only one list, the other is longer and
+	 * therefore not a subset.
 	 */
 	if (key1 != NULL)
-		return PATHKEYS_BETTER1;	/* key1 更长 */
+		return PATHKEYS_BETTER1;	/* key1 is longer */
 	if (key2 != NULL)
-		return PATHKEYS_BETTER2;	/* key2 更长 */
-
-	/*
-	 * 如果两个列表都遍历完了，说明它们是等价的。
-	 */
+		return PATHKEYS_BETTER2;	/* key2 is longer */
 	return PATHKEYS_EQUAL;
 }
 
@@ -430,53 +419,25 @@ get_cheapest_fractional_path_for_pathkeys(List *paths,
 
 
 /*
- * get_cheapest_parallel_safe_total_inner - 查找最便宜的并行安全总内部路径
- *
- * 该函数用于在路径列表中查找未参数化的并行安全路径中总成本最低的路径。
- * 这在并行查询优化中非常重要，因为只有并行安全的路径才能在并行执行中使用。
- *
- * 参数说明:
- * - paths: 路径列表，包含多个可能的执行路径
- *
- * 返回值:
- * - Path*: 返回找到的最便宜的并行安全内部路径，如果未找到则返回NULL
- *
- * 工作原理:
- * 1. 遍历路径列表中的每个路径
- * 2. 检查路径是否满足两个条件：
- *    a) parallel_safe: 路径是否支持并行执行
- *    b) 未参数化：PATH_REQ_OUTER返回空，表示不依赖外部参数
- * 3. 返回第一个满足条件的路径（由于路径列表通常按成本排序，第一个就是最便宜的）
- *
- * 注意事项:
- * - 该函数假设输入的路径列表已经按成本排序
- * - 只返回完全独立的路径（无参数依赖），确保可以在并行工作进程中安全执行
- * - 如果没有找到满足条件的路径，返回NULL
+ * get_cheapest_parallel_safe_total_inner
+ *	  Find the unparameterized parallel-safe path with the least total cost.
  */
 Path *
 get_cheapest_parallel_safe_total_inner(List *paths)
 {
-	ListCell   *l;  /* 列表遍历指针 */
+	ListCell   *l;
 
-	/* 遍历路径列表中的每个路径 */
 	foreach(l, paths)
 	{
 		Path	   *innerpath = (Path *) lfirst(l);
 
-		/* 
-		 * 检查路径是否满足并行安全和未参数化条件：
-		 * 1. parallel_safe: 路径必须标记为并行安全
-		 * 2. bms_is_empty(PATH_REQ_OUTER(innerpath)): 路径不能有外部参数依赖
-		 */
 		if (innerpath->parallel_safe &&
 			bms_is_empty(PATH_REQ_OUTER(innerpath)))
-			return innerpath;  /* 返回第一个满足条件的路径 */
+			return innerpath;
 	}
 
-	/* 如果没有找到满足条件的路径，返回NULL */
 	return NULL;
 }
-
 
 /****************************************************************************
  *		NEW PATHKEY FORMATION
@@ -1329,21 +1290,30 @@ find_mergeclauses_for_outer_pathkeys(PlannerInfo *root,
 
 	return mergeclauses;
 }
+
 /*
  * select_outer_pathkeys_for_merge
- *	  构建一个 pathkey 列表，表示可以用于给定 mergeclauses 的外部排序顺序。
+ *	  Builds a pathkey list representing a possible sort ordering
+ *	  that can be used with the given mergeclauses.
  *
- * 'mergeclauses' 是用于 merge join 的 RestrictInfo 列表。
- * 'joinrel' 是我们尝试构建的连接关系。
+ * 'mergeclauses' is a list of RestrictInfos for mergejoin clauses
+ *			that will be used in a merge join.
+ * 'joinrel' is the join relation we are trying to construct.
  *
- * RestrictInfo 必须通过 outer_is_left 标记，指示每个子句的外部路径是哪一侧。
- * （参见 select_mergejoin_clauses()）
+ * The restrictinfos must be marked (via outer_is_left) to show which side
+ * of each clause is associated with the current outer path.  (See
+ * select_mergejoin_clauses())
  *
- * 返回可应用于外部关系的 pathkeys 列表。
+ * Returns a pathkeys list that can be applied to the outer relation.
  *
- * 由于这里假设需要排序，因此无需匹配外部关系已有的排序顺序（joinpath.c 有专门处理无需排序的 mergejoin 的代码路径）。
- * 更有意义的是尝试匹配 query_pathkeys，这样可以避免二次排序输出；如果无法匹配，则优先列出“更受欢迎”的键
- * （即未匹配的 EquivalenceClass 成员最多的键），以期使结果排序对更多高层 mergejoin 有用。
+ * Since we assume here that a sort is required, there is no particular use
+ * in matching any available ordering of the outerrel.  (joinpath.c has an
+ * entirely separate code path for considering sort-free mergejoins.)  Rather,
+ * it's interesting to try to match the requested query_pathkeys so that a
+ * second output sort may be avoided; and failing that, we try to list "more
+ * popular" keys (those with the most unmatched EquivalenceClass peers)
+ * earlier, in hopes of making the resulting ordering useful for as many
+ * higher-level mergejoins as possible.
  */
 List *
 select_outer_pathkeys_for_merge(PlannerInfo *root,
@@ -1358,12 +1328,13 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 	ListCell   *lc;
 	int			j;
 
-	/* 可能没有 mergeclauses */
+	/* Might have no mergeclauses */
 	if (nClauses == 0)
 		return NIL;
 
 	/*
-	 * 构建 mergeclauses 使用的 EC 数组（去重）及其“受欢迎度”分数。
+	 * Make arrays of the ECs used by the mergeclauses (dropping any
+	 * duplicates) and their "popularity" scores.
 	 */
 	ecs = (EquivalenceClass **) palloc(nClauses * sizeof(EquivalenceClass *));
 	scores = (int *) palloc(nClauses * sizeof(int));
@@ -1376,7 +1347,7 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 		int			score;
 		ListCell   *lc2;
 
-		/* 获取外部 eclass */
+		/* get the outer eclass */
 		update_mergeclause_eclasses(root, rinfo);
 
 		if (rinfo->outer_is_left)
@@ -1384,7 +1355,7 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 		else
 			oeclass = rinfo->right_ec;
 
-		/* 去重 */
+		/* reject duplicates */
 		for (j = 0; j < necs; j++)
 		{
 			if (ecs[j] == oeclass)
@@ -1393,13 +1364,13 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 		if (j < necs)
 			continue;
 
-		/* 计算分数：未与 joinrel 连接的成员数量 */
+		/* compute score */
 		score = 0;
 		foreach(lc2, oeclass->ec_members)
 		{
 			EquivalenceMember *em = (EquivalenceMember *) lfirst(lc2);
 
-			/* 未来可能的连接伙伴？ */
+			/* Potential future join partner? */
 			if (!em->em_is_const && !em->em_is_child &&
 				!bms_overlap(em->em_relids, joinrel->relids))
 				score++;
@@ -1411,8 +1382,9 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 	}
 
 	/*
-	 * 检查 query_pathkeys 是否全部包含在 ECs 中；如果是，则可以生成对最终输出有用的排序顺序。
-	 * 部分匹配没有意义，必须全部包含。
+	 * Find out if we have all the ECs mentioned in query_pathkeys; if so we
+	 * can generate a sort order that's also useful for final output. There is
+	 * no percentage in a partial match, though, so we have to have 'em all.
 	 */
 	if (root->query_pathkeys)
 	{
@@ -1424,17 +1396,17 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 			for (j = 0; j < necs; j++)
 			{
 				if (ecs[j] == query_ec)
-					break;		/* 找到匹配 */
+					break;		/* found match */
 			}
 			if (j >= necs)
-				break;			/* 未找到匹配，退出 */
+				break;			/* didn't find match */
 		}
-		/* 如果遍历完了，说明全部匹配 */
+		/* if we got to the end of the list, we have them all */
 		if (lc == NULL)
 		{
-			/* 复制 query_pathkeys 作为输出的起点 */
+			/* copy query_pathkeys as starting point for our output */
 			pathkeys = list_copy(root->query_pathkeys);
-			/* 标记这些 EC 已经输出 */
+			/* mark their ECs as already-emitted */
 			foreach(lc, root->query_pathkeys)
 			{
 				PathKey    *query_pathkey = (PathKey *) lfirst(lc);
@@ -1453,8 +1425,9 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 	}
 
 	/*
-	 * 按受欢迎度顺序将剩余 EC 加入列表，使用默认排序方式。
-	 * （可以用 qsort，但通常列表很短，不值得。）
+	 * Add remaining ECs to the list in popularity order, using a default sort
+	 * ordering.  (We could use qsort() here, but the list length is usually
+	 * so small it's not worth it.)
 	 */
 	for (;;)
 	{
@@ -1474,7 +1447,7 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 			}
 		}
 		if (best_score < 0)
-			break;				/* 全部处理完毕 */
+			break;				/* all done */
 		ec = ecs[best_j];
 		scores[best_j] = -1;
 		pathkey = make_canonical_pathkey(root,
@@ -1482,7 +1455,7 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 										 linitial_oid(ec->ec_opfamilies),
 										 BTLessStrategyNumber,
 										 false);
-		/* 不可能重复，因为没有重复的 EC */
+		/* can't be redundant because no duplicate ECs */
 		Assert(!pathkey_is_redundant(pathkey, pathkeys));
 		pathkeys = lappend(pathkeys, pathkey);
 	}
