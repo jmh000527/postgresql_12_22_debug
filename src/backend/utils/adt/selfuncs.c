@@ -3576,18 +3576,16 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 	ReleaseVariableStats(vardata);
 }
 
+
 /*
  * estimate_hashagg_tablesize
- *	  estimate the number of bytes that a hash aggregate hashtable will
- *	  require based on the agg_costs, path width and number of groups.
+ *	  根据 agg_costs、路径宽度和分组数量估算哈希聚合哈希表所需的字节数。
  *
- * We return the result as "double" to forestall any possible overflow
- * problem in the multiplication by dNumGroups.
+ * 返回结果为 double 类型，以避免在与 dNumGroups 相乘时发生溢出问题。
  *
- * XXX this may be over-estimating the size now that hashagg knows to omit
- * unneeded columns from the hashtable.  Also for mixed-mode grouping sets,
- * grouping columns not in the hashed set are counted here even though hashagg
- * won't store them.  Is this a problem?
+ * XXX 现在哈希聚合已经知道可以省略哈希表中不需要的列，因此这里的估算可能偏大。
+ * 对于混合模式分组集，不在哈希分组集中的分组列也会被计入，尽管哈希聚合不会存储它们。
+ * 这会有问题吗？
  */
 double
 estimate_hashagg_tablesize(Path *path, const AggClauseCosts *agg_costs,
@@ -3595,20 +3593,19 @@ estimate_hashagg_tablesize(Path *path, const AggClauseCosts *agg_costs,
 {
 	Size		hashentrysize;
 
-	/* Estimate per-hash-entry space at tuple width... */
+	/* 估算每个哈希条目的空间，按元组宽度计算... */
 	hashentrysize = MAXALIGN(path->pathtarget->width) +
 		MAXALIGN(SizeofMinimalTupleHeader);
 
-	/* plus space for pass-by-ref transition values... */
+	/* 加上传递引用类型聚合状态值所需空间... */
 	hashentrysize += agg_costs->transitionSpace;
-	/* plus the per-hash-entry overhead */
+	/* 加上每个哈希条目的额外开销 */
 	hashentrysize += hash_agg_entry_size(agg_costs->numAggs);
 
 	/*
-	 * Note that this disregards the effect of fill-factor and growth policy
-	 * of the hash table.  That's probably ok, given that the default
-	 * fill-factor is relatively high.  It'd be hard to meaningfully factor in
-	 * "double-in-size" growth policies here.
+	 * 注意这里没有考虑哈希表的填充因子和扩容策略的影响。
+	 * 这可能没问题，因为默认填充因子比较高。
+	 * 如果要考虑“翻倍扩容”策略，这里也很难合理估算。
 	 */
 	return hashentrysize * dNumGroups;
 }

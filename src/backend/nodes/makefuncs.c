@@ -61,39 +61,46 @@ makeSimpleA_Expr(A_Expr_Kind kind, char *name,
 
 /*
  * makeVar -
- *	  creates a Var node
+ *    创建一个Var节点
+ *
+ * Var节点是PostgreSQL查询树中表示表列引用的基本构建块。
+ * 它用于在查询执行计划中标识和引用来自特定关系（表）的列。
  */
 Var *
-makeVar(Index varno,
-		AttrNumber varattno,
-		Oid vartype,
-		int32 vartypmod,
-		Oid varcollid,
-		Index varlevelsup)
+makeVar(Index varno,           /* 关系编号，表示列所属的表或子查询 */
+        AttrNumber varattno,   /* 属性编号，表示列在表中的位置 */
+        Oid vartype,           /* 列的数据类型OID */
+        int32 vartypmod,       /* 类型修饰符（如长度限制） */
+        Oid varcollid,         /* 列的排序规则OID */
+        Index varlevelsup)     /* 此变量引用的查询嵌套级别（0表示当前级别） */
 {
-	Var		   *var = makeNode(Var);
+    /* 创建并初始化一个Var类型的节点 */
+    Var       *var = makeNode(Var);
 
-	var->varno = varno;
-	var->varattno = varattno;
-	var->vartype = vartype;
-	var->vartypmod = vartypmod;
-	var->varcollid = varcollid;
-	var->varlevelsup = varlevelsup;
+    /* 设置Var节点的核心属性，用于标识和引用特定的表列 */
+    var->varno = varno;         /* 设置关系编号 */
+    var->varattno = varattno;   /* 设置属性编号 */
+    var->vartype = vartype;     /* 设置数据类型 */
+    var->vartypmod = vartypmod; /* 设置类型修饰符 */
+    var->varcollid = varcollid; /* 设置排序规则 */
+    var->varlevelsup = varlevelsup; /* 设置查询嵌套级别 */
 
-	/*
-	 * Since few if any routines ever create Var nodes with varnoold/varoattno
-	 * different from varno/varattno, we don't provide separate arguments for
-	 * them, but just initialize them to the given varno/varattno. This
-	 * reduces code clutter and chance of error for most callers.
-	 */
-	var->varnoold = varno;
-	var->varoattno = varattno;
+    /*
+     * 由于很少有例程会创建varnoold/varoattno与varno/varattno不同的Var节点，
+     * 我们不为它们提供单独的参数，而是直接将它们初始化为给定的varno/varattno。
+     * 这样可以减少大多数调用者的代码混乱并降低出错的可能性。
+     * （注：varnoold和varoattno主要用于在查询转换过程中跟踪列的原始来源）
+     */
+    var->varnoold = varno;
+    var->varoattno = varattno;
 
-	/* Likewise, we just set location to "unknown" here */
-	var->location = -1;
+    /* 同样，我们这里将位置设置为"未知" */
+    var->location = -1;
 
-	return var;
+    /* 返回创建并初始化好的Var节点 */
+    return var;
 }
+
 
 /*
  * makeVarFromTargetEntry -
@@ -296,7 +303,7 @@ makeFromExpr(List *fromlist, Node *quals)
 
 /*
  * makeConst -
- *	  creates a Const node
+ *    创建一个 Const 节点
  */
 Const *
 makeConst(Oid consttype,
@@ -354,12 +361,15 @@ makeNullConst(Oid consttype, int32 consttypmod, Oid constcollid)
 
 /*
  * makeBoolConst -
- *	  creates a Const node representing a boolean value (can be NULL too)
+ *    创建一个表示布尔值（也可以为NULL）的 Const 节点
  */
 Node *
 makeBoolConst(bool value, bool isnull)
 {
-	/* note that pg_type.h hardwires size of bool as 1 ... duplicate it */
+	/*
+	 * 注意：pg_type.h 中规定 bool 类型的大小为 1，这里也需要保持一致
+	 * BoolGetDatum 用于将 C 语言的 bool 类型转换为 PostgreSQL 的 Datum 类型
+	 */
 	return (Node *) makeConst(BOOLOID, -1, InvalidOid, 1,
 							  BoolGetDatum(value), isnull, true);
 }

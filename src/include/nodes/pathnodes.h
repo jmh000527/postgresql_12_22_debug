@@ -29,57 +29,52 @@
 typedef Bitmapset *Relids;
 
 /*
- * When looking for a "cheapest path", this enum specifies whether we want
- * cheapest startup cost or cheapest total cost.
+ * 在寻找“最优路径”时，此枚举指定我们关注的是启动成本还是总成本。
  */
 typedef enum CostSelector
 {
-	STARTUP_COST, TOTAL_COST
+	STARTUP_COST,	/* 启动成本 */
+	TOTAL_COST		/* 总成本 */
 } CostSelector;
 
 /*
- * The cost estimate produced by cost_qual_eval() includes both a one-time
- * (startup) cost, and a per-tuple cost.
+ * cost_qual_eval() 产生的成本估算包括一次性（启动）成本和每元组成本。
  */
 typedef struct QualCost
 {
-	Cost		startup;		/* one-time cost */
-	Cost		per_tuple;		/* per-evaluation cost */
+	Cost		startup;		/* 一次性启动成本 */
+	Cost		per_tuple;		/* 每元组评估成本 */
 } QualCost;
 
 /*
- * Costing aggregate function execution requires these statistics about
- * the aggregates to be executed by a given Agg node.  Note that the costs
- * include the execution costs of the aggregates' argument expressions as
- * well as the aggregate functions themselves.  Also, the fields must be
- * defined so that initializing the struct to zeroes with memset is correct.
+ * 聚合函数执行的成本估算需要以下关于待执行聚合的信息。
+ * 注意，成本包括聚合参数表达式的执行成本以及聚合函数本身的成本。
+ * 所有字段必须定义为可用 memset 初始化为零。
  */
 typedef struct AggClauseCosts
 {
-	int			numAggs;		/* total number of aggregate functions */
-	int			numOrderedAggs; /* number w/ DISTINCT/ORDER BY/WITHIN GROUP */
-	bool		hasNonPartial;	/* does any agg not support partial mode? */
-	bool		hasNonSerial;	/* is any partial agg non-serializable? */
-	QualCost	transCost;		/* total per-input-row execution costs */
-	QualCost	finalCost;		/* total per-aggregated-row costs */
-	Size		transitionSpace;	/* space for pass-by-ref transition data */
+	int			numAggs;			/* 聚合函数总数 */
+	int			numOrderedAggs; 	/* 包含 DISTINCT/ORDER BY/WITHIN GROUP 的聚合数 */
+	bool		hasNonPartial;		/* 是否存在不支持部分聚合模式的聚合 */
+	bool		hasNonSerial;		/* 是否存在部分聚合不可序列化 */
+	QualCost	transCost;			/* 每输入行的总执行成本 */
+	QualCost	finalCost;			/* 每聚合行的总执行成本 */
+	Size		transitionSpace;	/* 按引用传递的中间数据空间大小 */
 } AggClauseCosts;
 
 /*
- * This enum identifies the different types of "upper" (post-scan/join)
- * relations that we might deal with during planning.
+ * UpperRelationKind 枚举用于标识在规划过程中可能处理的不同类型的“上层”（扫描/连接之后）关系。
  */
 typedef enum UpperRelationKind
 {
-	UPPERREL_SETOP,				/* result of UNION/INTERSECT/EXCEPT, if any */
-	UPPERREL_PARTIAL_GROUP_AGG, /* result of partial grouping/aggregation, if
-								 * any */
-	UPPERREL_GROUP_AGG,			/* result of grouping/aggregation, if any */
-	UPPERREL_WINDOW,			/* result of window functions, if any */
-	UPPERREL_DISTINCT,			/* result of "SELECT DISTINCT", if any */
-	UPPERREL_ORDERED,			/* result of ORDER BY, if any */
-	UPPERREL_FINAL				/* result of any remaining top-level actions */
-	/* NB: UPPERREL_FINAL must be last enum entry; it's used to size arrays */
+	UPPERREL_SETOP,				/* UNION/INTERSECT/EXCEPT 操作的结果（如有） */
+	UPPERREL_PARTIAL_GROUP_AGG, /* 部分分组/聚合的结果（如有） */
+	UPPERREL_GROUP_AGG,			/* 分组/聚合的结果（如有） */
+	UPPERREL_WINDOW,			/* 窗口函数的结果（如有） */
+	UPPERREL_DISTINCT,			/* SELECT DISTINCT 的结果（如有） */
+	UPPERREL_ORDERED,			/* ORDER BY 的结果（如有） */
+	UPPERREL_FINAL				/* 任何剩余顶层操作的结果 */
+	/* 注意：UPPERREL_FINAL 必须是最后一个枚举项，用于确定相关数组的大小 */
 } UpperRelationKind;
 
 /*
@@ -96,59 +91,61 @@ typedef enum InheritanceKind
 
 /*----------
  * PlannerGlobal
- *		Global information for planning/optimization
+ *		规划/优化的全局信息
  *
- * PlannerGlobal holds state for an entire planner invocation; this state
- * is shared across all levels of sub-Queries that exist in the command being
- * planned.
+ * PlannerGlobal 保存一次 planner 调用的全局状态；
+ * 该状态在整个命令的所有子查询层级间共享。
  *----------
  */
 typedef struct PlannerGlobal
 {
 	NodeTag		type;
 
-	ParamListInfo boundParams;	/* Param values provided to planner() */
+	ParamListInfo boundParams;				/* planner() 提供的参数值 */
 
-	List	   *subplans;		/* Plans for SubPlan nodes */
+	List	   *subplans;					/* SubPlan 节点的计划列表 */
 
-	List	   *subroots;		/* PlannerInfos for SubPlan nodes */
+	List	   *subroots;					/* SubPlan 节点的 PlannerInfo 列表 */
 
-	Bitmapset  *rewindPlanIDs;	/* indices of subplans that require REWIND */
+	Bitmapset  *rewindPlanIDs;				/* 需要 REWIND 的 subplan 索引集合 */
 
-	List	   *finalrtable;	/* "flat" rangetable for executor */
+	List	   *finalrtable;				/* executor 用的“扁平化” rangetable */
 
-	List	   *finalrowmarks;	/* "flat" list of PlanRowMarks */
+	List	   *finalrowmarks;				/* “扁平化”的 PlanRowMarks 列表 */
 
-	List	   *resultRelations;	/* "flat" list of integer RT indexes */
+	List	   *resultRelations;			/* “扁平化”的结果关系 RT 索引列表 */
 
-	List	   *rootResultRelations;	/* "flat" list of integer RT indexes */
+	List	   *rootResultRelations;		/* “扁平化”的根结果关系 RT 索引列表 */
 
-	List	   *relationOids;	/* OIDs of relations the plan depends on */
+	List	   *relationOids;				/* 计划依赖的关系 OID 列表 */
 
-	List	   *invalItems;		/* other dependencies, as PlanInvalItems */
+	List	   *invalItems;					/* 其他依赖项，PlanInvalItems 列表 */
 
-	List	   *paramExecTypes; /* type OIDs for PARAM_EXEC Params */
+	List	   *paramExecTypes; 			/* PARAM_EXEC 类型的 OID 列表 */
 
-	Index		lastPHId;		/* highest PlaceHolderVar ID assigned */
+	Index		lastPHId;					/* 已分配的最大 PlaceHolderVar ID */
 
-	Index		lastRowMarkId;	/* highest PlanRowMark ID assigned */
+	Index		lastRowMarkId;				/* 已分配的最大 PlanRowMark ID */
 
-	int			lastPlanNodeId; /* highest plan node ID assigned */
+	int			lastPlanNodeId; 			/* 已分配的最大计划节点 ID */
 
-	bool		transientPlan;	/* redo plan when TransactionXmin changes? */
+	bool		transientPlan;				/* TransactionXmin 变化时是否重做计划？ */
 
-	bool		dependsOnRole;	/* is plan specific to current role? */
+	bool		dependsOnRole;				/* 计划是否依赖当前角色？ */
 
-	bool		parallelModeOK; /* parallel mode potentially OK? */
+	bool		parallelModeOK; 			/* 是否可能使用并行模式？ */
 
-	bool		parallelModeNeeded; /* parallel mode actually required? */
+	bool		parallelModeNeeded; 		/* 是否实际需要并行模式？ */
 
-	char		maxParallelHazard;	/* worst PROPARALLEL hazard level */
+	char		maxParallelHazard;			/* 最严重的 PROPARALLEL hazard 等级 */
 
-	PartitionDirectory partition_directory; /* partition descriptors */
+	PartitionDirectory partition_directory; /* 分区描述符目录 */
 } PlannerGlobal;
 
-/* macro for fetching the Plan associated with a SubPlan node */
+/* 获取 SubPlan 节点关联的 Plan 的宏
+ * 通过 subplan 的 plan_id 从 root->glob->subplans 列表中获取对应的 Plan 指针
+ * 注意 plan_id 从 1 开始，因此需要减 1 作为索引
+ */
 #define planner_subplan_get_plan(root, subplan) \
 	((Plan *) list_nth((root)->glob->subplans, (subplan)->plan_id - 1))
 
@@ -696,62 +693,75 @@ typedef struct RelOptInfo
 typedef struct IndexOptInfo IndexOptInfo;
 #define HAVE_INDEXOPTINFO_TYPEDEF 1
 #endif
-
+/*
+ * IndexOptInfo
+ *		规划/优化阶段每个索引的信息
+ *
+ *		indexkeys[], indexcollations[] 数组长度为 ncolumns。
+ *		opfamily[], opcintype[] 数组长度为 nkeycolumns。它们不包含包含列（included attributes）的信息。
+ *
+ *		sortopfamily[], reverse_sort[], nulls_first[] 数组长度为 nkeycolumns（若索引有序）；若无序则为 NULL。
+ *
+ *		indexkeys[] 数组中的 0 表示该索引列为表达式；每个此类列在 indexprs 中有一个元素。
+ *
+ *		对于有序索引，reverse_sort[] 和 nulls_first[] 描述正向索引扫描的排序方式；反向扫描则顺序相反。
+ *
+ *		indexprs 和 indpred 表达式已通过 prepqual.c 和 eval_const_expressions() 处理，便于与 WHERE 子句匹配。indpred 为隐式 AND 形式。
+ *
+ *		indextlist 是 TargetEntry 列表，表示索引列。对于简单列，提供等价的基表 Var；对于表达式列，链接到 indexprs 中的对应元素。
+ *
+ *		大部分字段在创建 IndexOptInfo 时填充（由 plancat.c 完成），indrestrictinfo 和 predOK 在 check_index_predicates() 中设置。
+ */
 struct IndexOptInfo
 {
 	NodeTag		type;
 
-	Oid			indexoid;		/* OID of the index relation */
-	Oid			reltablespace;	/* tablespace of index (not table) */
-	RelOptInfo *rel;			/* back-link to index's table */
+	Oid			indexoid;				/* 索引关系的 OID */
+	Oid			reltablespace;			/* 索引所在表空间（不是表的表空间） */
+	RelOptInfo *rel;					/* 回链到索引所属的表 */
 
-	/* index-size statistics (from pg_class and elsewhere) */
-	BlockNumber pages;			/* number of disk pages in index */
-	double		tuples;			/* number of index tuples in index */
-	int			tree_height;	/* index tree height, or -1 if unknown */
+	/* 索引大小统计信息（来自 pg_class 等） */
+	BlockNumber pages;					/* 索引的磁盘页数 */
+	double		tuples;					/* 索引中的元组数 */
+	int			tree_height;			/* 索引树高度，未知时为 -1 */
 
-	/* index descriptor information */
-	int			ncolumns;		/* number of columns in index */
-	int			nkeycolumns;	/* number of key columns in index */
-	int		   *indexkeys;		/* column numbers of index's attributes both
-								 * key and included columns, or 0 */
-	Oid		   *indexcollations;	/* OIDs of collations of index columns */
-	Oid		   *opfamily;		/* OIDs of operator families for columns */
-	Oid		   *opcintype;		/* OIDs of opclass declared input data types */
-	Oid		   *sortopfamily;	/* OIDs of btree opfamilies, if orderable */
-	bool	   *reverse_sort;	/* is sort order descending? */
-	bool	   *nulls_first;	/* do NULLs come first in the sort order? */
-	bool	   *canreturn;		/* which index cols can be returned in an
-								 * index-only scan? */
-	Oid			relam;			/* OID of the access method (in pg_am) */
+	/* 索引描述信息 */	
+	int			ncolumns;				/* 索引列总数，包括索引键列和 INCLUDE 列 */
+	int			nkeycolumns;			/* 索引键列数 */
+	int		   *indexkeys;				/* 索引属性的列号（包括键列和包含列），表达式列为 0 */
+	Oid		   *indexcollations;		/* 索引列的排序规则 OID */
+	Oid		   *opfamily;				/* 索引列的操作符族 OID */
+	Oid		   *opcintype;				/* 索引列的操作符类声明输入类型 OID */
+	Oid		   *sortopfamily;			/* 若可排序，则为 btree 操作符族 OID */
+	bool	   *reverse_sort;			/* 是否降序排序？ */
+	bool	   *nulls_first;			/* NULL 是否排在前面？ */
+	bool	   *canreturn;				/* 哪些索引列可用于索引仅扫描？ */
+	Oid			relam;					/* 访问方法的 OID（pg_am） */
 
-	List	   *indexprs;		/* expressions for non-simple index columns */
-	List	   *indpred;		/* predicate if a partial index, else NIL */
+	List	   *indexprs;				/* 非简单索引列的表达式列表 */
+	List	   *indpred;				/* 若为部分索引则为谓词，否则为 NIL */
 
-	List	   *indextlist;		/* targetlist representing index columns */
+	List	   *indextlist;				/* 表示索引列的 targetlist */
 
-	List	   *indrestrictinfo;	/* parent relation's baserestrictinfo
-									 * list, less any conditions implied by
-									 * the index's predicate (unless it's a
-									 * target rel, see comments in
-									 * check_index_predicates()) */
+	List	   *indrestrictinfo;		/* 父关系的 baserestrictinfo 列表，去除被索引谓词隐含的条件（除非是目标关系，详见 check_index_predicates() 注释） */
 
-	bool		predOK;			/* true if index predicate matches query */
-	bool		unique;			/* true if a unique index */
-	bool		immediate;		/* is uniqueness enforced immediately? */
-	bool		hypothetical;	/* true if index doesn't really exist */
+	bool		predOK;					/* 索引谓词是否与查询匹配？ */
+	bool		unique;					/* 是否唯一索引？ */
+	bool		immediate;				/* 唯一性是否立即强制？ */
+	bool		hypothetical;			/* 是否为假想索引（实际不存在）？ */
 
-	/* Remaining fields are copied from the index AM's API struct: */
-	bool		amcanorderbyop; /* does AM support order by operator result? */
-	bool		amoptionalkey;	/* can query omit key for the first column? */
-	bool		amsearcharray;	/* can AM handle ScalarArrayOpExpr quals? */
-	bool		amsearchnulls;	/* can AM search for NULL/NOT NULL entries? */
-	bool		amhasgettuple;	/* does AM have amgettuple interface? */
-	bool		amhasgetbitmap; /* does AM have amgetbitmap interface? */
-	bool		amcanparallel;	/* does AM support parallel scan? */
-	bool		amcanmarkpos;	/* does AM support mark/restore? */
-	/* Rather than include amapi.h here, we declare amcostestimate like this */
-	void		(*amcostestimate) ();	/* AM's cost estimator */
+	/* 以下字段来自索引访问方法的 API 结构体： */
+	bool		amcanorderbyop;			/* 访问方法是否支持 order by 操作符结果？ */
+	bool		amoptionalkey;			/* 查询是否可省略首列键？ */
+	bool		amsearcharray;			/* 访问方法是否支持 ScalarArrayOpExpr 条件？ */
+	bool		amsearchnulls;			/* 访问方法是否支持搜索 NULL/NOT NULL？ */
+	bool		amhasgettuple;			/* 是否有 amgettuple 接口？ */
+	bool		amhasgetbitmap; 		/* 是否有 amgetbitmap 接口？ */
+	bool		amcanparallel;			/* 是否支持并行扫描？ */
+	bool		amcanmarkpos;			/* 是否支持 mark/restore？ */
+
+	/* 为避免包含 amapi.h，这里直接声明 amcostestimate */
+	void		(*amcostestimate) ();	/* 访问方法的成本估算函数 */
 };
 
 /*
@@ -863,11 +873,35 @@ typedef struct EquivalenceClass
 } EquivalenceClass;
 
 /*
- * If an EC contains a const and isn't below-outer-join, any PathKey depending
- * on it must be redundant, since there's only one possible value of the key.
+ * EC_MUST_BE_REDUNDANT - 判断等价类是否必然冗余
+ *
+ * 宏功能:
+ * 该宏用于判断一个等价类(EC)是否必然冗余。如果等价类包含常量且不在外连接之下，
+ * 那么依赖于它的任何路径键(PathKey)都必须是冗余的，因为该键只有一个可能的值。
+ *
+ * 参数说明:
+ * eclass: 指向EquivalenceClass结构的指针，表示要检查的等价类
+ *
+ * 返回值:
+ * 布尔值，如果等价类必然冗余则返回true，否则返回false
+ *
+ * 判断逻辑:
+ * 1. (eclass)->ec_has_const: 检查等价类是否包含常量值
+ * 2. !(eclass)->ec_below_outer_join: 检查等价类是否不在外连接之下
+ * 3. 当两个条件都满足时，等价类必然冗余
+ *
+ * 应用场景:
+ * 在查询优化过程中，当构建路径键列表时，可以通过此宏快速识别并跳过那些
+ * 不会提供额外排序区分度的路径键，从而优化排序和索引匹配操作。
+ *
+ * 示例:
+ * SELECT * FROM table WHERE x = 42 ORDER BY x, y;
+ * 在这个例子中，x列由于等于常量42，因此ORDER BY子句中的x是冗余的，
+ * 可以直接按y排序即可。
  */
 #define EC_MUST_BE_REDUNDANT(eclass)  \
 	((eclass)->ec_has_const && !(eclass)->ec_below_outer_join)
+
 
 /*
  * EquivalenceMember - one member expression of an EquivalenceClass
@@ -906,28 +940,52 @@ typedef struct EquivalenceMember
 /*
  * PathKeys
  *
- * The sort ordering of a path is represented by a list of PathKey nodes.
- * An empty list implies no known ordering.  Otherwise the first item
- * represents the primary sort key, the second the first secondary sort key,
- * etc.  The value being sorted is represented by linking to an
- * EquivalenceClass containing that value and including pk_opfamily among its
- * ec_opfamilies.  The EquivalenceClass tells which collation to use, too.
- * This is a convenient method because it makes it trivial to detect
- * equivalent and closely-related orderings. (See optimizer/README for more
- * information.)
+ * 路径的排序顺序由PathKey节点列表表示。
+ * 空列表表示无已知排序。否则，列表的第一个元素表示主排序键，第二个表示第一次要排序键，
+ * 依此类推。排序的值通过链接到包含该值的EquivalenceClass来表示，其中EquivalenceClass包含pk_opfamily
+ * 在其ec_opfamilies中。EquivalenceClass还指定了要使用的排序规则。
+ * 这是一种便捷的方法，因为它可以轻松检测等价和密切相关的排序方式。（更多信息请参阅optimizer/README）
  *
- * Note: pk_strategy is either BTLessStrategyNumber (for ASC) or
- * BTGreaterStrategyNumber (for DESC).  We assume that all ordering-capable
- * index types will use btree-compatible strategy numbers.
+ * 注意：pk_strategy要么是BTLessStrategyNumber（表示ASC），要么是BTGreaterStrategyNumber（表示DESC）。
+ * 我们假设所有支持排序的索引类型都将使用与btree兼容的策略编号。
+ */
+
+/*
+ * PathKey结构体：表示查询执行路径中的单个排序键
+ * 在PostgreSQL查询优化器中，PathKey用于描述查询结果集的排序状态
+ * 多个PathKey组成的列表定义了完整的排序顺序
  */
 typedef struct PathKey
 {
-	NodeTag		type;
+	NodeTag		type;          /* 节点类型标记，用于运行时类型识别 */
 
-	EquivalenceClass *pk_eclass;	/* the value that is ordered */
-	Oid			pk_opfamily;	/* btree opfamily defining the ordering */
-	int			pk_strategy;	/* sort direction (ASC or DESC) */
-	bool		pk_nulls_first; /* do NULLs come before normal values? */
+	/*
+	 * pk_eclass：指向等价类的指针，等价类包含被排序的值
+	 * 等价类的使用使优化器能够识别不同表达式之间的等价关系，
+	 * 从而在逻辑上等价的排序方式之间进行匹配
+	 */
+	EquivalenceClass *pk_eclass; /* 被排序的值 */
+	
+	/*
+	 * pk_opfamily：定义排序的btree操作符族OID
+	 * 操作符族决定了如何比较排序键的值，特别是对于非标准数据类型
+	 * 不同的操作符族可能有不同的比较规则
+	 */
+	Oid			pk_opfamily;   /* 定义排序的btree操作符族 */
+	
+	/*
+	 * pk_strategy：排序方向（升序或降序）
+	 * 取值为BTLessStrategyNumber（表示ASC）或BTGreaterStrategyNumber（表示DESC）
+	 * 策略号对应btree索引接口中定义的操作符策略
+	 */
+	int			pk_strategy;   /* 排序方向（ASC或DESC） */
+	
+	/*
+	 * pk_nulls_first：NULL值排序行为标志
+	 * true表示NULL值排在普通值之前，false表示NULL值排在普通值之后
+	 * 控制SQL标准中的NULL排序规则行为
+	 */
+	bool		pk_nulls_first; /* NULL值是否排在普通值之前？ */
 } PathKey;
 
 
@@ -1020,27 +1078,30 @@ typedef struct Path
 {
 	NodeTag		type;
 
-	NodeTag		pathtype;		/* 标识可构建的扫描/连接方法的 tag */
+	NodeTag		pathtype;			/* 标识可构建的扫描/连接方法的 tag */
 
-	RelOptInfo *parent;			/* 该 path 能构建的关系 */
-	PathTarget *pathtarget;		/* 要计算的 Vars/Expr 列表、成本、宽度 */
+	RelOptInfo *parent;				/* 该 path 能构建的关系 */
+	PathTarget *pathtarget;			/* 要计算的 Vars/Expr 列表、成本、宽度 */
 
-	ParamPathInfo *param_info;	/* 参数化信息，若无则为 NULL */
+	ParamPathInfo *param_info;		/* 参数化信息，若无则为 NULL */
 
-	bool		parallel_aware; /* 是否启用并行感知逻辑？ */
-	bool		parallel_safe;	/* 是否可安全用于并行计划？ */
+	bool		parallel_aware; 	/* 是否启用并行感知逻辑？ */
+	bool		parallel_safe;		/* 是否可安全用于并行计划？ */
 	int			parallel_workers;	/* 期望的 worker 数；0 表示不并行 */
 
 	/* 路径的估计大小/代价（详见 costsize.c） */
-	double		rows;			/* 估计的结果元组数 */
-	Cost		startup_cost;	/* 在获取任何元组前产生的代价 */
-	Cost		total_cost;		/* 总代价（假定获取所有元组） */
+	double		rows;				/* 估计的结果元组数 */
+	Cost		startup_cost;		/* 在获取任何元组前产生的代价 */
+	Cost		total_cost;			/* 总代价（假定获取所有元组） */
 
-	List	   *pathkeys;		/* path 输出的排序顺序 */
+	List	   *pathkeys;			/* path 输出的排序顺序 */
 	/* pathkeys 是 PathKey 节点的 List；详见上文 */
 } Path;
 
-/* Macro for extracting a path's parameterization relids; beware double eval */
+/* 获取路径的参数化外部关系 relids 的宏；注意避免重复求值
+ * 如果 path->param_info 非空，则返回其 ppi_req_outer 字段（参数化所需的外部 relids）
+ * 否则返回 NULL
+ */
 #define PATH_REQ_OUTER(path)  \
 	((path)->param_info ? (path)->param_info->ppi_req_outer : (Relids) NULL)
 
@@ -1095,47 +1156,36 @@ typedef struct IndexPath
 } IndexPath;
 
 /*
- * Each IndexClause references a RestrictInfo node from the query's WHERE
- * or JOIN conditions, and shows how that restriction can be applied to
- * the particular index.  We support both indexclauses that are directly
- * usable by the index machinery, which are typically of the form
- * "indexcol OP pseudoconstant", and those from which an indexable qual
- * can be derived.  The simplest such transformation is that a clause
- * of the form "pseudoconstant OP indexcol" can be commuted to produce an
- * indexable qual (the index machinery expects the indexcol to be on the
- * left always).  Another example is that we might be able to extract an
- * indexable range condition from a LIKE condition, as in "x LIKE 'foo%bar'"
- * giving rise to "x >= 'foo' AND x < 'fop'".  Derivation of such lossy
- * conditions is done by a planner support function attached to the
- * indexclause's top-level function or operator.
+ * 每个 IndexClause 都引用查询的 WHERE 或 JOIN 条件中的一个 RestrictInfo 节点，
+ * 并展示该限制如何应用于特定索引。我们支持既能被索引机制直接使用的 indexclauses，
+ * 通常形式为 "indexcol OP pseudoconstant"，也支持可以从中推导出可索引条件的子句。
+ * 最简单的转换是将 "pseudoconstant OP indexcol" 形式的子句交换左右，
+ * 以生成可索引的条件（索引机制总是期望索引列在左侧）。
+ * 另一个例子是可以从 LIKE 条件中提取可索引的范围条件，
+ * 如 "x LIKE 'foo%bar'" 可转化为 "x >= 'foo' AND x < 'fop'"。
+ * 这种有损条件的推导由附加在 indexclause 顶层函数或操作符上的 planner 支持函数完成。
  *
- * indexquals is a list of RestrictInfos for the directly-usable index
- * conditions associated with this IndexClause.  In the simplest case
- * it's a one-element list whose member is iclause->rinfo.  Otherwise,
- * it contains one or more directly-usable indexqual conditions extracted
- * from the given clause.  The 'lossy' flag indicates whether the
- * indexquals are semantically equivalent to the original clause, or
- * represent a weaker condition.
+ * indexquals 是与该 IndexClause 相关的可直接用于索引的条件（RestrictInfo 列表）。
+ * 最简单情况下，它是一个只包含 iclause->rinfo 的单元素列表。
+ * 否则，它包含一个或多个从给定子句中提取的可直接用于索引的条件。
+ * 'lossy' 标志表示 indexquals 是否与原始子句语义等价，或仅表示更弱的条件。
  *
- * Normally, indexcol is the index of the single index column the clause
- * works on, and indexcols is NIL.  But if the clause is a RowCompareExpr,
- * indexcol is the index of the leading column, and indexcols is a list of
- * all the affected columns.  (Note that indexcols matches up with the
- * columns of the actual indexable RowCompareExpr in indexquals, which
- * might be different from the original in rinfo.)
+ * 通常情况下，indexcol 是该子句作用的单个索引列的索引，indexcols 为 NIL。
+ * 但如果子句是 RowCompareExpr，则 indexcol 是首列索引，indexcols 是所有受影响列的列表。
+ * （注意，indexcols 与 indexquals 中实际可索引的 RowCompareExpr 的列对应，
+ * 可能与 rinfo 中的原始表达式不同。）
  *
- * An IndexPath's IndexClause list is required to be ordered by index
- * column, i.e. the indexcol values must form a nondecreasing sequence.
- * (The order of multiple clauses for the same index column is unspecified.)
+ * 一个 IndexPath 的 IndexClause 列表要求按索引列顺序排列，即 indexcol 值必须是非递减序列。
+ * （同一索引列的多个子句顺序未指定。）
  */
 typedef struct IndexClause
 {
-	NodeTag		type;
-	struct RestrictInfo *rinfo; /* original restriction or join clause */
-	List	   *indexquals;		/* indexqual(s) derived from it */
-	bool		lossy;			/* are indexquals a lossy version of clause? */
-	AttrNumber	indexcol;		/* index column the clause uses (zero-based) */
-	List	   *indexcols;		/* multiple index columns, if RowCompare */
+	NodeTag				type;
+	struct RestrictInfo *rinfo; 		/* 原始限制或连接子句 */
+	List	   			*indexquals;	/* 从其推导出的 indexqual 条件 */
+	bool				lossy;			/* indexquals 是否为子句的有损版本？ */
+	AttrNumber			indexcol;		/* 子句使用的索引列（从零开始） */	
+	List	   			*indexcols;		/* 若为 RowCompare，则为多个索引列 */
 } IndexClause;
 
 /*
@@ -1336,23 +1386,38 @@ typedef struct MaterialPath
 } MaterialPath;
 
 /*
- * UniquePath represents elimination of distinct rows from the output of
- * its subpath.
- *
- * This can represent significantly different plans: either hash-based or
- * sort-based implementation, or a no-op if the input path can be proven
- * distinct already.  The decision is sufficiently localized that it's not
- * worth having separate Path node types.  (Note: in the no-op case, we could
- * eliminate the UniquePath node entirely and just return the subpath; but
- * it's convenient to have a UniquePath in the path tree to signal upper-level
- * routines that the input is known distinct.)
+ * UniquePath表示从其子路径的输出中消除重复行的操作。
+ * 
+ * 这个结构可以代表几种截然不同的执行计划：
+ * 1. 基于哈希的实现
+ * 2. 基于排序的实现
+ * 3. 无操作（如果输入路径已经被证明是唯一的）
+ * 
+ * 由于这些决策是相对局部化的，因此不值得为每种情况创建单独的Path节点类型。
+ * 注意：在无操作的情况下，我们可以完全消除UniquePath节点，直接返回子路径；
+ * 但是在路径树中保留UniquePath节点可以向上层例程表明输入已知是唯一的，这很方便。
+ */
+
+/*
+ * UniquePathMethod枚举定义了PostgreSQL查询优化器中去重操作的三种实现方法。
+ * 这个枚举被用于UniquePath节点中，指定具体的去重策略。
  */
 typedef enum
 {
-	UNIQUE_PATH_NOOP,			/* input is known unique already */
-	UNIQUE_PATH_HASH,			/* use hashing */
-	UNIQUE_PATH_SORT			/* use sorting */
+	UNIQUE_PATH_NOOP,  /* 无操作：输入数据已经保证唯一，无需额外处理。
+                        * 这种情况通常发生在输入是主键扫描或唯一索引扫描时，
+                        * 优化器可以直接推断出结果集的唯一性。
+                        */
+	UNIQUE_PATH_HASH,  /* 使用哈希算法：通过构建哈希表来去重。
+                        * 这种方法的优点是在输入数据量适中时效率高，通常为O(n)复杂度。
+                        * 适用于内存充足且不需要维护结果顺序的场景。
+                        */
+	UNIQUE_PATH_SORT   /* 使用排序方法：先对数据排序，然后扫描去除相邻重复项。
+                        * 虽然排序本身需要O(n log n)时间，但如果查询中已经包含排序操作，
+                        * 或者需要保持特定的输出顺序，则排序去重可能是更优选择。
+                        */
 } UniquePathMethod;
+
 
 typedef struct UniquePath
 {
@@ -1389,190 +1454,244 @@ typedef struct GatherMergePath
 
 
 /*
- * All join-type paths share these fields.
+ * JoinPath结构体
+ * 表示查询优化器中的连接操作路径
+ * 所有连接类型路径共享的字段，用于实现继承机制
+ * 作为所有特定连接类型路径（如NestLoopPath、MergePath、HashPath等）的基类
  */
-
 typedef struct JoinPath
 {
-	Path		path;
+	Path		path;   		/* 继承自Path结构体，包含所有路径共有的字段如成本、行数、宽度等 */
 
-	JoinType	jointype;
+	JoinType	jointype;	/* 连接类型，如JOIN_INNER、JOIN_LEFT、JOIN_FULL、JOIN_RIGHT等 */
 
-	bool		inner_unique;	/* each outer tuple provably matches no more
-								 * than one inner tuple */
+	bool		inner_unique;	/* 标记外部表的每个元组最多只匹配内部表的一个元组
+						 * 此信息用于优化连接操作，如将某些连接类型降级以提高性能 */
 
-	Path	   *outerjoinpath;	/* path for the outer side of the join */
-	Path	   *innerjoinpath;	/* path for the inner side of the join */
+	Path	   *outerjoinpath;  /* 连接操作外側（驱动表）的访问路径 */
+	Path	   *innerjoinpath;  /* 连接操作内侧（被驱动表）的访问路径 */
 
-	List	   *joinrestrictinfo;	/* RestrictInfos to apply to join */
+	List	   *joinrestrictinfo; /* 应用于连接操作的限制条件列表，每个元素为RestrictInfo结构体
+						 * 包含连接条件的表达式和相关优化信息 */
 
 	/*
-	 * See the notes for RelOptInfo and ParamPathInfo to understand why
-	 * joinrestrictinfo is needed in JoinPath, and can't be merged into the
-	 * parent RelOptInfo.
+	 * 参考RelOptInfo和ParamPathInfo的注释，了解为什么joinrestrictinfo需要存在于JoinPath中，
+	 * 而不能合并到父级RelOptInfo中。这主要是因为连接条件可能包含参数化信息，
+	 * 需要与特定的连接路径相关联，而不是与一般的关系表示相关联。
 	 */
 } JoinPath;
 
+
 /*
  * A nested-loop path needs no special fields.
+ * 嵌套循环路径不需要特殊字段
+ *
+ * 注释说明：嵌套循环连接(Nested Loop Join)路径的表示不需要在JoinPath基类之外添加任何特殊字段，
+ * 所有必要的信息（如连接类型、内外侧路径、连接条件等）都已经包含在基类JoinPath中。
  */
-
-typedef JoinPath NestPath;
 
 /*
- * A mergejoin path has these fields.
+ * NestPath - 嵌套循环连接路径类型
+ * 将JoinPath类型定义为NestPath的别名
  *
- * Unlike other path types, a MergePath node doesn't represent just a single
- * run-time plan node: it can represent up to four.  Aside from the MergeJoin
- * node itself, there can be a Sort node for the outer input, a Sort node
- * for the inner input, and/or a Material node for the inner input.  We could
- * represent these nodes by separate path nodes, but considering how many
- * different merge paths are investigated during a complex join problem,
- * it seems better to avoid unnecessary palloc overhead.
+ * 由于嵌套循环连接的执行逻辑相对简单，不需要存储额外的优化信息，因此直接复用了JoinPath结构体。
+ * 相比之下，其他连接类型（如哈希连接、归并连接）需要额外的字段来存储特定的执行参数和优化信息。
+ */
+typedef JoinPath NestPath;
+
+
+/*
+ * MergePath结构体定义了合并连接(Merge Join)路径节点
  *
- * path_mergeclauses lists the clauses (in the form of RestrictInfos)
- * that will be used in the merge.
+ * 与其他路径类型不同，一个MergePath节点不仅代表单个运行时计划节点，它最多可以代表四个节点：
+ * 1. MergeJoin节点本身
+ * 2. 用于外部输入的Sort节点（如需要）
+ * 3. 用于内部输入的Sort节点（如需要）
+ * 4. 用于内部输入的Material节点（如需要）
  *
- * Note that the mergeclauses are a subset of the parent relation's
- * restriction-clause list.  Any join clauses that are not mergejoinable
- * appear only in the parent's restrict list, and must be checked by a
- * qpqual at execution time.
+ * 虽然我们可以用单独的路径节点来表示这些节点，但考虑到复杂连接问题中会考察大量不同的合并路径，
+ * 将这些信息合并到一个结构体中可以避免不必要的内存分配开销。
  *
- * outersortkeys (resp. innersortkeys) is NIL if the outer path
- * (resp. inner path) is already ordered appropriately for the
- * mergejoin.  If it is not NIL then it is a PathKeys list describing
- * the ordering that must be created by an explicit Sort node.
+ * path_mergeclauses列出了将用于合并的连接条件（以RestrictInfo形式）。
+ * 注意，这些合并条件是父关系限制条件列表的一个子集。任何不可用于合并连接的条件
+ * 仅出现在父关系的限制列表中，必须在执行时由qpqual进行检查。
  *
- * skip_mark_restore is true if the executor need not do mark/restore calls.
- * Mark/restore overhead is usually required, but can be skipped if we know
- * that the executor need find only one match per outer tuple, and that the
- * mergeclauses are sufficient to identify a match.  In such cases the
- * executor can immediately advance the outer relation after processing a
- * match, and therefore it need never back up the inner relation.
+ * outersortkeys（或innersortkeys）为NIL表示外部路径（或内部路径）已经具有适合合并连接的顺序。
+ * 如果不为NIL，则表示需要由显式Sort节点创建的排序顺序，以PathKeys列表形式描述。
  *
- * materialize_inner is true if a Material node should be placed atop the
- * inner input.  This may appear with or without an inner Sort step.
+ * skip_mark_restore为true表示执行器不需要执行mark/restore操作。
+ * 通常情况下需要mark/restore开销，但如果我们知道对于每个外部元组只需要找到一个匹配项，
+ * 并且合并条件足以识别匹配项，那么可以跳过这些操作。在这种情况下，执行器可以在处理完一个匹配项后
+ * 立即前进到下一个外部关系元组，因此永远不需要回退内部关系。
+ *
+ * materialize_inner为true表示应该在内部输入之上放置一个Material节点。
+ * 这可以与内部Sort步骤一起出现，也可以不一起出现。
  */
 
+/*
+ * MergePath结构体：描述合并连接(Merge Join)查询路径的节点结构
+ * 继承自JoinPath，添加了合并连接特有的属性
+ */
 typedef struct MergePath
 {
-	JoinPath	jpath;
-	List	   *path_mergeclauses;	/* join clauses to be used for merge */
-	List	   *outersortkeys;	/* keys for explicit sort, if any */
-	List	   *innersortkeys;	/* keys for explicit sort, if any */
-	bool		skip_mark_restore;	/* can executor skip mark/restore? */
-	bool		materialize_inner;	/* add Materialize to inner? */
+	JoinPath	jpath;              /* 继承自JoinPath，包含基本的连接路径信息 */
+	List	   *path_mergeclauses;    /* 用于合并连接的连接条件列表，每个元素为RestrictInfo */
+	List	   *outersortkeys;        /* 外部输入需要的显式排序键，如果不需要排序则为NIL */
+	List	   *innersortkeys;        /* 内部输入需要的显式排序键，如果不需要排序则为NIL */
+	bool		skip_mark_restore;      /* 执行器是否可以跳过mark/restore操作的标志 */
+	bool		materialize_inner;     /* 是否需要为内部输入添加Materialize节点的标志 */
 } MergePath;
 
 /*
  * A hashjoin path has these fields.
+ * 哈希连接路径具有以下字段
  *
  * The remarks above for mergeclauses apply for hashclauses as well.
+ * 上面关于mergeclauses的说明同样适用于hashclauses
  *
  * Hashjoin does not care what order its inputs appear in, so we have
  * no need for sortkeys.
+ * 哈希连接不关心输入的顺序，因此我们不需要排序键
+ *
+ * 注释说明：哈希连接是一种高效的连接算法，它通过将一个关系（通常是较小的内部表）构建成哈希表，
+ * 然后扫描另一个关系（外部表）并查找匹配的哈希桶来执行连接操作。与归并连接不同，哈希连接不需要
+ * 输入关系预先排序，这是它的一个重要特性。
  */
 
+/*
+ * HashPath - 哈希连接路径结构体
+ * 表示PostgreSQL查询优化器中哈希连接操作的执行路径
+ * 继承自JoinPath基类，添加了哈希连接特有的字段
+ */
 typedef struct HashPath
 {
-	JoinPath	jpath;
-	List	   *path_hashclauses;	/* join clauses used for hashing */
-	int			num_batches;	/* number of batches expected */
-	double		inner_rows_total;	/* total inner rows expected */
+	JoinPath	jpath;               /* 继承自JoinPath的基本连接信息 */
+	List	   *path_hashclauses;     /* 用于哈希的连接条件列表
+						 * 每个元素为RestrictInfo结构体，表示将用于构建哈希表和查找匹配的条件 */
+	int			num_batches;          /* 预期的批次数
+						 * 当内部表太大无法一次性放入内存时，需要分批构建哈希表
+						 * 此值决定了哈希连接将使用多少批次来处理数据 */
+	double		inner_rows_total;    /* 预期的内部表总行数
+						 * 用于计算哈希表大小和批次数的估计值
+						 * 这对于内存管理和执行计划成本估算非常重要 */
 } HashPath;
 
+
 /*
- * ProjectionPath represents a projection (that is, targetlist computation)
+ * ProjectionPath结构体：表示查询计划中的投影操作（目标列表计算）
  *
- * Nominally, this path node represents using a Result plan node to do a
- * projection step.  However, if the input plan node supports projection,
- * we can just modify its output targetlist to do the required calculations
- * directly, and not need a Result.  In some places in the planner we can just
- * jam the desired PathTarget into the input path node (and adjust its cost
- * accordingly), so we don't need a ProjectionPath.  But in other places
- * it's necessary to not modify the input path node, so we need a separate
- * ProjectionPath node, which is marked dummy to indicate that we intend to
- * assign the work to the input plan node.  The estimated cost for the
- * ProjectionPath node will account for whether a Result will be used or not.
+ * 投影操作本质上是将查询执行过程中获取的数据转换为最终结果集所需的形式，
+ * 包括列重命名、表达式计算、函数应用等操作。
+ *
+ * 在名义上，该路径节点表示使用Result计划节点执行投影步骤。然而，PostgreSQL
+ * 采用了一种优化策略：如果输入的计划节点本身支持投影（如通过is_projection_capable_path判断），
+ * 则可以直接修改该节点的输出目标列表，无需额外的Result节点。
+ *
+ * 规划器在不同场景下采用不同策略：
+ * 1. 在某些情况下，可以直接将目标PathTarget嵌入到输入路径节点中（同时调整成本），
+ *    此时不需要创建ProjectionPath节点。
+ * 2. 而在其他情况下（如需要保持输入路径节点不变），则需要创建独立的ProjectionPath节点，
+ *    通过设置dummypp标记来指示实际工作将由输入计划节点执行，而非创建单独的Result节点。
+ *
+ * ProjectionPath节点的估计成本会根据是否需要创建单独的Result节点而有所不同，
+ * 这种设计使得查询优化器能够灵活地选择最有效的投影执行方式。
  */
 typedef struct ProjectionPath
 {
-	Path		path;
-	Path	   *subpath;		/* path representing input source */
-	bool		dummypp;		/* true if no separate Result is needed */
+	Path		path;           /* 继承自Path结构体的公共字段，包括成本、行估计等信息 */
+	Path	   *subpath;        /* 表示输入数据源的路径节点，投影操作将应用于该路径的结果 */
+	bool		dummypp;        /* 标记是否需要单独的Result节点：
+                               		* true表示投影工作将由subpath处理，无需单独Result节点
+                               		* false表示需要创建单独的Result节点执行投影 */
 } ProjectionPath;
 
+
 /*
- * ProjectSetPath represents evaluation of a targetlist that includes
- * set-returning function(s), which will need to be implemented by a
- * ProjectSet plan node.
+ * ProjectSetPath结构体：表示包含集合返回函数(SRFs)的目标列表的计算路径
+ *
+ * 集合返回函数(Set-Returning Functions)是一种特殊函数，它可以为每行输入返回多行结果集，
+ * 例如generate_series()、unnest()等函数。这类函数在查询执行过程中需要特殊处理，
+ * 因此需要通过ProjectSetPath来表示使用ProjectSet计划节点执行的路径。
+ *
+ * ProjectSet节点的主要作用是正确处理集合返回函数的执行和结果展开，确保函数调用
+ * 与行处理正确对应，特别是当函数结果集大小与输入行数不同时。
  */
 typedef struct ProjectSetPath
 {
-	Path		path;
-	Path	   *subpath;		/* path representing input source */
+	Path		path;           /* 继承自Path结构体的公共字段，包括成本、行估计等信息 */
+	Path	   *subpath;        /* 表示输入数据源的路径节点，集合返回函数将应用于该路径的结果 */
 } ProjectSetPath;
 
 /*
- * SortPath represents an explicit sort step
+ * SortPath结构体：表示显式排序步骤的执行路径
  *
- * The sort keys are, by definition, the same as path.pathkeys.
+ * 排序操作是查询执行计划中的重要组件，用于实现ORDER BY子句或支持某些连接操作
+ *（如归并连接）。SortPath节点表示使用Sort计划节点执行排序操作的路径。
  *
- * Note: the Sort plan node cannot project, so path.pathtarget must be the
- * same as the input's pathtarget.
+ * 排序键信息存储在继承自Path结构体的pathkeys字段中，通过定义可以确保排序键与pathkeys一致。
+ *
+ * 重要限制：Sort计划节点本身不支持投影操作，因此SortPath的pathtarget必须与输入路径的
+ * pathtarget完全相同，即排序操作不会改变结果的数据结构，只改变元组的顺序。
  */
 typedef struct SortPath
 {
-	Path		path;
-	Path	   *subpath;		/* path representing input source */
+	Path		path;           /* 继承自Path结构体的公共字段，包括成本、行估计和排序键(pathkeys)等信息 */
+	Path	   *subpath;        /* 表示输入数据源的路径节点，排序操作将应用于该路径的结果 */
 } SortPath;
 
+
 /*
- * GroupPath represents grouping (of presorted input)
+ * GroupPath结构体：表示对已排序输入进行分组操作的执行路径
  *
- * groupClause represents the columns to be grouped on; the input path
- * must be at least that well sorted.
+ * 此路径节点用于实现SQL查询中的GROUP BY功能，特别是在输入数据已经按照分组键排序的情况下。
+ * 通过利用已排序的输入，可以高效地实现分组操作，而无需额外的排序或哈希操作。
  *
- * We can also apply a qual to the grouped rows (equivalent of HAVING)
+ * groupClause字段定义了用于分组的列；输入路径必须至少按照这些分组列进行了排序。
+ * 此外，GroupPath还支持对分组后的行应用过滤条件，这对应于SQL中的HAVING子句。
  */
 typedef struct GroupPath
 {
-	Path		path;
-	Path	   *subpath;		/* path representing input source */
-	List	   *groupClause;	/* a list of SortGroupClause's */
-	List	   *qual;			/* quals (HAVING quals), if any */
+	Path		path;           /* 继承自Path结构体的公共字段，包括成本、行估计等信息 */
+	Path	   *subpath;        /* 表示输入数据源的路径节点，该路径必须已按分组键排序 */
+	List	   *groupClause;    /* 分组子句列表，包含SortGroupClause结构，定义分组的列和排序规则 */
+	List	   *qual;           /* 分组后的过滤条件（HAVING条件），如果有的话 */
 } GroupPath;
 
 /*
- * UpperUniquePath represents adjacent-duplicate removal (in presorted input)
+ * UpperUniquePath结构体：表示在已排序输入中去除相邻重复值的执行路径
  *
- * The columns to be compared are the first numkeys columns of the path's
- * pathkeys.  The input is presumed already sorted that way.
+ * 此路径节点对应于SQL中的DISTINCT操作或需要去除重复行的场景，特别是当输入已经排序时。
+ * 通过利用输入已排序的特性，可以高效地检测和去除相邻的重复行，而无需构建哈希表或进行完整的排序。
+ *
+ * 用于比较重复的列是路径pathkeys中的前numkeys个列，输入数据被假定已经按照这些列排序。
  */
 typedef struct UpperUniquePath
 {
-	Path		path;
-	Path	   *subpath;		/* path representing input source */
-	int			numkeys;		/* number of pathkey columns to compare */
+	Path		path;           /* 继承自Path结构体的公共字段，包括成本、行估计和排序键等信息 */
+	Path	   *subpath;        /* 表示输入数据源的路径节点，该路径必须已按指定的键排序 */
+	int			numkeys;        /* 用于比较重复值的pathkey列数量，表示前numkeys个排序键列用于判断重复 */
 } UpperUniquePath;
 
 /*
- * AggPath represents generic computation of aggregate functions
+ * AggPath结构体：表示聚合函数通用计算的执行路径
  *
- * This may involve plain grouping (but not grouping sets), using either
- * sorted or hashed grouping; for the AGG_SORTED case, the input must be
- * appropriately presorted.
+ * 此路径节点用于实现SQL中的聚合函数计算（如SUM、AVG、COUNT等），可以支持简单分组（非分组集）
+ * 的聚合操作，使用排序或哈希分组策略。对于排序分组(AGG_SORTED)的情况，输入必须已经适当排序。
+ *
+ * AggPath是PostgreSQL中实现聚合操作的核心路径类型，它支持多种聚合策略和优化模式，
+ * 并包含了执行聚合所需的所有关键信息。
  */
 typedef struct AggPath
 {
-	Path		path;
-	Path	   *subpath;		/* path representing input source */
-	AggStrategy aggstrategy;	/* basic strategy, see nodes.h */
-	AggSplit	aggsplit;		/* agg-splitting mode, see nodes.h */
-	double		numGroups;		/* estimated number of groups in input */
-	List	   *groupClause;	/* a list of SortGroupClause's */
-	List	   *qual;			/* quals (HAVING quals), if any */
+	Path		path;           /* 继承自Path结构体的公共字段，包括成本、行估计等信息 */
+	Path	   *subpath;        /* 表示输入数据源的路径节点，对于排序聚合，该路径必须已排序 */
+	AggStrategy aggstrategy;   /* 基本聚合策略，定义在nodes.h中，如AGG_HASHED(哈希聚合)、AGG_SORTED(排序聚合)等 */
+	AggSplit	aggsplit;       /* 聚合拆分模式，定义在nodes.h中，表示聚合计算的拆分策略 */
+	double		numGroups;      /* 输入中估计的组数，用于成本计算和资源分配 */
+	List	   *groupClause;    /* 分组子句列表，包含SortGroupClause结构，定义分组的列和排序规则 */
+	List	   *qual;           /* 分组后的过滤条件（HAVING条件），如果有的话 */
 } AggPath;
+
 
 /*
  * Various annotations used for grouping sets in the planner.
@@ -1669,251 +1788,135 @@ typedef struct LockRowsPath
 } LockRowsPath;
 
 /*
- * ModifyTablePath represents performing INSERT/UPDATE/DELETE modifications
- *
- * We represent most things that will be in the ModifyTable plan node
- * literally, except we have child Path(s) not Plan(s).  But analysis of the
- * OnConflictExpr is deferred to createplan.c, as is collection of FDW data.
+ * ModifyTablePath 表示执行 INSERT/UPDATE/DELETE 数据修改操作的路径节点
+ * 
+ * 这个结构体几乎直接表示了最终 ModifyTable 计划节点中的所有内容，
+ * 唯一的区别是它包含的是子路径(Path)而不是子计划(Plan)。
+ * 注意：OnConflictExpr 的分析会推迟到 createplan.c 中进行，
+ * FDW(外部数据包装器)数据的收集也是如此。
  */
 typedef struct ModifyTablePath
 {
-	Path		path;
-	CmdType		operation;		/* INSERT, UPDATE, or DELETE */
-	bool		canSetTag;		/* do we set the command tag/es_processed? */
-	Index		nominalRelation;	/* Parent RT index for use of EXPLAIN */
-	Index		rootRelation;	/* Root RT index, if target is partitioned */
-	bool		partColsUpdated;	/* some part key in hierarchy updated */
-	List	   *resultRelations;	/* integer list of RT indexes */
-	List	   *subpaths;		/* Path(s) producing source data */
-	List	   *subroots;		/* per-target-table PlannerInfos */
-	List	   *withCheckOptionLists;	/* per-target-table WCO lists */
-	List	   *returningLists; /* per-target-table RETURNING tlists */
-	List	   *rowMarks;		/* PlanRowMarks (non-locking only) */
-	OnConflictExpr *onconflict; /* ON CONFLICT clause, or NULL */
-	int			epqParam;		/* ID of Param for EvalPlanQual re-eval */
+	Path		path;           /* 继承自基础Path结构，包含路径的通用信息（如成本、行数等） */
+	CmdType		operation;      /* 操作类型：INSERT、UPDATE 或 DELETE */
+	bool		canSetTag;       /* 是否设置命令标签和es_processed计数 */
+	Index		nominalRelation; /* 用于EXPLAIN显示的父关系RT索引 */
+	Index		rootRelation;    /* 如果目标是分区表，则为根表RT索引 */
+	bool		partColsUpdated; /* 是否更新了分区层次结构中的某些分区键 */
+	List	   *resultRelations; /* RT索引的整数列表，表示要修改的表 */
+	List	   *subpaths;       /* 生成源数据的子路径(可以有多个，如CTE或VALUES子句) */
+	List	   *subroots;       /* 每个目标表对应的PlannerInfo结构 */
+	List	   *withCheckOptionLists; /* 每个目标表的WITH CHECK OPTION条件列表 */
+	List	   *returningLists; /* 每个目标表的RETURNING子句选择列表 */
+	List	   *rowMarks;       /* PlanRowMarks列表（仅非锁定的），用于行级并发控制 */
+	OnConflictExpr *onconflict; /* ON CONFLICT子句表达式，用于INSERT ... ON CONFLICT，为NULL时表示无此子句 */
+	int		epqParam;          /* 用于EvalPlanQual重新评估的Param ID，处理并发更新冲突 */
 } ModifyTablePath;
 
 /*
- * LimitPath represents applying LIMIT/OFFSET restrictions
+ * LimitPath 表示应用 LIMIT/OFFSET 限制的路径节点
+ * 
+ * 这个结构体用于表示SQL查询中的LIMIT和OFFSET子句，
+ * 它控制最终结果集返回的行数和起始位置。
  */
 typedef struct LimitPath
 {
-	Path		path;
-	Path	   *subpath;		/* path representing input source */
-	Node	   *limitOffset;	/* OFFSET parameter, or NULL if none */
-	Node	   *limitCount;		/* COUNT parameter, or NULL if none */
+	Path		path;           /* 继承自基础Path结构，包含路径的通用信息 */
+	Path	   *subpath;        /* 表示输入数据源的子路径 */
+	Node	   *limitOffset;    /* OFFSET参数表达式，为NULL表示无偏移 */
+	Node	   *limitCount;     /* COUNT参数表达式，为NULL表示无限制 */
 } LimitPath;
 
 
 /*
- * Restriction clause info.
+ * 限制子句信息（RestrictInfo）。
  *
- * We create one of these for each AND sub-clause of a restriction condition
- * (WHERE or JOIN/ON clause).  Since the restriction clauses are logically
- * ANDed, we can use any one of them or any subset of them to filter out
- * tuples, without having to evaluate the rest.  The RestrictInfo node itself
- * stores data used by the optimizer while choosing the best query plan.
+ * 对于每个限制条件（WHERE 或 JOIN/ON 子句）中的 AND 子句，我们都会创建一个 RestrictInfo 结构体。
+ * 由于这些限制子句是逻辑上的 AND 关系，可以单独或组合使用它们过滤元组，无需全部评估。
+ * RestrictInfo 节点用于优化器选择最佳查询计划时存储相关数据。
  *
- * If a restriction clause references a single base relation, it will appear
- * in the baserestrictinfo list of the RelOptInfo for that base rel.
+ * 如果限制子句只引用一个基表，则会出现在该基表的 RelOptInfo 的 baserestrictinfo 列表中。
+ * 如果引用多个基表，则会出现在每个严格子集的 RelOptInfo 的 joininfo 列表中，用于驱动连接树的构建。
+ * 只有当我们构建了包含所有被引用基表的连接关系时，才能实际应用该子句。
  *
- * If a restriction clause references more than one base rel, it will
- * appear in the joininfo list of every RelOptInfo that describes a strict
- * subset of the base rels mentioned in the clause.  The joininfo lists are
- * used to drive join tree building by selecting plausible join candidates.
- * The clause cannot actually be applied until we have built a join rel
- * containing all the base rels it references, however.
+ * 多关系限制子句在不同连接顺序下可能到达连接树的不同高度，因此不能直接与连接 RelOptInfo 关联，
+ * 而是需要在每个连接路径上单独跟踪。
  *
- * When we construct a join rel that includes all the base rels referenced
- * in a multi-relation restriction clause, we place that clause into the
- * joinrestrictinfo lists of paths for the join rel, if neither left nor
- * right sub-path includes all base rels referenced in the clause.  The clause
- * will be applied at that join level, and will not propagate any further up
- * the join tree.  (Note: the "predicate migration" code was once intended to
- * push restriction clauses up and down the plan tree based on evaluation
- * costs, but it's dead code and is unlikely to be resurrected in the
- * foreseeable future.)
+ * 等价条件（如可用于合并连接的等值条件）会先附加到 EquivalenceClass，
+ * 在构建扫描或连接路径时，再从 EquivalenceClass 生成实际需要检查的 RestrictInfo。
  *
- * Note that in the presence of more than two rels, a multi-rel restriction
- * might reach different heights in the join tree depending on the join
- * sequence we use.  So, these clauses cannot be associated directly with
- * the join RelOptInfo, but must be kept track of on a per-join-path basis.
+ * 外连接处理时需特别注意子句的下推与上推。外连接的 JOIN/ON 条件必须在该连接节点处评估，
+ * 除非是“退化”条件（只引用可空侧的变量）。WHERE 或更高层 JOIN 的条件不能下推到外连接之下，
+ * 如果引用了可空变量。RestrictInfo 包含 is_pushed_down 标志，指示该子句是否被下推到比其语法位置更低的层级。
+ * 若外连接阻止子句下推到其“自然”语义层级，则 required_relids 会包含比实际引用更多的基表，
+ * 这样可防止其被评估在外连接之下。
  *
- * RestrictInfos that represent equivalence conditions (i.e., mergejoinable
- * equalities that are not outerjoin-delayed) are handled a bit differently.
- * Initially we attach them to the EquivalenceClasses that are derived from
- * them.  When we construct a scan or join path, we look through all the
- * EquivalenceClasses and generate derived RestrictInfos representing the
- * minimal set of conditions that need to be checked for this particular scan
- * or join to enforce that all members of each EquivalenceClass are in fact
- * equal in all rows emitted by the scan or join.
+ * outerjoin_delayed 标志表示该子句因下层外连接而必须延迟应用。
+ * outer_relids 字段仅对外连接子句有效，表示外连接的外侧基表集合。
+ * nullable_relids 表示该子句引用的、可能被外连接强制为 NULL 的基表集合。
  *
- * When dealing with outer joins we have to be very careful about pushing qual
- * clauses up and down the tree.  An outer join's own JOIN/ON conditions must
- * be evaluated exactly at that join node, unless they are "degenerate"
- * conditions that reference only Vars from the nullable side of the join.
- * Quals appearing in WHERE or in a JOIN above the outer join cannot be pushed
- * down below the outer join, if they reference any nullable Vars.
- * RestrictInfo nodes contain a flag to indicate whether a qual has been
- * pushed down to a lower level than its original syntactic placement in the
- * join tree would suggest.  If an outer join prevents us from pushing a qual
- * down to its "natural" semantic level (the level associated with just the
- * base rels used in the qual) then we mark the qual with a "required_relids"
- * value including more than just the base rels it actually uses.  By
- * pretending that the qual references all the rels required to form the outer
- * join, we prevent it from being evaluated below the outer join's joinrel.
- * When we do form the outer join's joinrel, we still need to distinguish
- * those quals that are actually in that join's JOIN/ON condition from those
- * that appeared elsewhere in the tree and were pushed down to the join rel
- * because they used no other rels.  That's what the is_pushed_down flag is
- * for; it tells us that a qual is not an OUTER JOIN qual for the set of base
- * rels listed in required_relids.  A clause that originally came from WHERE
- * or an INNER JOIN condition will *always* have its is_pushed_down flag set.
- * It's possible for an OUTER JOIN clause to be marked is_pushed_down too,
- * if we decide that it can be pushed down into the nullable side of the join.
- * In that case it acts as a plain filter qual for wherever it gets evaluated.
- * (In short, is_pushed_down is only false for non-degenerate outer join
- * conditions.  Possibly we should rename it to reflect that meaning?  But
- * see also the comments for RINFO_IS_PUSHED_DOWN, below.)
+ * security_level 字段用于安全屏障条件，值越高表示来源越不可信。只有泄漏安全（leakproof）的子句才能在更低安全级别的子句之前评估。
  *
- * RestrictInfo nodes also contain an outerjoin_delayed flag, which is true
- * if the clause's applicability must be delayed due to any outer joins
- * appearing below it (ie, it has to be postponed to some join level higher
- * than the set of relations it actually references).
+ * can_join 标志表示该子句可能可用于合并连接或哈希连接（即二元操作符且左右引用的基表集合不重叠）。
+ * pseudoconstant 标志表示该子句不引用本查询级别的 Vars 且无易变函数，可作为一次性条件在 gating Result 节点中评估。
  *
- * There is also an outer_relids field, which is NULL except for outer join
- * clauses; for those, it is the set of relids on the outer side of the
- * clause's outer join.  (These are rels that the clause cannot be applied to
- * in parameterized scans, since pushing it into the join's outer side would
- * lead to wrong answers.)
+ * parent_ec 字段指向生成该子句的 EquivalenceClass，若多个子句在同一连接中有相同 parent_ec，则它们是冗余的。
  *
- * There is also a nullable_relids field, which is the set of rels the clause
- * references that can be forced null by some outer join below the clause.
- *
- * outerjoin_delayed = true is subtly different from nullable_relids != NULL:
- * a clause might reference some nullable rels and yet not be
- * outerjoin_delayed because it also references all the other rels of the
- * outer join(s). A clause that is not outerjoin_delayed can be enforced
- * anywhere it is computable.
- *
- * To handle security-barrier conditions efficiently, we mark RestrictInfo
- * nodes with a security_level field, in which higher values identify clauses
- * coming from less-trusted sources.  The exact semantics are that a clause
- * cannot be evaluated before another clause with a lower security_level value
- * unless the first clause is leakproof.  As with outer-join clauses, this
- * creates a reason for clauses to sometimes need to be evaluated higher in
- * the join tree than their contents would suggest; and even at a single plan
- * node, this rule constrains the order of application of clauses.
- *
- * In general, the referenced clause might be arbitrarily complex.  The
- * kinds of clauses we can handle as indexscan quals, mergejoin clauses,
- * or hashjoin clauses are limited (e.g., no volatile functions).  The code
- * for each kind of path is responsible for identifying the restrict clauses
- * it can use and ignoring the rest.  Clauses not implemented by an indexscan,
- * mergejoin, or hashjoin will be placed in the plan qual or joinqual field
- * of the finished Plan node, where they will be enforced by general-purpose
- * qual-expression-evaluation code.  (But we are still entitled to count
- * their selectivity when estimating the result tuple count, if we
- * can guess what it is...)
- *
- * When the referenced clause is an OR clause, we generate a modified copy
- * in which additional RestrictInfo nodes are inserted below the top-level
- * OR/AND structure.  This is a convenience for OR indexscan processing:
- * indexquals taken from either the top level or an OR subclause will have
- * associated RestrictInfo nodes.
- *
- * The can_join flag is set true if the clause looks potentially useful as
- * a merge or hash join clause, that is if it is a binary opclause with
- * nonoverlapping sets of relids referenced in the left and right sides.
- * (Whether the operator is actually merge or hash joinable isn't checked,
- * however.)
- *
- * The pseudoconstant flag is set true if the clause contains no Vars of
- * the current query level and no volatile functions.  Such a clause can be
- * pulled out and used as a one-time qual in a gating Result node.  We keep
- * pseudoconstant clauses in the same lists as other RestrictInfos so that
- * the regular clause-pushing machinery can assign them to the correct join
- * level, but they need to be treated specially for cost and selectivity
- * estimates.  Note that a pseudoconstant clause can never be an indexqual
- * or merge or hash join clause, so it's of no interest to large parts of
- * the planner.
- *
- * When join clauses are generated from EquivalenceClasses, there may be
- * several equally valid ways to enforce join equivalence, of which we need
- * apply only one.  We mark clauses of this kind by setting parent_ec to
- * point to the generating EquivalenceClass.  Multiple clauses with the same
- * parent_ec in the same join are redundant.
+ * 其它字段用于缓存成本、选择性、合并连接/哈希连接相关信息等。
  */
-
 typedef struct RestrictInfo
 {
 	NodeTag		type;
 
-	Expr	   *clause;			/* the represented clause of WHERE or JOIN */
+	Expr	   *clause;			/* 实际的 WHERE 或 JOIN 子句表达式 */
 
-	bool		is_pushed_down; /* true if clause was pushed down in level */
+	bool		is_pushed_down; /* 是否被下推到更低层级 */
 
-	bool		outerjoin_delayed;	/* true if delayed by lower outer join */
+	bool		outerjoin_delayed;	/* 是否因下层外连接而延迟应用 */
 
-	bool		can_join;		/* see comment above */
+	bool		can_join;		/* 是否可能用于合并/哈希连接 */
 
-	bool		pseudoconstant; /* see comment above */
+	bool		pseudoconstant; /* 是否为伪常量子句 */
 
-	bool		leakproof;		/* true if known to contain no leaked Vars */
+	bool		leakproof;		/* 是否为泄漏安全子句 */
 
-	Index		security_level; /* see comment above */
+	Index		security_level; /* 安全级别 */
 
-	/* The set of relids (varnos) actually referenced in the clause: */
-	Relids		clause_relids;
+	Relids		clause_relids;	/* 实际引用的基表集合 */
 
-	/* The set of relids required to evaluate the clause: */
-	Relids		required_relids;
+	Relids		required_relids;/* 评估该子句所需的基表集合 */
 
-	/* If an outer-join clause, the outer-side relations, else NULL: */
-	Relids		outer_relids;
+	Relids		outer_relids;	/* 外连接子句的外侧基表集合，否则为 NULL */
 
-	/* The relids used in the clause that are nullable by lower outer joins: */
-	Relids		nullable_relids;
+	Relids		nullable_relids;/* 可能被外连接强制为 NULL 的基表集合 */
 
-	/* These fields are set for any binary opclause: */
-	Relids		left_relids;	/* relids in left side of clause */
-	Relids		right_relids;	/* relids in right side of clause */
+	Relids		left_relids;	/* 子句左侧引用的基表集合（二元操作符时） */
+	Relids		right_relids;	/* 子句右侧引用的基表集合（二元操作符时） */
 
-	/* This field is NULL unless clause is an OR clause: */
-	Expr	   *orclause;		/* modified clause with RestrictInfos */
+	Expr	   *orclause;		/* 若为 OR 子句，则为带 RestrictInfo 的修改版 */
 
-	/* This field is NULL unless clause is potentially redundant: */
-	EquivalenceClass *parent_ec;	/* generating EquivalenceClass */
+	EquivalenceClass *parent_ec;	/* 生成该子句的 EquivalenceClass，冗余检测用 */
 
-	/* cache space for cost and selectivity */
-	QualCost	eval_cost;		/* eval cost of clause; -1 if not yet set */
-	Selectivity norm_selec;		/* selectivity for "normal" (JOIN_INNER)
-								 * semantics; -1 if not yet set; >1 means a
-								 * redundant clause */
-	Selectivity outer_selec;	/* selectivity for outer join semantics; -1 if
-								 * not yet set */
+	QualCost		eval_cost;		/* 评估该子句的成本，未设置时为 -1 */
+	Selectivity 	norm_selec;		/* “普通”连接语义下的选择性，未设置时为 -1，>1 表示冗余 */
+	Selectivity 	outer_selec;	/* 外连接语义下的选择性，未设置时为 -1 */
 
-	/* valid if clause is mergejoinable, else NIL */
-	List	   *mergeopfamilies;	/* opfamilies containing clause operator */
+	List	   		*mergeopfamilies;	/* 若可合并连接，则为操作符族列表，否则为 NIL */
 
-	/* cache space for mergeclause processing; NULL if not yet set */
-	EquivalenceClass *left_ec;	/* EquivalenceClass containing lefthand */
-	EquivalenceClass *right_ec; /* EquivalenceClass containing righthand */
-	EquivalenceMember *left_em; /* EquivalenceMember for lefthand */
-	EquivalenceMember *right_em;	/* EquivalenceMember for righthand */
-	List	   *scansel_cache;	/* list of MergeScanSelCache structs */
+	EquivalenceClass 	*left_ec;		/* 合并连接左侧的 EquivalenceClass */
+	EquivalenceClass 	*right_ec; 		/* 合并连接右侧的 EquivalenceClass */
+	EquivalenceMember 	*left_em; 		/* 合并连接左侧的 EquivalenceMember */
+	EquivalenceMember 	*right_em;		/* 合并连接右侧的 EquivalenceMember */
+	List	   			*scansel_cache;	/* 合并连接选择性缓存（MergeScanSelCache 列表） */
 
-	/* transient workspace for use while considering a specific join path */
-	bool		outer_is_left;	/* T = outer var on left, F = on right */
+	bool		outer_is_left; 		/* 临时工作区：外连接时外表在左侧？ */
 
-	/* valid if clause is hashjoinable, else InvalidOid: */
-	Oid			hashjoinoperator;	/* copy of clause operator */
+	Oid			hashjoinoperator;	/* 若可哈希连接，则为操作符 OID，否则为 InvalidOid */
 
-	/* cache space for hashclause processing; -1 if not yet set */
-	Selectivity left_bucketsize;	/* avg bucketsize of left side */
-	Selectivity right_bucketsize;	/* avg bucketsize of right side */
-	Selectivity left_mcvfreq;	/* left side's most common val's freq */
-	Selectivity right_mcvfreq;	/* right side's most common val's freq */
+	Selectivity left_bucketsize;	/* 哈希连接左侧平均桶大小，未设置为 -1 */
+	Selectivity right_bucketsize;	/* 哈希连接右侧平均桶大小，未设置为 -1 */
+	Selectivity left_mcvfreq; 		/* 左侧最常见值的频率 */
+	Selectivity right_mcvfreq; 		/* 右侧最常见值的频率 */
 } RestrictInfo;
 
 /*
@@ -2280,23 +2283,19 @@ typedef struct JoinPathExtraData
 } JoinPathExtraData;
 
 /*
- * Various flags indicating what kinds of grouping are possible.
+ * 分组实现方式相关的标志位定义
  *
- * GROUPING_CAN_USE_SORT should be set if it's possible to perform
- * sort-based implementations of grouping.  When grouping sets are in use,
- * this will be true if sorting is potentially usable for any of the grouping
- * sets, even if it's not usable for all of them.
+ * GROUPING_CAN_USE_SORT：如果可以使用排序方式实现分组，则设置该标志。
+ *   当使用分组集（grouping sets）时，只要有任意一个分组集可以用排序实现，也会设置此标志。
  *
- * GROUPING_CAN_USE_HASH should be set if it's possible to perform
- * hash-based implementations of grouping.
+ * GROUPING_CAN_USE_HASH：如果可以使用哈希方式实现分组，则设置该标志。
  *
- * GROUPING_CAN_PARTIAL_AGG should be set if the aggregation is of a type
- * for which we support partial aggregation (not, for example, grouping sets).
- * It says nothing about parallel-safety or the availability of suitable paths.
+ * GROUPING_CAN_PARTIAL_AGG：如果该聚合类型支持部分聚合（partial aggregation），则设置该标志。
+ *   例如普通分组支持部分聚合，但分组集不支持。该标志不表示并行安全性或是否有合适的路径。
  */
-#define GROUPING_CAN_USE_SORT       0x0001
-#define GROUPING_CAN_USE_HASH       0x0002
-#define GROUPING_CAN_PARTIAL_AGG	0x0004
+#define GROUPING_CAN_USE_SORT       0x0001   /* 可使用排序分组 */
+#define GROUPING_CAN_USE_HASH       0x0002   /* 可使用哈希分组 */
+#define GROUPING_CAN_PARTIAL_AGG    0x0004   /* 支持部分聚合 */
 
 /*
  * What kind of partitionwise aggregation is in use?

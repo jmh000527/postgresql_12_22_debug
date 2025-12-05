@@ -484,25 +484,25 @@ typedef struct NamedArgExpr
 } NamedArgExpr;
 
 /*
- * OpExpr - expression node for an operator invocation
+ * OpExpr - 运算符调用的表达式节点
  *
- * Semantically, this is essentially the same as a function call.
+ * 语义上，这与函数调用基本等价。
  *
- * Note that opfuncid is not necessarily filled in immediately on creation
- * of the node.  The planner makes sure it is valid before passing the node
- * tree to the executor, but during parsing/planning opfuncid can be 0.
+ * 注意：opfuncid 字段在节点创建时不一定会立即填充。
+ * 规划器会确保在将节点树传递给执行器之前该字段有效，
+ * 但在解析/规划阶段 opfuncid 可能为 0。
  */
 typedef struct OpExpr
 {
 	Expr		xpr;
-	Oid			opno;			/* PG_OPERATOR OID of the operator */
-	Oid			opfuncid;		/* PG_PROC OID of underlying function */
-	Oid			opresulttype;	/* PG_TYPE OID of result value */
-	bool		opretset;		/* true if operator returns set */
-	Oid			opcollid;		/* OID of collation of result */
-	Oid			inputcollid;	/* OID of collation that operator should use */
-	List* args;			/* arguments to the operator (1 or 2) */
-	int			location;		/* token location, or -1 if unknown */
+	Oid			opno;			/* 运算符的 PG_OPERATOR OID */
+	Oid			opfuncid;		/* 底层函数的 PG_PROC OID */
+	Oid			opresulttype;	/* 运算结果的 PG_TYPE OID */
+	bool		opretset;		/* 若运算符返回集合则为 true */
+	Oid			opcollid;		/* 结果的排序规则 OID */
+	Oid			inputcollid;	/* 运算符应使用的排序规则 OID */
+	List* args;			/* 运算符的参数（1 或 2 个） */
+	int			location;		/* 词法标记位置，未知时为 -1 */
 } OpExpr;
 
 /*
@@ -774,26 +774,26 @@ typedef struct FieldStore
 /* ----------------
  * RelabelType
  *
- * RelabelType represents a "dummy" type coercion between two binary-
- * compatible datatypes, such as reinterpreting the result of an OID
- * expression as an int4.  It is a no-op at runtime; we only need it
- * to provide a place to store the correct type to be attributed to
- * the expression result during type resolution.  (We can't get away
- * with just overwriting the type field of the input expression node,
- * so we need a separate node to show the coercion's result type.)
+ * RelabelType表示两种二进制兼容的数据类型之间的"伪"类型转换，
+ * 例如将OID表达式的结果重新解释为int4类型。
+ * 在运行时这是一个空操作（no-op）；我们仅需要它在类型解析过程中
+ * 提供一个位置来存储表达式结果应有的正确类型。
+ * （我们不能仅覆盖输入表达式节点的类型字段，因此需要一个单独的节点
+ * 来表示转换后的结果类型。）
  * ----------------
  */
 
 typedef struct RelabelType
 {
-	Expr		xpr;
-	Expr* arg;			/* input expression */
-	Oid			resulttype;		/* output type of coercion expression */
-	int32		resulttypmod;	/* output typmod (usually -1) */
-	Oid			resultcollid;	/* OID of collation, or InvalidOid if none */
-	CoercionForm relabelformat; /* how to display this node */
-	int			location;		/* token location, or -1 if unknown */
+    Expr        xpr;             /* 所有表达式节点的基结构体，包含节点类型标识 */
+    Expr* arg;                   /* 输入表达式，即需要重新标记类型的原始表达式 */
+    Oid         resulttype;      /* 转换表达式的输出类型OID */
+    int32       resulttypmod;    /* 输出类型的修饰符（通常为-1，表示无修饰） */
+    Oid         resultcollid;    /* 排序规则的OID，如无则为InvalidOid */
+    CoercionForm relabelformat;  /* 此节点的显示格式（如何在查询树中表示这个转换） */
+    int         location;        /* 词法标记位置，未知时为-1 */
 } RelabelType;
+
 
 /* ----------------
  * CoerceViaIO
@@ -1168,19 +1168,17 @@ typedef struct XmlExpr
 /* ----------------
  * NullTest
  *
- * NullTest represents the operation of testing a value for NULLness.
- * The appropriate test is performed and returned as a boolean Datum.
+ * NullTest 表示测试一个值是否为 NULL 的操作。
+ * 执行相应的测试并返回一个布尔 Datum。
  *
- * When argisrow is false, this simply represents a test for the null value.
+ * 当 argisrow 为 false 时，这仅仅表示测试是否为 null 值。
  *
- * When argisrow is true, the input expression must yield a rowtype, and
- * the node implements "row IS [NOT] NULL" per the SQL standard.  This
- * includes checking individual fields for NULLness when the row datum
- * itself isn't NULL.
+ * 当 argisrow 为 true 时，输入表达式必须产生一个行类型（rowtype），
+ * 并且该节点根据 SQL 标准实现 "row IS [NOT] NULL"。
+ * 这包括在行 datum 本身不为 NULL 时，检查各个字段是否为 NULL。
  *
- * NOTE: the combination of a rowtype input and argisrow==false does NOT
- * correspond to the SQL notation "row IS [NOT] NULL"; instead, this case
- * represents the SQL notation "row IS [NOT] DISTINCT FROM NULL".
+ * 注意：行类型输入和 argisrow==false 的组合并不对应于 SQL 写法 "row IS [NOT] NULL"；
+ * 相反，这种情况对应于 SQL 写法 "row IS [NOT] DISTINCT FROM NULL"。
  * ----------------
  */
 
@@ -1191,12 +1189,13 @@ typedef enum NullTestType
 
 typedef struct NullTest
 {
-	Expr		xpr;
-	Expr* arg;			/* input expression */
-	NullTestType nulltesttype;	/* IS NULL, IS NOT NULL */
-	bool		argisrow;		/* T to perform field-by-field null checks */
-	int			location;		/* token location, or -1 if unknown */
+	Expr			xpr;
+	Expr			*arg;			/* 输入表达式 */
+	NullTestType 	nulltesttype;	/* IS NULL, IS NOT NULL */
+	bool			argisrow;		/* 为 true 则执行逐字段的 null 检查 */
+	int				location;		/* 词法标记位置，未知时为 -1 */
 } NullTest;
+
 
 /*
  * BooleanTest

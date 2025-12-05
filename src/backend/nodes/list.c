@@ -200,10 +200,9 @@ add_new_cell(List *list, ListCell *prev_cell)
 }
 
 /*
- * Add a new cell to the specified list (which must be non-NIL);
- * it will be placed after the list cell 'prev' (which must be
- * non-NULL and a member of 'list'). The data placed in the new cell
- * is 'datum'. The newly-constructed cell is returned.
+ * 向指定链表（必须为非 NIL）添加一个新节点；
+ * 新节点将被插入到 'prev' 节点之后（'prev' 必须非 NULL 且属于该链表）。
+ * 新节点的数据为 'datum'，并返回新创建的节点指针。
  */
 ListCell *
 lappend_cell(List *list, ListCell *prev, void *datum)
@@ -245,15 +244,12 @@ lappend_cell_oid(List *list, ListCell *prev, Oid datum)
 }
 
 /*
- * Prepend a new element to the list. A pointer to the modified list
- * is returned. Note that this function may or may not destructively
- * modify the list; callers should always use this function's return
- * value, rather than continuing to use the pointer passed as the
- * second argument.
+ * 在链表头部插入一个新元素。返回修改后的链表指针。
+ * 注意：该函数可能会破坏性地修改原链表，调用者应始终使用返回值，
+ * 而不是继续使用传入的第二个参数。
  *
- * Caution: before Postgres 8.0, the original List was unmodified and
- * could be considered to retain its separate identity.  This is no longer
- * the case.
+ * 注意：在 Postgres 8.0 之前，原始链表未被修改，可以认为保留了其独立性。
+ * 现在已经不是这样了。
  */
 List *
 lcons(void *datum, List *list)

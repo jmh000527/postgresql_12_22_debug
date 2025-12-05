@@ -1660,11 +1660,10 @@ fix_opfuncids_walker(Node *node, void *context)
 
 /*
  * set_opfuncid
- *		Set the opfuncid (procedure OID) in an OpExpr node,
- *		if it hasn't been set already.
+ *		设置 OpExpr 节点中的 opfuncid（过程 OID），
+ *		如果尚未设置的话。
  *
- * Because of struct equivalence, this can also be used for
- * DistinctExpr and NullIfExpr nodes.
+ * 由于结构体等价，也可用于 DistinctExpr 和 NullIfExpr 节点。
  */
 void
 set_opfuncid(OpExpr *opexpr)
@@ -1675,7 +1674,7 @@ set_opfuncid(OpExpr *opexpr)
 
 /*
  * set_sa_opfuncid
- *		As above, for ScalarArrayOpExpr nodes.
+ *		如上，针对 ScalarArrayOpExpr 节点。
  */
 void
 set_sa_opfuncid(ScalarArrayOpExpr *opexpr)

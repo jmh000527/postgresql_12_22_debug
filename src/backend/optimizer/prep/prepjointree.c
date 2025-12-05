@@ -2782,40 +2782,29 @@ reduce_outer_joins_pass2(Node *jtnode,
 
 /*
  * remove_useless_result_rtes
- *		Attempt to remove RTE_RESULT RTEs from the join tree.
+ *		尝试从连接树中移除 RTE_RESULT 类型的 RTE。
  *
- * We can remove RTE_RESULT entries from the join tree using the knowledge
- * that RTE_RESULT returns exactly one row and has no output columns.  Hence,
- * if one is inner-joined to anything else, we can delete it.  Optimizations
- * are also possible for some outer-join cases, as detailed below.
+ * 我们可以利用 RTE_RESULT 总是返回一行且没有输出列的特性，
+ * 在连接树中将其删除。如果它与其他表进行内连接，则可以直接移除。
+ * 对于某些外连接场景，也可以进行优化，具体见下文。
  *
- * Some of these optimizations depend on recognizing empty (constant-true)
- * quals for FromExprs and JoinExprs.  That makes it useful to apply this
- * optimization pass after expression preprocessing, since that will have
- * eliminated constant-true quals, allowing more cases to be recognized as
- * optimizable.  What's more, the usual reason for an RTE_RESULT to be present
- * is that we pulled up a subquery or VALUES clause, thus very possibly
- * replacing Vars with constants, making it more likely that a qual can be
- * reduced to constant true.  Also, because some optimizations depend on
- * the outer-join type, it's best to have done reduce_outer_joins() first.
+ * 这些优化依赖于识别空（恒为真）的 quals，因此建议在表达式预处理后
+ * 再进行本优化，这样可以识别更多可优化的场景。通常 RTE_RESULT 的出现
+ * 是因为上拉了子查询或 VALUES 子句，这可能会将 Vars 替换为常量，
+ * 使 quals 更容易被化简为恒真。同时，由于部分优化依赖于外连接类型，
+ * 建议先执行 reduce_outer_joins()。
  *
- * A PlaceHolderVar referencing an RTE_RESULT RTE poses an obstacle to this
- * process: we must remove the RTE_RESULT's relid from the PHV's phrels, but
- * we must not reduce the phrels set to empty.  If that would happen, and
- * the RTE_RESULT is an immediate child of an outer join, we have to give up
- * and not remove the RTE_RESULT: there is noplace else to evaluate the
- * PlaceHolderVar.  (That is, in such cases the RTE_RESULT *does* have output
- * columns.)  But if the RTE_RESULT is an immediate child of an inner join,
- * we can usually change the PlaceHolderVar's phrels so as to evaluate it at
- * the inner join instead.  This is OK because we really only care that PHVs
- * are evaluated above or below the correct outer joins.  We can't, however,
- * postpone the evaluation of a PHV to above where it is used; so there are
- * some checks below on whether output PHVs are laterally referenced in the
- * other join input rel(s).
+ * 如果有 PlaceHolderVar 引用 RTE_RESULT，则移除时需将该 relid
+ * 从 PHV 的 phrels 集合中删除，但不能删到空集。如果删到空集且该
+ * RTE_RESULT 是外连接的直接子节点，则必须放弃移除，因为没有其他地方
+ * 可以计算该 PlaceHolderVar（此时 RTE_RESULT 实际有输出列）。
+ * 如果是内连接，则通常可以将 PlaceHolderVar 的 phrels 改为在内连接处
+ * 计算，这样是安全的，因为我们只关心 PHV 是否在正确的外连接上下方计算。
+ * 但不能将 PHV 的计算推迟到其被使用之后，因此还需检查其他连接输入是否
+ * 有对 PHV 的引用。
  *
- * We used to try to do this work as part of pull_up_subqueries() where the
- * potentially-optimizable cases get introduced; but it's way simpler, and
- * more effective, to do it separately.
+ * 过去曾尝试在 pull_up_subqueries() 阶段做这项工作，但单独处理更简单，
+ * 效果也更好。
  */
 void
 remove_useless_result_rtes(PlannerInfo *root)
@@ -2824,24 +2813,22 @@ remove_useless_result_rtes(PlannerInfo *root)
 	ListCell   *prev;
 	ListCell   *next;
 
-	/* Top level of jointree must always be a FromExpr */
+	/* 顶层连接树必须是 FromExpr */
 	Assert(IsA(root->parse->jointree, FromExpr));
-	/* Recurse ... */
+	/* 递归处理连接树 */
 	root->parse->jointree = (FromExpr *)
 		remove_useless_results_recurse(root, (Node *) root->parse->jointree);
-	/* We should still have a FromExpr */
+	/* 处理后仍应为 FromExpr */
 	Assert(IsA(root->parse->jointree, FromExpr));
 
 	/*
-	 * Remove any PlanRowMark referencing an RTE_RESULT RTE.  We obviously
-	 * must do that for any RTE_RESULT that we just removed.  But one for a
-	 * RTE that we did not remove can be dropped anyway: since the RTE has
-	 * only one possible output row, there is no need for EPQ to mark and
-	 * restore that row.
+	 * 移除所有引用 RTE_RESULT 的 PlanRowMark。
+	 * 对于刚刚被移除的 RTE_RESULT 必须移除 PlanRowMark；
+	 * 即使未被移除的 RTE_RESULT，其 PlanRowMark 也可以删除：
+	 * 因为该 RTE 只有一行输出，EPQ 无需标记和恢复该行。
 	 *
-	 * It's necessary, not optional, to remove the PlanRowMark for a surviving
-	 * RTE_RESULT RTE; otherwise we'll generate a whole-row Var for the
-	 * RTE_RESULT, which the executor has no support for.
+	 * 对于存活的 RTE_RESULT，移除 PlanRowMark 是必须的，
+	 * 否则会生成 whole-row Var，执行器无法支持。
 	 */
 	prev = NULL;
 	for (cell = list_head(root->rowMarks); cell; cell = next)

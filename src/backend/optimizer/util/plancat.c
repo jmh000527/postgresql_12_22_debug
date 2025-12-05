@@ -1598,27 +1598,19 @@ relation_excluded_by_constraints(PlannerInfo *root,
 	return false;
 }
 
-
 /*
  * build_physical_tlist
+ * 为给定的关系构建一个“物理”目标列表，该目标列表与关系的列一一对应。
+ * 构建一个仅包含关系的用户属性且顺序一致的目标列表（targetlist）。
+ * 执行器可以对这种目标列表进行特殊优化，避免在运行时进行投影步骤，因此我们优先为扫描节点使用这种目标列表。
  *
- * Build a targetlist consisting of exactly the relation's user attributes,
- * in order.  The executor can special-case such tlists to avoid a projection
- * step at runtime, so we use such tlists preferentially for scan nodes.
+ * 例外情况：如果存在被删除或缺失的列，则返回 NIL。理想情况下我们也希望处理这些情况，
+ * 但这会给 ExecTypeFromTL 带来问题，因为它可能需要为包含已不存在类型的变量的目标列表构建 tupdesc。
+ * 理论上我们可以从关系的 pg_attribute 条目中获取所需信息，但这些数据对 ExecTypeFromTL 来说并不容易获取。
+ * 目前，如果存在被删除的列，则不应用物理目标列表优化。
  *
- * Exception: if there are any dropped or missing columns, we punt and return
- * NIL.  Ideally we would like to handle these cases too.  However this
- * creates problems for ExecTypeFromTL, which may be asked to build a tupdesc
- * for a tlist that includes vars of no-longer-existent types.  In theory we
- * could dig out the required info from the pg_attribute entries of the
- * relation, but that data is not readily available to ExecTypeFromTL.
- * For now, we don't apply the physical-tlist optimization when there are
- * dropped cols.
- *
- * We also support building a "physical" tlist for subqueries, functions,
- * values lists, table expressions, and CTEs, since the same optimization can
- * occur in SubqueryScan, FunctionScan, ValuesScan, CteScan, TableFunc,
- * NamedTuplestoreScan, and WorkTableScan nodes.
+ * 我们还支持为子查询、函数、值列表、表表达式和 CTE 构建“物理”目标列表，
+ * 因为 SubqueryScan、FunctionScan、ValuesScan、CteScan、TableFunc、NamedTuplestoreScan 和 WorkTableScan 节点也可以进行类似优化。
  */
 List *
 build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
@@ -1637,7 +1629,7 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 	switch (rte->rtekind)
 	{
 		case RTE_RELATION:
-			/* Assume we already have adequate lock */
+			/* 假设已经有足够的锁 */
 			relation = table_open(rte->relid, NoLock);
 
 			numattrs = RelationGetNumberOfAttributes(relation);
@@ -1648,7 +1640,7 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 
 				if (att_tup->attisdropped || att_tup->atthasmissing)
 				{
-					/* found a dropped or missing col, so punt */
+					/* 发现被删除或缺失的列，直接返回 NIL */
 					tlist = NIL;
 					break;
 				}
@@ -1677,8 +1669,7 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 				TargetEntry *tle = (TargetEntry *) lfirst(l);
 
 				/*
-				 * A resjunk column of the subquery can be reflected as
-				 * resjunk in the physical tlist; we need not punt.
+				 * 子查询中的 resjunk 列可以在物理目标列表中反映为 resjunk，无需特殊处理。
 				 */
 				var = makeVarFromTargetEntry(varno, tle);
 
@@ -1696,16 +1687,15 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 		case RTE_CTE:
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
-			/* Not all of these can have dropped cols, but share code anyway */
-			expandRTE(rte, varno, 0, -1, true /* include dropped */ ,
+			/* 并非所有类型都可能有被删除的列，但统一处理 */
+			expandRTE(rte, varno, 0, -1, true /* 包含被删除的列 */ ,
 					  NULL, &colvars);
 			foreach(l, colvars)
 			{
 				var = (Var *) lfirst(l);
 
 				/*
-				 * A non-Var in expandRTE's output means a dropped column;
-				 * must punt.
+				 * expandRTE 输出的非 Var 表示被删除的列，需返回 NIL。
 				 */
 				if (!IsA(var, Var))
 				{
@@ -1722,8 +1712,8 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 			break;
 
 		default:
-			/* caller error */
-			elog(ERROR, "unsupported RTE kind %d in build_physical_tlist",
+			/* 调用者错误 */
+			elog(ERROR, "build_physical_tlist 不支持的 RTE 类型 %d",
 				 (int) rte->rtekind);
 			break;
 	}

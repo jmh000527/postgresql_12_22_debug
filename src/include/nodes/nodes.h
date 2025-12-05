@@ -600,23 +600,57 @@ extern PGDLLIMPORT Node* newNodeMacroHolder;
 #define IsA(nodeptr,_type_)		(nodeTag(nodeptr) == T_##_type_)
 
 /*
- * castNode(type, ptr) casts ptr to "type *", and if assertions are enabled,
- * verifies that the node has the appropriate type (using its nodeTag()).
+ * castNode(type, ptr) 将ptr强制转换为"type *"，并且在启用断言的情况下，
+ * 验证节点具有适当的类型（使用其nodeTag()方法）。
  *
- * Use an inline function when assertions are enabled, to avoid multiple
- * evaluations of the ptr argument (which could e.g. be a function call).
+ * 在启用断言时使用内联函数，以避免ptr参数的多次求值（例如，ptr可能是一个函数调用）。
  */
 #ifdef USE_ASSERT_CHECKING
+
+/* 
+ * castNodeImpl - 类型转换的内联实现函数
+ * @type: 目标节点类型标签
+ * @ptr: 要转换的节点指针
+ * @return: 转换后的节点指针
+ * 
+ * 这个内联函数在断言启用时使用，确保类型安全的节点转换
+ */
 static inline Node*
 castNodeImpl(NodeTag type, void* ptr)
 {
-	Assert(ptr == NULL || nodeTag(ptr) == type);
-	return (Node*)ptr;
+    /* 
+     * 断言检查：如果指针不为NULL，则验证其节点标签是否与目标类型匹配
+     * 这确保了在开发环境中进行严格的类型检查
+     */
+    Assert(ptr == NULL || nodeTag(ptr) == type);
+    /* 执行实际的类型转换并返回 */
+    return (Node*)ptr;
 }
+
+/* 
+ * castNode 宏定义 - 在断言启用情况下
+ * @_type_: 目标节点类型名称
+ * @nodeptr: 要转换的节点指针
+ * 
+ * 使用内联函数castNodeImpl执行带类型检查的转换
+ * T_##_type_ 是一个宏展开，生成对应类型的枚举常量
+ */
 #define castNode(_type_, nodeptr) ((_type_ *) castNodeImpl(T_##_type_, nodeptr))
+
 #else
+
+/* 
+ * castNode 宏定义 - 在断言禁用情况下
+ * @_type_: 目标节点类型名称
+ * @nodeptr: 要转换的节点指针
+ * 
+ * 在生产环境中，直接执行简单的指针转换，不进行类型检查
+ * 这提高了执行效率，但牺牲了运行时类型安全性
+ */
 #define castNode(_type_, nodeptr) ((_type_ *) (nodeptr))
+
 #endif							/* USE_ASSERT_CHECKING */
+
 
 
  /* ----------------------------------------------------------------
@@ -658,12 +692,29 @@ extern int16* readAttrNumberCols(int numCols);
  */
 extern void* copyObjectImpl(const void* obj);
 
-/* cast result back to argument type, if supported by compiler */
+/* 
+ * copyObject 宏定义
+ * 
+ * 此宏提供了一个类型安全的对象深拷贝机制，是PostgreSQL内部对象系统的核心函数之一。
+ * 它会调用copyObjectImpl函数进行实际的对象复制操作，并根据编译器支持情况进行适当的类型转换。
+ * 
+ * 实现原理：
+ * 1. 对于支持typeof运算符的编译器（如GCC、Clang等），使用typeof获取参数类型
+ *    并将复制结果显式转换回原始类型，提供完整的类型安全性。
+ * 2. 对于不支持typeof的编译器，直接返回copyObjectImpl的结果，可能需要调用者进行手动类型转换。
+ * 
+ * copyObjectImpl是实际执行对象复制的函数，通常会根据对象的节点类型标签(node tag)执行相应的复制逻辑。
+ * 这种设计使得PostgreSQL能够实现一个统一的复制接口，同时处理各种不同类型的节点对象。
+ */
+/* 如果编译器支持，将结果转换回参数类型 */
 #ifdef HAVE_TYPEOF
+/* 当编译器支持typeof时，使用typeof获取参数类型并进行类型安全的转换 */
 #define copyObject(obj) ((typeof(obj)) copyObjectImpl(obj))
 #else
+/* 当编译器不支持typeof时，直接返回复制结果，可能需要调用者手动进行类型转换 */
 #define copyObject(obj) copyObjectImpl(obj)
 #endif
+
 
 /*
  * nodes/equalfuncs.c
@@ -746,18 +797,38 @@ typedef enum JoinType
 } JoinType;
 
 /*
- * OUTER joins are those for which pushed-down quals must behave differently
- * from the join's own quals.  This is in fact everything except INNER and
- * SEMI joins.  However, this macro must also exclude the JOIN_UNIQUE symbols
- * since those are temporary proxies for what will eventually be an INNER
- * join.
+ * IS_OUTER_JOIN - 判断连接类型是否为外连接
  *
- * Note: semijoins are a hybrid case, but we choose to treat them as not
- * being outer joins.  This is okay principally because the SQL syntax makes
- * it impossible to have a pushed-down qual that refers to the inner relation
- * of a semijoin; so there is no strong need to distinguish join quals from
- * pushed-down quals.  This is convenient because for almost all purposes,
- * quals attached to a semijoin can be treated the same as innerjoin quals.
+ * 外连接是指那些下推的限定条件必须与连接自身限定条件表现不同的连接类型。
+ * 实际上除了内连接(INNER)和半连接(SEMI)之外的所有连接都是外连接。
+ * 但是，这个宏还必须排除JOIN_UNIQUE符号，因为它们只是最终将成为内连接的临时代理。
+ *
+ * 注意：半连接是一个混合情况，但我们选择将其视为非外连接。
+ * 这主要是可以接受的，因为SQL语法使得不可能存在引用半连接内关系的下推限定条件；
+ * 因此没有必要强烈区分连接限定条件和下推限定条件。
+ * 这很方便，因为几乎所有情况下，附加到半连接的限定条件都可以像内连接限定条件一样处理。
+ *
+ * 参数说明:
+ * - jointype: 连接类型枚举值(JOIN_LEFT, JOIN_FULL, JOIN_RIGHT, JOIN_ANTI等)
+ *
+ * 返回值:
+ * - 布尔值：如果是外连接则返回true，否则返回false
+ *
+ * 工作原理:
+ * 使用位运算检查jointype是否属于外连接类型集合。
+ * 通过将jointype左移一位生成位掩码，然后与外连接类型的位掩码进行按位与操作，
+ * 如果结果不为0则说明是外连接类型。
+ *
+ * 外连接类型包括:
+ * - JOIN_LEFT: 左外连接
+ * - JOIN_FULL: 全外连接
+ * - JOIN_RIGHT: 右外连接
+ * - JOIN_ANTI: 反连接
+ *
+ * 非外连接类型:
+ * - JOIN_INNER: 内连接
+ * - JOIN_SEMI: 半连接
+ * - JOIN_UNIQUE_*: 唯一化连接(临时代理)
  */
 #define IS_OUTER_JOIN(jointype) \
 	(((1 << (jointype)) & \
@@ -766,49 +837,91 @@ typedef enum JoinType
 	   (1 << JOIN_RIGHT) | \
 	   (1 << JOIN_ANTI))) != 0)
 
- /*
-  * AggStrategy -
-  *	  overall execution strategies for Agg plan nodes
-  *
-  * This is needed in both pathnodes.h and plannodes.h, so put it here...
-  */
+
+/*
+ * AggStrategy -
+ *	  聚合节点的整体执行策略枚举
+ *
+ * 该枚举用于 Agg 计划节点，表示不同的聚合执行方式。
+ * 在 pathnodes.h 和 plannodes.h 中都需要，所以放在此处。
+ */
 typedef enum AggStrategy
 {
-	AGG_PLAIN,					/* simple agg across all input rows */
-	AGG_SORTED,					/* grouped agg, input must be sorted */
-	AGG_HASHED,					/* grouped agg, use internal hashtable */
-	AGG_MIXED					/* grouped agg, hash and sort both used */
+	AGG_PLAIN,		/* 简单聚合，针对所有输入行进行汇总 */
+	AGG_SORTED,		/* 分组聚合，输入必须已排序 */
+	AGG_HASHED,		/* 分组聚合，使用内部哈希表 */
+	AGG_MIXED		/* 分组聚合，同时使用哈希和排序 */
 } AggStrategy;
 
 /*
  * AggSplit -
- *	  splitting (partial aggregation) modes for Agg plan nodes
+ *	  Agg 计划节点的拆分（部分聚合）模式
  *
- * This is needed in both pathnodes.h and plannodes.h, so put it here...
+ * 该枚举在 pathnodes.h 和 plannodes.h 中都需要，所以放在此处...
  */
 
- /* Primitive options supported by nodeAgg.c: */
-#define AGGSPLITOP_COMBINE		0x01	/* substitute combinefn for transfn */
-#define AGGSPLITOP_SKIPFINAL	0x02	/* skip finalfn, return state as-is */
-#define AGGSPLITOP_SERIALIZE	0x04	/* apply serializefn to output */
-#define AGGSPLITOP_DESERIALIZE	0x08	/* apply deserializefn to input */
+/* nodeAgg.c 支持的基本选项: */
+#define AGGSPLITOP_COMBINE		0x01	/* 用 combinefn 替换 transfn */
+#define AGGSPLITOP_SKIPFINAL	0x02	/* 跳过 finalfn，直接返回状态 */
+#define AGGSPLITOP_SERIALIZE	0x04	/* 对输出应用 serializefn */
+#define AGGSPLITOP_DESERIALIZE	0x08	/* 对输入应用 deserializefn */
 
-/* Supported operating modes (i.e., useful combinations of these options): */
+/* 支持的操作模式（即这些选项的有用组合）: */
 typedef enum AggSplit
 {
-	/* Basic, non-split aggregation: */
+	/* 基本的非拆分聚合: */
 	AGGSPLIT_SIMPLE = 0,
-	/* Initial phase of partial aggregation, with serialization: */
+	/* 部分聚合的初始阶段，带序列化: */
 	AGGSPLIT_INITIAL_SERIAL = AGGSPLITOP_SKIPFINAL | AGGSPLITOP_SERIALIZE,
-	/* Final phase of partial aggregation, with deserialization: */
+	/* 部分聚合的最终阶段，带反序列化: */
 	AGGSPLIT_FINAL_DESERIAL = AGGSPLITOP_COMBINE | AGGSPLITOP_DESERIALIZE
 } AggSplit;
 
 /* Test whether an AggSplit value selects each primitive option: */
+/* 
+ * 检查给定的 AggSplit 值是否包含 COMBINE 操作选项
+ * 参数：
+ *   as - AggSplit 枚举值
+ * 返回：
+ *   布尔值，表示是否使用 combinefn 替换 transfn（即合并聚合状态）
+ * 实现原理：
+ *   通过按位与操作检查 AGGSPLITOP_COMBINE 位标志是否设置
+ */
 #define DO_AGGSPLIT_COMBINE(as)		(((as) & AGGSPLITOP_COMBINE) != 0)
+
+/* 
+ * 检查给定的 AggSplit 值是否包含 SKIPFINAL 操作选项
+ * 参数：
+ *   as - AggSplit 枚举值
+ * 返回：
+ *   布尔值，表示是否跳过 finalfn，直接返回聚合状态
+ * 实现原理：
+ *   通过按位与操作检查 AGGSPLITOP_SKIPFINAL 位标志是否设置
+ */
 #define DO_AGGSPLIT_SKIPFINAL(as)	(((as) & AGGSPLITOP_SKIPFINAL) != 0)
+
+/* 
+ * 检查给定的 AggSplit 值是否包含 SERIALIZE 操作选项
+ * 参数：
+ *   as - AggSplit 枚举值
+ * 返回：
+ *   布尔值，表示是否对聚合输出应用 serializefn 进行序列化
+ * 实现原理：
+ *   通过按位与操作检查 AGGSPLITOP_SERIALIZE 位标志是否设置
+ */
 #define DO_AGGSPLIT_SERIALIZE(as)	(((as) & AGGSPLITOP_SERIALIZE) != 0)
+
+/* 
+ * 检查给定的 AggSplit 值是否包含 DESERIALIZE 操作选项
+ * 参数：
+ *   as - AggSplit 枚举值
+ * 返回：
+ *   布尔值，表示是否对聚合输入应用 deserializefn 进行反序列化
+ * 实现原理：
+ *   通过按位与操作检查 AGGSPLITOP_DESERIALIZE 位标志是否设置
+ */
 #define DO_AGGSPLIT_DESERIALIZE(as) (((as) & AGGSPLITOP_DESERIALIZE) != 0)
+
 
 /*
  * SetOpCmd and SetOpStrategy -

@@ -112,70 +112,65 @@ static void InvalidateOprProofCacheCallBack(Datum arg, int cacheid, uint32 hashv
 
 /*
  * predicate_implied_by
- *	  Recursively checks whether the clauses in clause_list imply that the
- *	  given predicate is true.
+ *    递归检查clause_list中的条件集合是否隐含给定的predicate条件为真
  *
- * We support two definitions of implication:
+ * 函数支持两种隐含关系定义：
  *
- * "Strong" implication: A implies B means that truth of A implies truth of B.
- * We use this to prove that a row satisfying one WHERE clause or index
- * predicate must satisfy another one.
+ * "强"隐含关系：A隐含B表示当A为真时B必定为真
+ * 用于证明满足某个WHERE子句或索引谓词的行必定满足另一个WHERE子句或索引谓词
  *
- * "Weak" implication: A implies B means that non-falsity of A implies
- * non-falsity of B ("non-false" means "either true or NULL").  We use this to
- * prove that a row satisfying one CHECK constraint must satisfy another one.
+ * "弱"隐含关系：A隐含B表示当A为非假（即A为真或NULL）时，B也为非假
+ * 用于证明满足某个CHECK约束的行必定满足另一个CHECK约束
  *
- * Strong implication can also be used to prove that a WHERE clause implies a
- * CHECK constraint, although it will fail to prove a few cases where we could
- * safely conclude that the implication holds.  There's no support for proving
- * the converse case, since only a few kinds of CHECK constraint would allow
- * deducing anything.
+ * 强隐含关系也可用于证明WHERE子句隐含CHECK约束，虽然在少数情况下可能无法证明
+ * 实际上存在的隐含关系。不支持证明反向情况（CHECK约束隐含WHERE子句），因为只有
+ * 少数类型的CHECK约束能推导出有用信息。
  *
- * The top-level List structure of each list corresponds to an AND list.
- * We assume that eval_const_expressions() has been applied and so there
- * are no un-flattened ANDs or ORs (e.g., no AND immediately within an AND,
- * including AND just below the top-level List structure).
- * If this is not true we might fail to prove an implication that is
- * valid, but no worse consequences will ensue.
+ * 每个列表的顶层List结构对应于一个AND条件列表。
+ * 假设已经应用了eval_const_expressions()函数，因此不存在未扁平化的AND或OR
+ * （例如，AND不会直接嵌套在另一个AND中，包括顶层List结构下的AND）。
+ * 若此假设不成立，可能会无法证明实际上有效的隐含关系，但不会产生更严重的后果。
  *
- * We assume the predicate has already been checked to contain only
- * immutable functions and operators.  (In many current uses this is known
- * true because the predicate is part of an index predicate that has passed
- * CheckPredicate(); otherwise, the caller must check it.)  We dare not make
- * deductions based on non-immutable functions, because they might change
- * answers between the time we make the plan and the time we execute the plan.
- * Immutability of functions in the clause_list is checked here, if necessary.
+ * 假设predicate_list已经过检查，只包含不可变函数和操作符。
+ * （在许多当前使用场景中，这已知为真，因为predicate是已通过CheckPredicate()
+ * 检查的索引谓词的一部分；否则，调用者必须进行检查。）
+ * 我们不敢基于可变函数进行推导，因为它们可能在制定计划和执行计划的时间之间改变结果。
+ * clause_list中的函数的不可变性会在此函数中根据需要进行检查。
  */
 bool
 predicate_implied_by(List *predicate_list, List *clause_list,
-					 bool weak)
+                     bool weak)
 {
-	Node	   *p,
-			   *c;
+    Node       *p,  /* 转换后的谓词节点 */
+               *c;  /* 转换后的条件列表节点 */
 
-	if (predicate_list == NIL)
-		return true;			/* no predicate: implication is vacuous */
-	if (clause_list == NIL)
-		return false;			/* no restriction: implication must fail */
+    /* 边界条件处理：若没有谓词，则隐含关系空真成立 */
+    if (predicate_list == NIL)
+        return true;        /* no predicate: implication is vacuous */
+    
+    /* 边界条件处理：若没有约束条件，则无法隐含任何谓词 */
+    if (clause_list == NIL)
+        return false;       /* no restriction: implication must fail */
 
-	/*
-	 * If either input is a single-element list, replace it with its lone
-	 * member; this avoids one useless level of AND-recursion.  We only need
-	 * to worry about this at top level, since eval_const_expressions should
-	 * have gotten rid of any trivial ANDs or ORs below that.
-	 */
-	if (list_length(predicate_list) == 1)
-		p = (Node *) linitial(predicate_list);
-	else
-		p = (Node *) predicate_list;
-	if (list_length(clause_list) == 1)
-		c = (Node *) linitial(clause_list);
-	else
-		c = (Node *) clause_list;
+    /*
+     * 优化处理：如果任一输入是单元素列表，则将其替换为该元素
+     * 这避免了一层无用的AND递归。我们只需在顶层处理这种情况，
+     * 因为eval_const_expressions应该已经处理了下面的所有简单AND或OR。
+     */
+    if (list_length(predicate_list) == 1)
+        p = (Node *) linitial(predicate_list);
+    else
+        p = (Node *) predicate_list;
+    
+    if (list_length(clause_list) == 1)
+        c = (Node *) linitial(clause_list);
+    else
+        c = (Node *) clause_list;
 
-	/* And away we go ... */
-	return predicate_implied_by_recurse(c, p, weak);
+    /* 调用递归函数进行实际的隐含关系检查 */
+    return predicate_implied_by_recurse(c, p, weak);
 }
+
 
 /*
  * predicate_refuted_by
@@ -249,250 +244,240 @@ predicate_refuted_by(List *predicate_list, List *clause_list,
 
 /*----------
  * predicate_implied_by_recurse
- *	  Does the predicate implication test for non-NULL restriction and
- *	  predicate clauses.
+ *    对非NULL的约束条件和谓词条件进行隐含关系测试的递归函数
  *
- * The logic followed here is ("=>" means "implies"):
- *	atom A => atom B iff:			predicate_implied_by_simple_clause says so
- *	atom A => AND-expr B iff:		A => each of B's components
- *	atom A => OR-expr B iff:		A => any of B's components
- *	AND-expr A => atom B iff:		any of A's components => B
- *	AND-expr A => AND-expr B iff:	A => each of B's components
- *	AND-expr A => OR-expr B iff:	A => any of B's components,
- *									*or* any of A's components => B
- *	OR-expr A => atom B iff:		each of A's components => B
- *	OR-expr A => AND-expr B iff:	A => each of B's components
- *	OR-expr A => OR-expr B iff:		each of A's components => any of B's
+ * 实现的逻辑规则（"=>"表示"隐含"）：
+ *    原子表达式A => 原子表达式B：当且仅当predicate_implied_by_simple_clause判定如此
+ *    原子表达式A => AND表达式B：当A隐含B的每个组件时
+ *    原子表达式A => OR表达式B：当A隐含B的任意一个组件时
+ *    AND表达式A => 原子表达式B：当A的任意一个组件隐含B时
+ *    AND表达式A => AND表达式B：当A隐含B的每个组件时
+ *    AND表达式A => OR表达式B：当A隐含B的任意一个组件，
+ *                            或A的任意一个组件隐含B时
+ *    OR表达式A => 原子表达式B：当A的每个组件都隐含B时
+ *    OR表达式A => AND表达式B：当A的每个组件都隐含B时
+ *    OR表达式A => OR表达式B：当A的每个组件都隐含B的某个组件时
  *
- * An "atom" is anything other than an AND or OR node.  Notice that we don't
- * have any special logic to handle NOT nodes; these should have been pushed
- * down or eliminated where feasible during eval_const_expressions().
+ * "原子表达式"指的是除AND或OR节点以外的任何表达式。注意我们没有特别处理NOT节点，
+ * 这些应该在eval_const_expressions()过程中已被下推或在可行情况下被消除。
  *
- * All of these rules apply equally to strong or weak implication.
+ * 所有这些规则同样适用于强隐含和弱隐含关系。
  *
- * We can't recursively expand either side first, but have to interleave
- * the expansions per the above rules, to be sure we handle all of these
- * examples:
- *		(x OR y) => (x OR y OR z)
- *		(x AND y AND z) => (x AND y)
- *		(x AND y) => ((x AND y) OR z)
- *		((x OR y) AND z) => (x OR y)
- * This is still not an exhaustive test, but it handles most normal cases
- * under the assumption that both inputs have been AND/OR flattened.
+ * 我们不能先递归展开任一侧，而是必须按照上述规则交错展开，以确保处理以下所有情况：
+ *    (x OR y) => (x OR y OR z)
+ *    (x AND y AND z) => (x AND y)
+ *    (x AND y) => ((x AND y) OR z)
+ *    ((x OR y) AND z) => (x OR y)
+ * 虽然这不是一个详尽无遗的测试，但在假设两个输入都已被AND/OR扁平化的情况下，
+ * 它能处理大多数正常情况。
  *
- * We have to be prepared to handle RestrictInfo nodes in the restrictinfo
- * tree, though not in the predicate tree.
+ * 我们必须准备好处理约束条件树中的RestrictInfo节点，但不在谓词树中处理。
  *----------
  */
 static bool
 predicate_implied_by_recurse(Node *clause, Node *predicate,
-							 bool weak)
+                             bool weak)
 {
-	PredIterInfoData clause_info;
-	PredIterInfoData pred_info;
-	PredClass	pclass;
-	bool		result;
+    PredIterInfoData clause_info; /* 存储子句的迭代信息 */
+    PredIterInfoData pred_info;   /* 存储谓词的迭代信息 */
+    PredClass    pclass;          /* 谓词的类型分类 */
+    bool        result;           /* 返回结果 */
 
-	/* skip through RestrictInfo */
-	Assert(clause != NULL);
-	if (IsA(clause, RestrictInfo))
-		clause = (Node *) ((RestrictInfo *) clause)->clause;
+    /* 跳过RestrictInfo包装，直接获取实际的子句 */
+    Assert(clause != NULL);
+    if (IsA(clause, RestrictInfo))
+        clause = (Node *) ((RestrictInfo *) clause)->clause;
 
-	pclass = predicate_classify(predicate, &pred_info);
+    /* 对谓词进行分类，并获取迭代信息 */
+    pclass = predicate_classify(predicate, &pred_info);
 
-	switch (predicate_classify(clause, &clause_info))
-	{
-		case CLASS_AND:
-			switch (pclass)
-			{
-				case CLASS_AND:
+    /* 根据子句和谓词的类型组合，应用相应的隐含规则 */
+    switch (predicate_classify(clause, &clause_info))
+    {
+        case CLASS_AND: /* 子句是AND表达式 */
+            switch (pclass)
+            {
+                case CLASS_AND: /* 谓词也是AND表达式 */
 
-					/*
-					 * AND-clause => AND-clause if A implies each of B's items
-					 */
-					result = true;
-					iterate_begin(pitem, predicate, pred_info)
-					{
-						if (!predicate_implied_by_recurse(clause, pitem,
-														  weak))
-						{
-							result = false;
-							break;
-						}
-					}
-					iterate_end(pred_info);
-					return result;
+                    /*
+                     * AND子句 => AND谓词：当子句隐含谓词的每个项时
+                     */
+                    result = true;
+                    iterate_begin(pitem, predicate, pred_info) /* 遍历谓词的每个组件 */
+                    {
+                        if (!predicate_implied_by_recurse(clause, pitem, weak))
+                        {
+                            result = false;
+                            break;
+                        }
+                    }
+                    iterate_end(pred_info);
+                    return result;
 
-				case CLASS_OR:
+                case CLASS_OR: /* 谓词是OR表达式 */
 
-					/*
-					 * AND-clause => OR-clause if A implies any of B's items
-					 *
-					 * Needed to handle (x AND y) => ((x AND y) OR z)
-					 */
-					result = false;
-					iterate_begin(pitem, predicate, pred_info)
-					{
-						if (predicate_implied_by_recurse(clause, pitem,
-														 weak))
-						{
-							result = true;
-							break;
-						}
-					}
-					iterate_end(pred_info);
-					if (result)
-						return result;
+                    /*
+                     * AND子句 => OR谓词：当子句隐含谓词的任意一个项时
+                     *
+                     * 用于处理 (x AND y) => ((x AND y) OR z) 这类情况
+                     */
+                    result = false;
+                    iterate_begin(pitem, predicate, pred_info) /* 遍历谓词的每个组件 */
+                    {
+                        if (predicate_implied_by_recurse(clause, pitem, weak))
+                        {
+                            result = true;
+                            break;
+                        }
+                    }
+                    iterate_end(pred_info);
+                    if (result)
+                        return result;
 
-					/*
-					 * Also check if any of A's items implies B
-					 *
-					 * Needed to handle ((x OR y) AND z) => (x OR y)
-					 */
-					iterate_begin(citem, clause, clause_info)
-					{
-						if (predicate_implied_by_recurse(citem, predicate,
-														 weak))
-						{
-							result = true;
-							break;
-						}
-					}
-					iterate_end(clause_info);
-					return result;
+                    /*
+                     * 也要检查子句的任意一个项是否隐含整个谓词
+                     *
+                     * 用于处理 ((x OR y) AND z) => (x OR y) 这类情况
+                     */
+                    iterate_begin(citem, clause, clause_info) /* 遍历子句的每个组件 */
+                    {
+                        if (predicate_implied_by_recurse(citem, predicate, weak))
+                        {
+                            result = true;
+                            break;
+                        }
+                    }
+                    iterate_end(clause_info);
+                    return result;
 
-				case CLASS_ATOM:
+                case CLASS_ATOM: /* 谓词是原子表达式 */
 
-					/*
-					 * AND-clause => atom if any of A's items implies B
-					 */
-					result = false;
-					iterate_begin(citem, clause, clause_info)
-					{
-						if (predicate_implied_by_recurse(citem, predicate,
-														 weak))
-						{
-							result = true;
-							break;
-						}
-					}
-					iterate_end(clause_info);
-					return result;
-			}
-			break;
+                    /*
+                     * AND子句 => 原子谓词：当子句的任意一个项隐含谓词时
+                     */
+                    result = false;
+                    iterate_begin(citem, clause, clause_info) /* 遍历子句的每个组件 */
+                    {
+                        if (predicate_implied_by_recurse(citem, predicate, weak))
+                        {
+                            result = true;
+                            break;
+                        }
+                    }
+                    iterate_end(clause_info);
+                    return result;
+            }
+            break;
 
-		case CLASS_OR:
-			switch (pclass)
-			{
-				case CLASS_OR:
+        case CLASS_OR: /* 子句是OR表达式 */
+            switch (pclass)
+            {
+                case CLASS_OR: /* 谓词也是OR表达式 */
 
-					/*
-					 * OR-clause => OR-clause if each of A's items implies any
-					 * of B's items.  Messy but can't do it any more simply.
-					 */
-					result = true;
-					iterate_begin(citem, clause, clause_info)
-					{
-						bool		presult = false;
+                    /*
+                     * OR子句 => OR谓词：当子句的每个项都隐含谓词的某个项时
+                     * 逻辑较复杂，但无法更简化
+                     */
+                    result = true;
+                    iterate_begin(citem, clause, clause_info) /* 遍历子句的每个组件 */
+                    {
+                        bool        presult = false;
 
-						iterate_begin(pitem, predicate, pred_info)
-						{
-							if (predicate_implied_by_recurse(citem, pitem,
-															 weak))
-							{
-								presult = true;
-								break;
-							}
-						}
-						iterate_end(pred_info);
-						if (!presult)
-						{
-							result = false; /* doesn't imply any of B's */
-							break;
-						}
-					}
-					iterate_end(clause_info);
-					return result;
+                        iterate_begin(pitem, predicate, pred_info) /* 遍历谓词的每个组件 */
+                        {
+                            if (predicate_implied_by_recurse(citem, pitem, weak))
+                            {
+                                presult = true;
+                                break;
+                            }
+                        }
+                        iterate_end(pred_info);
+                        if (!presult)
+                        {
+                            result = false; /* 子句的该项不隐含谓词的任何一项 */
+                            break;
+                        }
+                    }
+                    iterate_end(clause_info);
+                    return result;
 
-				case CLASS_AND:
-				case CLASS_ATOM:
+                case CLASS_AND: /* 谓词是AND表达式 */
+                case CLASS_ATOM: /* 谓词是原子表达式 */
 
-					/*
-					 * OR-clause => AND-clause if each of A's items implies B
-					 *
-					 * OR-clause => atom if each of A's items implies B
-					 */
-					result = true;
-					iterate_begin(citem, clause, clause_info)
-					{
-						if (!predicate_implied_by_recurse(citem, predicate,
-														  weak))
-						{
-							result = false;
-							break;
-						}
-					}
-					iterate_end(clause_info);
-					return result;
-			}
-			break;
+                    /*
+                     * OR子句 => AND谓词：当子句的每个项都隐含谓词时
+                     *
+                     * OR子句 => 原子谓词：当子句的每个项都隐含谓词时
+                     */
+                    result = true;
+                    iterate_begin(citem, clause, clause_info) /* 遍历子句的每个组件 */
+                    {
+                        if (!predicate_implied_by_recurse(citem, predicate, weak))
+                        {
+                            result = false;
+                            break;
+                        }
+                    }
+                    iterate_end(clause_info);
+                    return result;
+            }
+            break;
 
-		case CLASS_ATOM:
-			switch (pclass)
-			{
-				case CLASS_AND:
+        case CLASS_ATOM: /* 子句是原子表达式 */
+            switch (pclass)
+            {
+                case CLASS_AND: /* 谓词是AND表达式 */
 
-					/*
-					 * atom => AND-clause if A implies each of B's items
-					 */
-					result = true;
-					iterate_begin(pitem, predicate, pred_info)
-					{
-						if (!predicate_implied_by_recurse(clause, pitem,
-														  weak))
-						{
-							result = false;
-							break;
-						}
-					}
-					iterate_end(pred_info);
-					return result;
+                    /*
+                     * 原子子句 => AND谓词：当子句隐含谓词的每个项时
+                     */
+                    result = true;
+                    iterate_begin(pitem, predicate, pred_info) /* 遍历谓词的每个组件 */
+                    {
+                        if (!predicate_implied_by_recurse(clause, pitem, weak))
+                        {
+                            result = false;
+                            break;
+                        }
+                    }
+                    iterate_end(pred_info);
+                    return result;
 
-				case CLASS_OR:
+                case CLASS_OR: /* 谓词是OR表达式 */
 
-					/*
-					 * atom => OR-clause if A implies any of B's items
-					 */
-					result = false;
-					iterate_begin(pitem, predicate, pred_info)
-					{
-						if (predicate_implied_by_recurse(clause, pitem,
-														 weak))
-						{
-							result = true;
-							break;
-						}
-					}
-					iterate_end(pred_info);
-					return result;
+                    /*
+                     * 原子子句 => OR谓词：当子句隐含谓词的任意一个项时
+                     */
+                    result = false;
+                    iterate_begin(pitem, predicate, pred_info) /* 遍历谓词的每个组件 */
+                    {
+                        if (predicate_implied_by_recurse(clause, pitem, weak))
+                        {
+                            result = true;
+                            break;
+                        }
+                    }
+                    iterate_end(pred_info);
+                    return result;
 
-				case CLASS_ATOM:
+                case CLASS_ATOM: /* 谓词也是原子表达式 */
 
-					/*
-					 * atom => atom is the base case
-					 */
-					return
-						predicate_implied_by_simple_clause((Expr *) predicate,
-														   clause,
-														   weak);
-			}
-			break;
-	}
+                    /*
+                     * 原子子句 => 原子谓词：这是基本情况，由专门函数处理
+                     */
+                    return
+                        predicate_implied_by_simple_clause((Expr *) predicate,
+                                                           clause,
+                                                           weak);
+            }
+            break;
+    }
 
-	/* can't get here */
-	elog(ERROR, "predicate_classify returned a bogus value");
-	return false;
+    /* 无法到达的代码，但为了安全还是添加错误处理 */
+    elog(ERROR, "predicate_classify returned a bogus value");
+    return false;
 }
+
 
 /*----------
  * predicate_refuted_by_recurse
@@ -808,95 +793,103 @@ predicate_refuted_by_recurse(Node *clause, Node *predicate,
 
 /*
  * predicate_classify
- *	  Classify an expression node as AND-type, OR-type, or neither (an atom).
+ *    将表达式节点分类为AND类型、OR类型或非复合类型（原子表达式）
  *
- * If the expression is classified as AND- or OR-type, then *info is filled
- * in with the functions needed to iterate over its components.
+ * 如果表达式被分类为AND或OR类型，则通过info参数填充用于迭代其组件的函数
  *
- * This function also implements enforcement of MAX_SAOP_ARRAY_SIZE: if a
- * ScalarArrayOpExpr's array has too many elements, we just classify it as an
- * atom.  (This will result in its being passed as-is to the simple_clause
- * functions, many of which will fail to prove anything about it.) Note that we
- * cannot just stop after considering MAX_SAOP_ARRAY_SIZE elements; in general
- * that would result in wrong proofs, rather than failing to prove anything.
+ * 该函数还实现了MAX_SAOP_ARRAY_SIZE限制：如果ScalarArrayOpExpr的数组元素过多，
+ * 我们将其简单地分类为原子表达式。（这将导致它按原样传递给simple_clause函数，
+ * 其中许多函数将无法证明关于它的任何内容。）注意，我们不能只在考虑MAX_SAOP_ARRAY_SIZE
+ * 个元素后就停止，因为这样通常会导致错误的证明，而不仅仅是无法证明。
  */
 static PredClass
 predicate_classify(Node *clause, PredIterInfo info)
 {
-	/* Caller should not pass us NULL, nor a RestrictInfo clause */
-	Assert(clause != NULL);
-	Assert(!IsA(clause, RestrictInfo));
+    /* 调用者不应传递NULL，也不应传递RestrictInfo类型的子句 */
+    Assert(clause != NULL);
+    Assert(!IsA(clause, RestrictInfo));
 
-	/*
-	 * If we see a List, assume it's an implicit-AND list; this is the correct
-	 * semantics for lists of RestrictInfo nodes.
-	 */
-	if (IsA(clause, List))
-	{
-		info->startup_fn = list_startup_fn;
-		info->next_fn = list_next_fn;
-		info->cleanup_fn = list_cleanup_fn;
-		return CLASS_AND;
-	}
+    /*
+     * 如果是List类型，假设它是一个隐式AND列表；这是RestrictInfo节点列表的正确语义
+     */
+    if (IsA(clause, List))
+    {
+        /* 设置用于迭代List的函数 */
+        info->startup_fn = list_startup_fn;    /* 初始化迭代的函数 */
+        info->next_fn = list_next_fn;          /* 获取下一个元素的函数 */
+        info->cleanup_fn = list_cleanup_fn;    /* 清理迭代资源的函数 */
+        return CLASS_AND;                      /* 列表被视为AND组合 */
+    }
 
-	/* Handle normal AND and OR boolean clauses */
-	if (is_andclause(clause))
-	{
-		info->startup_fn = boolexpr_startup_fn;
-		info->next_fn = list_next_fn;
-		info->cleanup_fn = list_cleanup_fn;
-		return CLASS_AND;
-	}
-	if (is_orclause(clause))
-	{
-		info->startup_fn = boolexpr_startup_fn;
-		info->next_fn = list_next_fn;
-		info->cleanup_fn = list_cleanup_fn;
-		return CLASS_OR;
-	}
+    /* 处理普通的AND和OR布尔表达式 */
+    if (is_andclause(clause))
+    {
+        /* 设置用于迭代布尔表达式的函数 */
+        info->startup_fn = boolexpr_startup_fn; /* 初始化布尔表达式迭代 */
+        info->next_fn = list_next_fn;           /* 获取下一个条件 */
+        info->cleanup_fn = list_cleanup_fn;     /* 清理迭代资源 */
+        return CLASS_AND;                       /* 返回AND类型 */
+    }
+    if (is_orclause(clause))
+    {
+        /* 设置用于迭代布尔表达式的函数 */
+        info->startup_fn = boolexpr_startup_fn; /* 初始化布尔表达式迭代 */
+        info->next_fn = list_next_fn;           /* 获取下一个条件 */
+        info->cleanup_fn = list_cleanup_fn;     /* 清理迭代资源 */
+        return CLASS_OR;                        /* 返回OR类型 */
+    }
 
-	/* Handle ScalarArrayOpExpr */
-	if (IsA(clause, ScalarArrayOpExpr))
-	{
-		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
-		Node	   *arraynode = (Node *) lsecond(saop->args);
+    /* 处理标量数组操作表达式(ScalarArrayOpExpr) */
+    if (IsA(clause, ScalarArrayOpExpr))
+    {
+        ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+        /* 获取数组操作数（通常是第二个参数） */
+        Node    *arraynode = (Node *) lsecond(saop->args);
 
-		/*
-		 * We can break this down into an AND or OR structure, but only if we
-		 * know how to iterate through expressions for the array's elements.
-		 * We can do that if the array operand is a non-null constant or a
-		 * simple ArrayExpr.
-		 */
-		if (arraynode && IsA(arraynode, Const) &&
-			!((Const *) arraynode)->constisnull)
-		{
-			ArrayType  *arrayval;
-			int			nelems;
+        /*
+         * 我们可以将其分解为AND或OR结构，但前提是我们知道如何迭代数组元素的表达式。
+         * 当数组操作数是非空常量或简单ArrayExpr时，我们可以这样做。
+         */
+        /* 情况1：数组是一个非空常量 */
+        if (arraynode && IsA(arraynode, Const) &&
+            !((Const *) arraynode)->constisnull)
+        {
+            ArrayType  *arrayval;
+            int         nelems; /* 数组元素数量 */
 
-			arrayval = DatumGetArrayTypeP(((Const *) arraynode)->constvalue);
-			nelems = ArrayGetNItems(ARR_NDIM(arrayval), ARR_DIMS(arrayval));
-			if (nelems <= MAX_SAOP_ARRAY_SIZE)
-			{
-				info->startup_fn = arrayconst_startup_fn;
-				info->next_fn = arrayconst_next_fn;
-				info->cleanup_fn = arrayconst_cleanup_fn;
-				return saop->useOr ? CLASS_OR : CLASS_AND;
-			}
-		}
-		else if (arraynode && IsA(arraynode, ArrayExpr) &&
-				 !((ArrayExpr *) arraynode)->multidims &&
-				 list_length(((ArrayExpr *) arraynode)->elements) <= MAX_SAOP_ARRAY_SIZE)
-		{
-			info->startup_fn = arrayexpr_startup_fn;
-			info->next_fn = arrayexpr_next_fn;
-			info->cleanup_fn = arrayexpr_cleanup_fn;
-			return saop->useOr ? CLASS_OR : CLASS_AND;
-		}
-	}
+            /* 获取实际的数组值 */
+            arrayval = DatumGetArrayTypeP(((Const *) arraynode)->constvalue);
+            /* 计算数组元素数量 */
+            nelems = ArrayGetNItems(ARR_NDIM(arrayval), ARR_DIMS(arrayval));
+            /* 检查元素数量是否在允许的最大范围内 */
+            if (nelems <= MAX_SAOP_ARRAY_SIZE)
+            {
+                /* 设置用于迭代常量数组的函数 */
+                info->startup_fn = arrayconst_startup_fn;
+                info->next_fn = arrayconst_next_fn;
+                info->cleanup_fn = arrayconst_cleanup_fn;
+                /* 根据表达式的useOr标志决定是AND还是OR组合 */
+                return saop->useOr ? CLASS_OR : CLASS_AND;
+            }
+        }
+        /* 情况2：数组是一个非多维ArrayExpr且元素数量在限制范围内 */
+        else if (arraynode && IsA(arraynode, ArrayExpr) &&
+                 !((ArrayExpr *) arraynode)->multidims &&
+                 list_length(((ArrayExpr *) arraynode)->elements) <= MAX_SAOP_ARRAY_SIZE)
+        {
+            /* 设置用于迭代ArrayExpr的函数 */
+            info->startup_fn = arrayexpr_startup_fn;
+            info->next_fn = arrayexpr_next_fn;
+            info->cleanup_fn = arrayexpr_cleanup_fn;
+            /* 根据表达式的useOr标志决定是AND还是OR组合 */
+            return saop->useOr ? CLASS_OR : CLASS_AND;
+        }
+    }
 
-	/* None of the above, so it's an atom */
-	return CLASS_ATOM;
+    /* 不属于上述任何类型，因此是原子表达式 */
+    return CLASS_ATOM;
 }
+
 
 /*
  * PredIterInfo routines for iterating over regular Lists.  The iteration

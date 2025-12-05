@@ -344,9 +344,9 @@ bms_is_subset(const Bitmapset *a, const Bitmapset *b)
 }
 
 /*
- * bms_subset_compare - compare A and B for equality/subset relationships
+ * bms_subset_compare - 比较 A 和 B 的相等/子集关系
  *
- * This is more efficient than testing bms_is_subset in both directions.
+ * 比分别调用 bms_is_subset 更高效。
  */
 BMS_Comparison
 bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
@@ -356,7 +356,7 @@ bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
 	int			longlen;
 	int			i;
 
-	/* Handle cases where either input is NULL */
+	/* 处理任一输入为 NULL 的情况 */
 	if (a == NULL)
 	{
 		if (b == NULL)
@@ -365,8 +365,9 @@ bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
 	}
 	if (b == NULL)
 		return bms_is_empty(a) ? BMS_EQUAL : BMS_SUBSET2;
-	/* Check common words */
-	result = BMS_EQUAL;			/* status so far */
+
+	/* 检查共有的 word 部分 */
+	result = BMS_EQUAL;			/* 当前状态 */
 	shortlen = Min(a->nwords, b->nwords);
 	for (i = 0; i < shortlen; i++)
 	{
@@ -375,20 +376,20 @@ bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
 
 		if ((aword & ~bword) != 0)
 		{
-			/* a is not a subset of b */
+			/* a 不是 b 的子集 */
 			if (result == BMS_SUBSET1)
 				return BMS_DIFFERENT;
 			result = BMS_SUBSET2;
 		}
 		if ((bword & ~aword) != 0)
 		{
-			/* b is not a subset of a */
+			/* b 不是 a 的子集 */
 			if (result == BMS_SUBSET2)
 				return BMS_DIFFERENT;
 			result = BMS_SUBSET1;
 		}
 	}
-	/* Check extra words */
+	/* 检查额外的 word 部分 */
 	if (a->nwords > b->nwords)
 	{
 		longlen = a->nwords;
@@ -396,7 +397,7 @@ bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
 		{
 			if (a->words[i] != 0)
 			{
-				/* a is not a subset of b */
+				/* a 不是 b 的子集 */
 				if (result == BMS_SUBSET1)
 					return BMS_DIFFERENT;
 				result = BMS_SUBSET2;
@@ -410,7 +411,7 @@ bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
 		{
 			if (b->words[i] != 0)
 			{
-				/* b is not a subset of a */
+				/* b 不是 a 的子集 */
 				if (result == BMS_SUBSET2)
 					return BMS_DIFFERENT;
 				result = BMS_SUBSET1;

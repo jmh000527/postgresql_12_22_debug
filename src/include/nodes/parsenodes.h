@@ -1560,40 +1560,38 @@ typedef struct SelectStmt
 
 
 /* ----------------------
- *		Set Operation node for post-analysis query trees
+ *      Set Operation node for post-analysis query trees
+ *      集合操作节点，用于解析分析后的查询树
  *
- * After parse analysis, a SELECT with set operations is represented by a
- * top-level Query node containing the leaf SELECTs as subqueries in its
- * range table.  Its setOperations field shows the tree of set operations,
- * with leaf SelectStmt nodes replaced by RangeTblRef nodes, and internal
- * nodes replaced by SetOperationStmt nodes.  Information about the output
- * column types is added, too.  (Note that the child nodes do not necessarily
- * produce these types directly, but we've checked that their output types
- * can be coerced to the output column type.)  Also, if it's not UNION ALL,
- * information about the types' sort/group semantics is provided in the form
- * of a SortGroupClause list (same representation as, eg, DISTINCT).
- * The resolved common column collations are provided too; but note that if
- * it's not UNION ALL, it's okay for a column to not have a common collation,
- * so a member of the colCollations list could be InvalidOid even though the
- * column has a collatable type.
+ * 解析分析后，带有集合操作的SELECT由一个顶级Query节点表示，该节点在其
+ * range table中包含作为子查询的叶SELECT语句。它的setOperations字段显示
+ * 集合操作的树状结构，其中叶节点SelectStmt被替换为RangeTblRef节点，
+ * 内部节点被替换为SetOperationStmt节点。输出列类型的信息也被添加。
+ * （注意：子节点不一定直接产生这些类型，但我们已检查它们的输出类型可以
+ * 强制转换为输出列类型。）此外，如果不是UNION ALL，类型的排序/分组语义
+ * 信息以SortGroupClause列表的形式提供（与DISTINCT等的表示相同）。
+ * 还提供解析后的公共列排序规则；但请注意，如果不是UNION ALL，列可能没有
+ * 公共排序规则，因此即使列具有可排序的类型，colCollations列表的成员也可能是
+ * InvalidOid。
  * ----------------------
  */
 typedef struct SetOperationStmt
 {
-	NodeTag		type;
-	SetOperation op;			/* type of set op */
-	bool		all;			/* ALL specified? */
-	Node	   *larg;			/* left child */
-	Node	   *rarg;			/* right child */
-	/* Eventually add fields for CORRESPONDING spec here */
+    NodeTag     type;               /* 节点类型标记，用于运行时类型识别 */
+    SetOperation op;                /* 集合操作类型（如UNION、INTERSECT、EXCEPT） */
+    bool        all;                /* 是否指定了ALL选项（如UNION ALL） */
+    Node       *larg;               /* 左操作数（左子节点） */
+    Node       *rarg;               /* 右操作数（右子节点） */
+    /* 最终会在此处添加对应CORRESPONDING规范的字段 */
 
-	/* Fields derived during parse analysis: */
-	List	   *colTypes;		/* OID list of output column type OIDs */
-	List	   *colTypmods;		/* integer list of output column typmods */
-	List	   *colCollations;	/* OID list of output column collation OIDs */
-	List	   *groupClauses;	/* a list of SortGroupClause's */
-	/* groupClauses is NIL if UNION ALL, but must be set otherwise */
+    /* 在解析分析过程中派生的字段： */
+    List       *colTypes;           /* 输出列类型OID的列表 */
+    List       *colTypmods;         /* 输出列typmods（类型修饰符）的整数列表 */
+    List       *colCollations;      /* 输出列排序规则OID的列表 */
+    List       *groupClauses;       /* SortGroupClause的列表，用于排序和去重 */
+    /* 如果是UNION ALL，groupClauses为NIL，否则必须设置 */
 } SetOperationStmt;
+
 
 
 /*****************************************************************************

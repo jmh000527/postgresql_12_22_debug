@@ -402,75 +402,95 @@ add_placeholders_to_base_rels(PlannerInfo *root)
 }
 
 /*
- * add_placeholders_to_joinrel
- *		Add any required PlaceHolderVars to a join rel's targetlist;
- *		and if they contain lateral references, add those references to the
- *		joinrel's direct_lateral_relids.
+ * add_placeholders_to_joinrel - 将必要的占位符变量添加到连接关系的目标列表中
  *
- * A join rel should emit a PlaceHolderVar if (a) the PHV can be computed
- * at or below this join level and (b) the PHV is needed above this level.
- * However, condition (a) is sufficient to add to direct_lateral_relids,
- * as explained below.
+ * 该函数负责处理连接关系中的占位符变量(PlaceHolderVars)，确保在适当的位置计算和输出这些变量，
+ * 并正确处理其中包含的横向引用(LATERAL references)。
+ *
+ * 参数说明:
+ * - root: 查询优化器的全局信息结构
+ * - joinrel: 目标连接关系的优化信息结构
+ * - outer_rel: 外部关系的优化信息结构
+ * - inner_rel: 内部关系的优化信息结构
+ *
+ * 返回值:
+ * - void: 无返回值
+ *
+ * 工作原理:
+ * 1. 遍历全局占位符列表，检查每个占位符是否应在当前连接级别计算
+ * 2. 对于可在当前级别计算且在更高级别需要的占位符，将其添加到目标列表中
+ * 3. 计算占位符表达式的成本并累加到连接关系的成本中
+ * 4. 处理占位符中的横向引用，更新连接关系的直接横向依赖关系
+ *
+ * 关键概念:
+ * - PlaceHolderVar(PHV): 占位符变量，用于延迟计算复杂表达式
+ * - LATERAL引用: 允许子查询引用外层查询中的表
+ * - direct_lateral_relids: 直接横向依赖的关系ID集合
+ *
+ * 条件判断:
+ * 连接关系应输出占位符变量当且仅当：
+ * (a) 占位符可以在当前或更低连接级别计算
+ * (b) 占位符在当前级别之上仍有需求
+ * 但条件(a)足以添加到direct_lateral_relids中
  */
 void
 add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 							RelOptInfo *outer_rel, RelOptInfo *inner_rel)
 {
-	Relids		relids = joinrel->relids;
-	ListCell   *lc;
+	Relids		relids = joinrel->relids;  /* 当前连接关系的关系ID集合 */
+	ListCell   *lc;                        /* 列表遍历指针 */
 
+	/* 遍历全局占位符列表中的每个占位符 */
 	foreach(lc, root->placeholder_list)
 	{
 		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
 
-		/* Is it computable here? */
+		/* 检查该占位符是否可以在当前连接级别计算 */
 		if (bms_is_subset(phinfo->ph_eval_at, relids))
 		{
-			/* Is it still needed above this joinrel? */
+			/* 检查该占位符在当前连接级别之上是否仍然需要 */
 			if (bms_nonempty_difference(phinfo->ph_needed, relids))
 			{
-				/* Yup, add it to the output */
+				/* 是的，将其添加到输出目标列表中 */
 				joinrel->reltarget->exprs = lappend(joinrel->reltarget->exprs,
 													phinfo->ph_var);
 				joinrel->reltarget->width += phinfo->ph_width;
 
 				/*
-				 * Charge the cost of evaluating the contained expression if
-				 * the PHV can be computed here but not in either input.  This
-				 * is a bit bogus because we make the decision based on the
-				 * first pair of possible input relations considered for the
-				 * joinrel.  With other pairs, it might be possible to compute
-				 * the PHV in one input or the other, and then we'd be double
-				 * charging the PHV's cost for some join paths.  For now, live
-				 * with that; but we might want to improve it later by
-				 * refiguring the reltarget costs for each pair of inputs.
+				 * 如果占位符可以在当前级别计算但不能在任一输入关系中计算，
+				 * 则计入计算其所包含表达式的成本。
+				 * 
+				 * 这个判断有些简化，因为我们基于第一对考虑的输入关系来做决定。
+				 * 对于其他输入对，可能可以在某个输入中计算占位符，
+				 * 这样就会对某些连接路径重复计算占位符的成本。
+				 * 目前暂且接受这种情况；但后续可以通过为每对输入重新计算reltarget成本来改进。
 				 */
 				if (!bms_is_subset(phinfo->ph_eval_at, outer_rel->relids) &&
 					!bms_is_subset(phinfo->ph_eval_at, inner_rel->relids))
 				{
-					QualCost	cost;
+					QualCost	cost;  /* 成本计算结构 */
 
+					/* 计算占位符表达式的成本 */
 					cost_qual_eval_node(&cost, (Node *) phinfo->ph_var->phexpr,
 										root);
+					/* 累加启动成本 */
 					joinrel->reltarget->cost.startup += cost.startup;
+					/* 累加每元组处理成本 */
 					joinrel->reltarget->cost.per_tuple += cost.per_tuple;
 				}
 			}
 
 			/*
-			 * Also adjust joinrel's direct_lateral_relids to include the
-			 * PHV's source rel(s).  We must do this even if we're not
-			 * actually going to emit the PHV, otherwise join_is_legal() will
-			 * reject valid join orderings.  (In principle maybe we could
-			 * instead remove the joinrel's lateral_relids dependency; but
-			 * that's complicated to get right, and cases where we're not
-			 * going to emit the PHV are too rare to justify the work.)
+			 * 同时调整连接关系的direct_lateral_relids，包含占位符的源关系。
+			 * 即使我们实际上不输出该占位符，也必须这样做，
+			 * 否则join_is_legal()会拒绝有效的连接顺序。
+			 * (理论上也许我们可以移除连接关系的lateral_relids依赖；
+			 * 但这很难正确实现，而且我们不输出占位符的情况太少见，
+			 * 不值得为此做额外工作。)
 			 *
-			 * In principle we should only do this if the join doesn't yet
-			 * include the PHV's source rel(s).  But our caller
-			 * build_join_rel() will clean things up by removing the join's
-			 * own relids from its direct_lateral_relids, so we needn't
-			 * account for that here.
+			 * 理论上我们应该只在连接尚未包含占位符的源关系时才这样做。
+			 * 但我们的调用者build_join_rel()会通过从direct_lateral_relids中
+			 * 移除连接自身的关系ID来清理，所以我们这里不需要考虑这一点。
 			 */
 			joinrel->direct_lateral_relids =
 				bms_add_members(joinrel->direct_lateral_relids,
