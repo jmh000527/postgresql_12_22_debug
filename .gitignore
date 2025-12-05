@@ -43,3 +43,7 @@ lib*.pc
 /Release/
 /tmp_install/
 /portlock/
+conftest.c
+conftest.err
+confdefs.h
+conftest

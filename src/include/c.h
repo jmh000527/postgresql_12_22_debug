@@ -970,18 +970,15 @@ extern void ExceptionalCondition(const char *conditionName,
 
 /*
  * MemSet
- *	Exactly the same as standard library function memset(), but considerably
- *	faster for zeroing small word-aligned structures (such as parsetree nodes).
- *	This has to be a macro because the main point is to avoid function-call
- *	overhead.   However, we have also found that the loop is faster than
- *	native libc memset() on some platforms, even those with assembler
- *	memset() functions.  More research needs to be done, perhaps with
- *	MEMSET_LOOP_LIMIT tests in configure.
+ *	与标准库函数 memset() 完全相同，但在清零小型按字对齐的结构体（如 parsetree 节点）时速度更快。
+ *	必须定义为宏，主要目的是避免函数调用开销。
+ *	此外，在某些平台上，即使有汇编实现的 memset()，该循环也比原生 libc memset() 更快。
+ *	更多的研究需要进行，或许可以在 configure 中测试 MEMSET_LOOP_LIMIT。
  */
 #define MemSet(start, val, len) \
 	do \
 	{ \
-		/* must be void* because we don't know if it is integer aligned yet */ \
+		/* 必须为 void*，因为我们还不知道是否整数对齐 */ \
 		void   *_vstart = (void *) (start); \
 		int		_val = (val); \
 		Size	_len = (len); \
@@ -991,8 +988,7 @@ extern void ExceptionalCondition(const char *conditionName,
 			_val == 0 && \
 			_len <= MEMSET_LOOP_LIMIT && \
 			/* \
-			 *	If MEMSET_LOOP_LIMIT == 0, optimizer should find \
-			 *	the whole "if" false at compile time. \
+			 *	如果 MEMSET_LOOP_LIMIT == 0，优化器应在编译时判定整个 if 为假。 \
 			 */ \
 			MEMSET_LOOP_LIMIT != 0) \
 		{ \

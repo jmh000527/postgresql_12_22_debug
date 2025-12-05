@@ -43,11 +43,10 @@
 #define FUNC_MAX_ARGS		100
 
 /*
- * Maximum number of columns in an index.  There is little point in making
- * this anything but a multiple of 32, because the main cost is associated
- * with index tuple header size (see access/itup.h).
+ * 索引中最多允许的列数。设置为32的倍数意义更大，
+ * 因为主要开销与索引元组头大小有关（见 access/itup.h）。
  *
- * Changing this requires an initdb.
+ * 修改此值需要重新初始化数据库（initdb）。
  */
 #define INDEX_MAX_KEYS		32
 

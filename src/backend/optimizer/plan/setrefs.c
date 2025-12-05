@@ -440,248 +440,294 @@ add_rte_to_flat_rtable(PlannerGlobal *glob, RangeTblEntry *rte)
 }
 
 /*
- * set_plan_refs: recurse through the Plan nodes of a single subquery level
+ * set_plan_refs: 递归处理单个子查询级别的Plan节点
+ *
+ * 参数：
+ *   root - 规划器全局信息指针，包含查询的所有上下文信息
+ *   plan - 需要处理的计划节点指针
+ *   rtoffset - 关系表编号偏移量，用于调整Var节点中的关系引用
+ *
+ * 返回值：
+ *   返回处理后的计划节点指针
+ *
+ * 功能：
+ *   该函数是查询优化器中的关键组件，负责为执行计划中的节点设置正确的引用关系，
+ *   特别是调整Var节点中的关系编号，确保在查询执行时能正确引用到对应的表和列。
+ *   函数通过递归方式处理整个计划树，并根据不同的节点类型采用不同的处理策略。
  */
 static Plan *
 set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 {
 	ListCell   *l;
 
+	/* 处理空计划节点情况 */
 	if (plan == NULL)
 		return NULL;
 
-	/* Assign this node a unique ID. */
+	/* 为该计划节点分配唯一ID */
 	plan->plan_node_id = root->glob->lastPlanNodeId++;
 
 	/*
-	 * Plan-type-specific fixes
+	 * 根据不同的计划节点类型执行特定的修复操作
 	 */
 	switch (nodeTag(plan))
 	{
-		case T_SeqScan:
+		case T_SeqScan: /* 顺序扫描节点处理 */
 			{
 				SeqScan    *splan = (SeqScan *) plan;
 
+				/* 调整扫描关系编号，应用偏移量 */
 				splan->scanrelid += rtoffset;
-				splan->plan.targetlist =
+				/* 修复目标列列表中的引用 */
+				splan->plan.targetlist = 
 					fix_scan_list(root, splan->plan.targetlist, rtoffset);
-				splan->plan.qual =
+				/* 修复过滤条件中的引用 */
+				splan->plan.qual = 
 					fix_scan_list(root, splan->plan.qual, rtoffset);
 			}
 			break;
-		case T_SampleScan:
+		case T_SampleScan: /* 表采样扫描节点处理 */
 			{
 				SampleScan *splan = (SampleScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
+				/* 修复表采样子句 */
 				splan->tablesample = (TableSampleClause *)
 					fix_scan_expr(root, (Node *) splan->tablesample, rtoffset);
 			}
 			break;
-		case T_IndexScan:
+		case T_IndexScan: /* 索引扫描节点处理 */
 			{
 				IndexScan  *splan = (IndexScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
-				splan->indexqual =
+				/* 修复索引条件相关表达式 */
+				splan->indexqual = 
 					fix_scan_list(root, splan->indexqual, rtoffset);
-				splan->indexqualorig =
+				splan->indexqualorig = 
 					fix_scan_list(root, splan->indexqualorig, rtoffset);
-				splan->indexorderby =
+				splan->indexorderby = 
 					fix_scan_list(root, splan->indexorderby, rtoffset);
-				splan->indexorderbyorig =
+				splan->indexorderbyorig = 
 					fix_scan_list(root, splan->indexorderbyorig, rtoffset);
 			}
 			break;
-		case T_IndexOnlyScan:
+		case T_IndexOnlyScan: /* 仅索引扫描节点处理 */
 			{
 				IndexOnlyScan *splan = (IndexOnlyScan *) plan;
 
+				/* 使用专门的函数处理仅索引扫描 */
 				return set_indexonlyscan_references(root, splan, rtoffset);
 			}
 			break;
-		case T_BitmapIndexScan:
+		case T_BitmapIndexScan: /* 位图索引扫描节点处理 */
 			{
 				BitmapIndexScan *splan = (BitmapIndexScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				/* no need to fix targetlist and qual */
+				/* 位图索引扫描不应该有目标列和过滤条件 */
 				Assert(splan->scan.plan.targetlist == NIL);
 				Assert(splan->scan.plan.qual == NIL);
-				splan->indexqual =
+				/* 修复索引条件 */
+				splan->indexqual = 
 					fix_scan_list(root, splan->indexqual, rtoffset);
-				splan->indexqualorig =
+				splan->indexqualorig = 
 					fix_scan_list(root, splan->indexqualorig, rtoffset);
 			}
 			break;
-		case T_BitmapHeapScan:
+		case T_BitmapHeapScan: /* 位图堆扫描节点处理 */
 			{
 				BitmapHeapScan *splan = (BitmapHeapScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
-				splan->bitmapqualorig =
+				/* 修复位图条件 */
+				splan->bitmapqualorig = 
 					fix_scan_list(root, splan->bitmapqualorig, rtoffset);
 			}
 			break;
-		case T_TidScan:
+		case T_TidScan: /* TID扫描节点处理 */
 			{
 				TidScan    *splan = (TidScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
-				splan->tidquals =
+				/* 修复TID条件 */
+				splan->tidquals = 
 					fix_scan_list(root, splan->tidquals, rtoffset);
 			}
 			break;
-		case T_SubqueryScan:
-			/* Needs special treatment, see comments below */
-			return set_subqueryscan_references(root,
-											   (SubqueryScan *) plan,
-											   rtoffset);
-		case T_FunctionScan:
+		case T_SubqueryScan: /* 子查询扫描节点处理 */
+			/* 需要特殊处理，见相关函数注释 */
+			return set_subqueryscan_references(root, 
+									  (SubqueryScan *) plan, 
+									  rtoffset);
+		case T_FunctionScan: /* 函数扫描节点处理 */
 			{
 				FunctionScan *splan = (FunctionScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
-				splan->functions =
+				/* 修复函数表达式列表 */
+				splan->functions = 
 					fix_scan_list(root, splan->functions, rtoffset);
 			}
 			break;
-		case T_TableFuncScan:
+		case T_TableFuncScan: /* 表函数扫描节点处理 */
 			{
 				TableFuncScan *splan = (TableFuncScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
+				/* 修复表函数表达式 */
 				splan->tablefunc = (TableFunc *)
 					fix_scan_expr(root, (Node *) splan->tablefunc, rtoffset);
 			}
 			break;
-		case T_ValuesScan:
+		case T_ValuesScan: /* 值扫描节点处理 */
 			{
 				ValuesScan *splan = (ValuesScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
-				splan->values_lists =
+				/* 修复值列表 */
+				splan->values_lists = 
 					fix_scan_list(root, splan->values_lists, rtoffset);
 			}
 			break;
-		case T_CteScan:
+		case T_CteScan: /* CTE扫描节点处理 */
 			{
 				CteScan    *splan = (CteScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
 			}
 			break;
-		case T_NamedTuplestoreScan:
+		case T_NamedTuplestoreScan: /* 命名元组存储扫描节点处理 */
 			{
 				NamedTuplestoreScan *splan = (NamedTuplestoreScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
 			}
 			break;
-		case T_WorkTableScan:
+		case T_WorkTableScan: /* 工作表扫描节点处理 */
 			{
 				WorkTableScan *splan = (WorkTableScan *) plan;
 
+				/* 调整扫描关系编号 */
 				splan->scan.scanrelid += rtoffset;
-				splan->scan.plan.targetlist =
+				/* 修复目标列和过滤条件 */
+				splan->scan.plan.targetlist = 
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-				splan->scan.plan.qual =
+				splan->scan.plan.qual = 
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
 			}
 			break;
-		case T_ForeignScan:
+		case T_ForeignScan: /* 外部表扫描节点处理 */
 			set_foreignscan_references(root, (ForeignScan *) plan, rtoffset);
 			break;
-		case T_CustomScan:
+		case T_CustomScan: /* 自定义扫描节点处理 */
 			set_customscan_references(root, (CustomScan *) plan, rtoffset);
 			break;
 
 		case T_NestLoop:
 		case T_MergeJoin:
-		case T_HashJoin:
+		case T_HashJoin: /* 连接节点处理 */
 			set_join_references(root, (Join *) plan, rtoffset);
 			break;
 
 		case T_Gather:
-		case T_GatherMerge:
+		case T_GatherMerge: /* 并行执行节点处理 */
 			{
+				/* 设置上层节点引用 */
 				set_upper_references(root, plan, rtoffset);
+				/* 设置参数引用 */
 				set_param_references(root, plan);
 			}
 			break;
 
-		case T_Hash:
+		case T_Hash: /* 哈希节点处理 */
 			set_hash_references(root, plan, rtoffset);
 			break;
 
-		case T_Material:
-		case T_Sort:
-		case T_Unique:
-		case T_SetOp:
+		case T_Material: /* 物化节点处理 */
+		case T_Sort: /* 排序节点处理 */
+		case T_Unique: /* 去重节点处理 */
+		case T_SetOp: /* 集合操作节点处理 */
 
 			/*
-			 * These plan types don't actually bother to evaluate their
-			 * targetlists, because they just return their unmodified input
-			 * tuples.  Even though the targetlist won't be used by the
-			 * executor, we fix it up for possible use by EXPLAIN (not to
-			 * mention ease of debugging --- wrong varnos are very confusing).
+			 * 这些计划类型实际上不会计算它们的目标列列表，因为它们只是返回未修改的输入元组。
+			 * 即使目标列列表不会被执行器使用，我们也会修复它以供EXPLAIN使用
+			 * （更不用说调试的便利性 - 错误的varnos非常令人困惑）。
 			 */
 			set_dummy_tlist_references(plan, rtoffset);
 
 			/*
-			 * Since these plan types don't check quals either, we should not
-			 * find any qual expression attached to them.
+			 * 由于这些计划类型也不检查条件，所以不应该有任何条件表达式附加到它们。
 			 */
 			Assert(plan->qual == NIL);
 			break;
-		case T_LockRows:
+		case T_LockRows: /* 行锁节点处理 */
 			{
 				LockRows   *splan = (LockRows *) plan;
 
 				/*
-				 * Like the plan types above, LockRows doesn't evaluate its
-				 * tlist or quals.  But we have to fix up the RT indexes in
-				 * its rowmarks.
+				 * 与上面的计划类型类似，LockRows不计算其目标列或条件。
+				 * 但我们必须修复其行标记中的RT索引。
 				 */
 				set_dummy_tlist_references(plan, rtoffset);
 				Assert(splan->plan.qual == NIL);
 
+				/* 修复行标记中的关系索引 */
 				foreach(l, splan->rowMarks)
 				{
 					PlanRowMark *rc = (PlanRowMark *) lfirst(l);
@@ -691,103 +737,105 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				}
 			}
 			break;
-		case T_Limit:
+		case T_Limit: /* 限制节点处理 */
 			{
 				Limit	   *splan = (Limit *) plan;
 
 				/*
-				 * Like the plan types above, Limit doesn't evaluate its tlist
-				 * or quals.  It does have live expressions for limit/offset,
-				 * however; and those cannot contain subplan variable refs, so
-				 * fix_scan_expr works for them.
+				 * 与上面的计划类型类似，Limit不计算其目标列或条件。
+				 * 但是它确实有用于limit/offset的实际表达式；并且这些表达式不能包含子计划变量引用，
+				 * 所以fix_scan_expr适用于它们。
 				 */
 				set_dummy_tlist_references(plan, rtoffset);
 				Assert(splan->plan.qual == NIL);
 
-				splan->limitOffset =
+				/* 修复limit和offset表达式 */
+				splan->limitOffset = 
 					fix_scan_expr(root, splan->limitOffset, rtoffset);
-				splan->limitCount =
+				splan->limitCount = 
 					fix_scan_expr(root, splan->limitCount, rtoffset);
 			}
 			break;
-		case T_Agg:
+		case T_Agg: /* 聚合节点处理 */
 			{
 				Agg		   *agg = (Agg *) plan;
 
 				/*
-				 * If this node is combining partial-aggregation results, we
-				 * must convert its Aggrefs to contain references to the
-				 * partial-aggregate subexpressions that will be available
-				 * from the child plan node.
+				 * 如果此节点正在合并 Partial Aggregate 结果，我们必须转换其Aggrefs以包含对
+				 * 将从子计划节点获得的部分聚合子表达式的引用。
 				 */
 				if (DO_AGGSPLIT_COMBINE(agg->aggsplit))
 				{
 					plan->targetlist = (List *)
 						convert_combining_aggrefs((Node *) plan->targetlist,
-												  NULL);
+										NULL);
 					plan->qual = (List *)
 						convert_combining_aggrefs((Node *) plan->qual,
-												  NULL);
+										NULL);
 				}
 
+				/* 设置上层节点引用 */
 				set_upper_references(root, plan, rtoffset);
 			}
 			break;
-		case T_Group:
+		case T_Group: /* 分组节点处理 */
 			set_upper_references(root, plan, rtoffset);
 			break;
-		case T_WindowAgg:
+		case T_WindowAgg: /* 窗口聚合节点处理 */
 			{
 				WindowAgg  *wplan = (WindowAgg *) plan;
 
+				/* 设置上层节点引用 */
 				set_upper_references(root, plan, rtoffset);
 
 				/*
-				 * Like Limit node limit/offset expressions, WindowAgg has
-				 * frame offset expressions, which cannot contain subplan
-				 * variable refs, so fix_scan_expr works for them.
+				 * 类似于Limit节点的limit/offset表达式，WindowAgg有框架偏移表达式，
+				 * 这些表达式不能包含子计划变量引用，所以fix_scan_expr适用于它们。
 				 */
-				wplan->startOffset =
+				wplan->startOffset = 
 					fix_scan_expr(root, wplan->startOffset, rtoffset);
-				wplan->endOffset =
+				wplan->endOffset = 
 					fix_scan_expr(root, wplan->endOffset, rtoffset);
 			}
 			break;
-		case T_Result:
+		case T_Result: /* 结果节点处理 */
 			{
 				Result	   *splan = (Result *) plan;
 
 				/*
-				 * Result may or may not have a subplan; if not, it's more
-				 * like a scan node than an upper node.
+				 * Result节点可能有也可能没有子计划；如果没有，则更像是扫描节点而不是上层节点。
 				 */
 				if (splan->plan.lefttree != NULL)
 					set_upper_references(root, plan, rtoffset);
 				else
 				{
-					splan->plan.targetlist =
+					/* 没有子计划时，修复目标列和条件 */
+					splan->plan.targetlist = 
 						fix_scan_list(root, splan->plan.targetlist, rtoffset);
-					splan->plan.qual =
+					splan->plan.qual = 
 						fix_scan_list(root, splan->plan.qual, rtoffset);
 				}
-				/* resconstantqual can't contain any subplan variable refs */
-				splan->resconstantqual =
+				/* resconstantqual不能包含任何子计划变量引用 */
+				splan->resconstantqual = 
 					fix_scan_expr(root, splan->resconstantqual, rtoffset);
 			}
 			break;
-		case T_ProjectSet:
+		case T_ProjectSet: /* 投影集节点处理 */
 			set_upper_references(root, plan, rtoffset);
 			break;
-		case T_ModifyTable:
+		case T_ModifyTable: /* 修改表节点处理 */
 			{
 				ModifyTable *splan = (ModifyTable *) plan;
 
+				/* 修改表节点不应该有目标列和条件 */
 				Assert(splan->plan.targetlist == NIL);
 				Assert(splan->plan.qual == NIL);
 
-				splan->withCheckOptionLists =
+				/* 修复CHECK OPTION条件列表 */
+				splan->withCheckOptionLists = 
 					fix_scan_list(root, splan->withCheckOptionLists, rtoffset);
 
+				/* 处理RETURNING子句 */
 				if (splan->returningLists)
 				{
 					List	   *newRL = NIL;
@@ -796,46 +844,40 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 							   *lcp;
 
 					/*
-					 * Pass each per-subplan returningList through
-					 * set_returning_clause_references().
+					 * 为每个子计划的returningList调用set_returning_clause_references()
 					 */
 					Assert(list_length(splan->returningLists) == list_length(splan->resultRelations));
 					Assert(list_length(splan->returningLists) == list_length(splan->plans));
+					/* 同时遍历三个列表：returningLists、resultRelations和plans */
 					forthree(lcrl, splan->returningLists,
-							 lcrr, splan->resultRelations,
-							 lcp, splan->plans)
+						 lcrr, splan->resultRelations,
+						 lcp, splan->plans)
 					{
 						List	   *rlist = (List *) lfirst(lcrl);
 						Index		resultrel = lfirst_int(lcrr);
 						Plan	   *subplan = (Plan *) lfirst(lcp);
 
 						rlist = set_returning_clause_references(root,
-																rlist,
-																subplan,
-																resultrel,
-																rtoffset);
+											 rlist,
+											 subplan,
+											 resultrel,
+											 rtoffset);
 						newRL = lappend(newRL, rlist);
 					}
 					splan->returningLists = newRL;
 
 					/*
-					 * Set up the visible plan targetlist as being the same as
-					 * the first RETURNING list. This is for the use of
-					 * EXPLAIN; the executor won't pay any attention to the
-					 * targetlist.  We postpone this step until here so that
-					 * we don't have to do set_returning_clause_references()
-					 * twice on identical targetlists.
+					 * 将可见的计划目标列列表设置为与第一个RETURNING列表相同。
+					 * 这是供EXPLAIN使用的；执行器不会关注目标列列表。
+					 * 我们将此步骤推迟到这里，以便不必对相同的目标列列表执行两次set_returning_clause_references()
 					 */
 					splan->plan.targetlist = copyObject(linitial(newRL));
 				}
 
 				/*
-				 * We treat ModifyTable with ON CONFLICT as a form of 'pseudo
-				 * join', where the inner side is the EXCLUDED tuple.
-				 * Therefore use fix_join_expr to setup the relevant variables
-				 * to INNER_VAR. We explicitly don't create any OUTER_VARs as
-				 * those are already used by RETURNING and it seems better to
-				 * be non-conflicting.
+				 * 我们将带有ON CONFLICT的ModifyTable视为一种'伪连接'，其中内部是EXCLUDED元组。
+				 * 因此，使用fix_join_expr将相关变量设置为INNER_VAR。
+				 * 我们明确不创建任何OUTER_VAR，因为它们已经被RETURNING使用，避免冲突更好。
 				 */
 				if (splan->onConflictSet)
 				{
@@ -843,33 +885,36 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 
 					itlist = build_tlist_index(splan->exclRelTlist);
 
-					splan->onConflictSet =
+					splan->onConflictSet = 
 						fix_join_expr(root, splan->onConflictSet,
-									  NULL, itlist,
-									  linitial_int(splan->resultRelations),
-									  rtoffset);
+							   NULL, itlist,
+							   linitial_int(splan->resultRelations),
+							   rtoffset);
 
 					splan->onConflictWhere = (Node *)
 						fix_join_expr(root, (List *) splan->onConflictWhere,
-									  NULL, itlist,
-									  linitial_int(splan->resultRelations),
-									  rtoffset);
+							   NULL, itlist,
+							   linitial_int(splan->resultRelations),
+							   rtoffset);
 
 					pfree(itlist);
 
-					splan->exclRelTlist =
+					splan->exclRelTlist = 
 						fix_scan_list(root, splan->exclRelTlist, rtoffset);
 				}
 
+				/* 调整各种关系引用 */
 				splan->nominalRelation += rtoffset;
 				if (splan->rootRelation)
 					splan->rootRelation += rtoffset;
 				splan->exclRelRTI += rtoffset;
 
+				/* 调整结果关系索引列表 */
 				foreach(l, splan->resultRelations)
 				{
 					lfirst_int(l) += rtoffset;
 				}
+				/* 调整行标记中的关系索引 */
 				foreach(l, splan->rowMarks)
 				{
 					PlanRowMark *rc = (PlanRowMark *) lfirst(l);
@@ -877,103 +922,104 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					rc->rti += rtoffset;
 					rc->prti += rtoffset;
 				}
+				/* 递归处理子计划 */
 				foreach(l, splan->plans)
 				{
 					lfirst(l) = set_plan_refs(root,
-											  (Plan *) lfirst(l),
-											  rtoffset);
+							   (Plan *) lfirst(l),
+							   rtoffset);
 				}
 
 				/*
-				 * Append this ModifyTable node's final result relation RT
-				 * index(es) to the global list for the plan, and set its
-				 * resultRelIndex to reflect their starting position in the
-				 * global list.
+				 * 将此ModifyTable节点的最终结果关系RT索引附加到计划的全局列表中，
+				 * 并设置其resultRelIndex以反映它们在全局列表中的起始位置。
 				 */
 				splan->resultRelIndex = list_length(root->glob->resultRelations);
-				root->glob->resultRelations =
+				root->glob->resultRelations = 
 					list_concat(root->glob->resultRelations,
-								list_copy(splan->resultRelations));
+						   list_copy(splan->resultRelations));
 
 				/*
-				 * If the main target relation is a partitioned table, also
-				 * add the partition root's RT index to rootResultRelations,
-				 * and remember its index in that list in rootResultRelIndex.
+				 * 如果主目标关系是分区表，还将分区根的RT索引添加到rootResultRelations，
+				 * 并在该列表中记住其索引在rootResultRelIndex中。
 				 */
 				if (splan->rootRelation)
 				{
-					splan->rootResultRelIndex =
+					splan->rootResultRelIndex = 
 						list_length(root->glob->rootResultRelations);
-					root->glob->rootResultRelations =
+					root->glob->rootResultRelations = 
 						lappend_int(root->glob->rootResultRelations,
-									splan->rootRelation);
+							   splan->rootRelation);
 				}
 			}
 			break;
-		case T_Append:
-			/* Needs special treatment, see comments below */
+		case T_Append: /* 追加节点处理 */
+			/* 需要特殊处理，见相关函数注释 */
 			return set_append_references(root,
-										 (Append *) plan,
-										 rtoffset);
-		case T_MergeAppend:
-			/* Needs special treatment, see comments below */
+							   (Append *) plan,
+							   rtoffset);
+		case T_MergeAppend: /* 合并追加节点处理 */
+			/* 需要特殊处理，见相关函数注释 */
 			return set_mergeappend_references(root,
-											  (MergeAppend *) plan,
-											  rtoffset);
-		case T_RecursiveUnion:
-			/* This doesn't evaluate targetlist or check quals either */
+							      (MergeAppend *) plan,
+							      rtoffset);
+		case T_RecursiveUnion: /* 递归联合节点处理 */
+			/* 这个节点也不计算目标列或检查条件 */
 			set_dummy_tlist_references(plan, rtoffset);
 			Assert(plan->qual == NIL);
 			break;
-		case T_BitmapAnd:
+		case T_BitmapAnd: /* 位图AND节点处理 */
 			{
 				BitmapAnd  *splan = (BitmapAnd *) plan;
 
-				/* BitmapAnd works like Append, but has no tlist */
+				/* BitmapAnd的工作方式类似于Append，但没有目标列列表 */
 				Assert(splan->plan.targetlist == NIL);
 				Assert(splan->plan.qual == NIL);
+				/* 递归处理所有位图子计划 */
 				foreach(l, splan->bitmapplans)
 				{
 					lfirst(l) = set_plan_refs(root,
-											  (Plan *) lfirst(l),
-											  rtoffset);
+							   (Plan *) lfirst(l),
+							   rtoffset);
 				}
 			}
 			break;
-		case T_BitmapOr:
+		case T_BitmapOr: /* 位图OR节点处理 */
 			{
 				BitmapOr   *splan = (BitmapOr *) plan;
 
-				/* BitmapOr works like Append, but has no tlist */
+				/* BitmapOr的工作方式类似于Append，但没有目标列列表 */
 				Assert(splan->plan.targetlist == NIL);
 				Assert(splan->plan.qual == NIL);
+				/* 递归处理所有位图子计划 */
 				foreach(l, splan->bitmapplans)
 				{
 					lfirst(l) = set_plan_refs(root,
-											  (Plan *) lfirst(l),
-											  rtoffset);
+							   (Plan *) lfirst(l),
+							   rtoffset);
 				}
 			}
 			break;
 		default:
+			/* 处理未识别的节点类型 */
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(plan));
 			break;
 	}
 
 	/*
-	 * Now recurse into child plans, if any
+	 * 现在递归处理子计划（如果有）
 	 *
-	 * NOTE: it is essential that we recurse into child plans AFTER we set
-	 * subplan references in this plan's tlist and quals.  If we did the
-	 * reference-adjustments bottom-up, then we would fail to match this
-	 * plan's var nodes against the already-modified nodes of the children.
+	 * 注意：至关重要的是，我们必须在设置此计划的目标列和条件中的子计划引用之后
+	 * 再递归到子计划。如果我们自下而上进行引用调整，那么我们将无法匹配此计划的
+	 * var节点与已修改的子节点。
 	 */
 	plan->lefttree = set_plan_refs(root, plan->lefttree, rtoffset);
 	plan->righttree = set_plan_refs(root, plan->righttree, rtoffset);
 
 	return plan;
 }
+
 
 /*
  * set_indexonlyscan_references
@@ -1645,117 +1691,184 @@ fix_param_node(PlannerInfo *root, Param *p)
 
 /*
  * fix_scan_expr
- *		Do set_plan_references processing on a scan-level expression
+ *    对扫描级别表达式执行set_plan_references处理
  *
- * This consists of incrementing all Vars' varnos by rtoffset,
- * replacing PARAM_MULTIEXPR Params, expanding PlaceHolderVars,
- * replacing Aggref nodes that should be replaced by initplan output Params,
- * looking up operator opcode info for OpExpr and related nodes,
- * and adding OIDs from regclass Const nodes into root->glob->relationOids.
+ * 该函数执行的操作包括：
+ * - 将所有Var节点的varnos（关系编号）增加rtoffset
+ * - 替换PARAM_MULTIEXPR类型的Param参数
+ * - 展开PlaceHolderVars（占位符变量）
+ * - 替换应被initplan输出参数替代的Aggref节点
+ * - 为OpExpr及相关节点查找运算符opcode信息
+ * - 将regclass类型常量节点中的OID添加到root->glob->relationOids中
  */
 static Node *
 fix_scan_expr(PlannerInfo *root, Node *node, int rtoffset)
 {
-	fix_scan_expr_context context;
+    fix_scan_expr_context context; /* 处理上下文，包含必要的参数和状态 */
 
-	context.root = root;
-	context.rtoffset = rtoffset;
+    /* 初始化上下文 */
+    context.root = root;      /* 查询规划器信息 */
+    context.rtoffset = rtoffset; /* 关系编号偏移量 */
 
-	if (rtoffset != 0 ||
-		root->multiexpr_params != NIL ||
-		root->glob->lastPHId != 0 ||
-		root->minmax_aggs != NIL)
-	{
-		return fix_scan_expr_mutator(node, &context);
-	}
-	else
-	{
-		/*
-		 * If rtoffset == 0, we don't need to change any Vars, and if there
-		 * are no MULTIEXPR subqueries then we don't need to replace
-		 * PARAM_MULTIEXPR Params, and if there are no placeholders anywhere
-		 * we won't need to remove them, and if there are no minmax Aggrefs we
-		 * won't need to replace them.  Then it's OK to just scribble on the
-		 * input node tree instead of copying (since the only change, filling
-		 * in any unset opfuncid fields, is harmless).  This saves just enough
-		 * cycles to be noticeable on trivial queries.
-		 */
-		(void) fix_scan_expr_walker(node, &context);
-		return node;
-	}
+    /*
+     * 判断是否需要进行完整的表达式复制和转换
+     * 当以下任一条件满足时需要完整转换：
+     * 1. rtoffset != 0 - 需要调整关系编号
+     * 2. 存在多表达式参数 - 需要替换参数
+     * 3. 存在占位符 - 需要展开占位符
+     * 4. 存在minmax聚合 - 需要替换聚合节点
+     */
+    if (rtoffset != 0 ||
+        root->multiexpr_params != NIL ||
+        root->glob->lastPHId != 0 ||
+        root->minmax_aggs != NIL)
+    {
+        /* 需要完整转换，调用mutator函数创建新的表达式树 */
+        return fix_scan_expr_mutator(node, &context);
+    }
+    else
+    {
+        /*
+         * 优化路径：如果rtoffset == 0，我们不需要更改任何Var节点，
+         * 如果没有MULTIEXPR子查询，则不需要替换PARAM_MULTIEXPR参数，
+         * 如果没有占位符，则不需要移除它们，
+         * 如果没有minmax聚合，则不需要替换它们。
+         * 
+         * 在这种情况下，可以直接在输入节点树上进行修改（因为唯一的更改是
+         * 填充未设置的opfuncid字段，这是无害的）。这可以节省足够的CPU周期，
+         * 在简单查询上效果显著。
+         */
+        (void) fix_scan_expr_walker(node, &context);
+        return node;  /* 直接返回修改后的原节点 */
+    }
 }
 
+
+/*
+ * fix_scan_expr_mutator - 递归处理扫描级别表达式中的节点，修复引用关系
+ * 
+ * 参数：
+ *   node - 待处理的表达式节点
+ *   context - 包含处理上下文信息的结构体，包括root(规划器状态)和rtoffset(关系编号偏移量)
+ * 
+ * 返回值：
+ *   返回处理后的新表达式节点
+ * 
+ * 功能：
+ *   此函数作为mutator函数，在表达式树遍历过程中修复各类节点中的引用关系，
+ *   特别是调整Var节点的关系编号、处理参数和聚合函数引用等
+ */
 static Node *
 fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 {
+	/* 处理NULL节点情况 */
 	if (node == NULL)
 		return NULL;
+	
+	/* 处理Var节点 - 表列引用 */
 	if (IsA(node, Var))
 	{
 		Var		   *var = copyVar((Var *) node);
 
+		/* 断言：扫描级别的变量不应有嵌套层级 */
 		Assert(var->varlevelsup == 0);
 
 		/*
-		 * We should not see any Vars marked INNER_VAR or OUTER_VAR.  But an
-		 * indexqual expression could contain INDEX_VAR Vars.
+		 * 断言：不应该看到标记为INNER_VAR或OUTER_VAR的Var。
+		 * 但索引条件表达式可能包含INDEX_VAR类型的Var。
 		 */
 		Assert(var->varno != INNER_VAR);
 		Assert(var->varno != OUTER_VAR);
+		
+		/* 调整非特殊关系编号，应用偏移量 */
 		if (!IS_SPECIAL_VARNO(var->varno))
 			var->varno += context->rtoffset;
+		/* 同样调整varnoold（原始关系编号） */
 		if (var->varnoold > 0)
 			var->varnoold += context->rtoffset;
 		return (Node *) var;
 	}
+	
+	/* 处理Param节点 - 参数引用 */
 	if (IsA(node, Param))
 		return fix_param_node(context->root, (Param *) node);
+	
+	/* 处理Aggref节点 - 聚合函数引用 */
 	if (IsA(node, Aggref))
 	{
 		Aggref	   *aggref = (Aggref *) node;
 		Param	   *aggparam;
 
-		/* See if the Aggref should be replaced by a Param */
+		/* 检查是否应该用Param替换Aggref（通常用于min/max聚合优化） */
 		aggparam = find_minmax_agg_replacement_param(context->root, aggref);
 		if (aggparam != NULL)
 		{
-			/* Make a copy of the Param for paranoia's sake */
+			/* 安全起见，复制Param节点 */
 			return (Node *) copyObject(aggparam);
 		}
-		/* If no match, just fall through to process it normally */
+		/* 无匹配项时，继续正常处理 */
 	}
+	
+	/* 处理CurrentOfExpr节点 - 当前游标的表达式引用 */
 	if (IsA(node, CurrentOfExpr))
 	{
 		CurrentOfExpr *cexpr = (CurrentOfExpr *) copyObject(node);
 
+		/* 断言：不应引用内部或外部关系 */
 		Assert(cexpr->cvarno != INNER_VAR);
 		Assert(cexpr->cvarno != OUTER_VAR);
+		/* 调整非特殊关系编号 */
 		if (!IS_SPECIAL_VARNO(cexpr->cvarno))
 			cexpr->cvarno += context->rtoffset;
 		return (Node *) cexpr;
 	}
+	
+	/* 处理PlaceHolderVar节点 - 占位变量 */
 	if (IsA(node, PlaceHolderVar))
 	{
-		/* At scan level, we should always just evaluate the contained expr */
+		/* 在扫描级别，我们应该直接评估包含的表达式 */
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
 
+		/* 递归处理占位变量包含的表达式 */
 		return fix_scan_expr_mutator((Node *) phv->phexpr, context);
 	}
+	
+	/* 对所有其他节点类型应用通用修复 */
 	fix_expr_common(context->root, node);
+	/* 递归处理节点的子表达式 */
 	return expression_tree_mutator(node, fix_scan_expr_mutator,
-								   (void *) context);
+					   (void *) context);
 }
 
+/*
+ * fix_scan_expr_walker - 遍历扫描级别表达式，执行原地修改
+ * 
+ * 参数：
+ *   node - 待处理的表达式节点
+ *   context - 包含处理上下文信息的结构体
+ * 
+ * 返回值：
+ *   布尔值，表示是否需要继续遍历
+ * 
+ * 功能：
+ *   作为walker函数，对表达式树执行原地修改操作，
+ *   适用于不需要创建新节点树的场景，主要调用fix_expr_common处理节点
+ */
 static bool
 fix_scan_expr_walker(Node *node, fix_scan_expr_context *context)
 {
+	/* 处理NULL节点情况 */
 	if (node == NULL)
 		return false;
+	/* 断言：此函数不处理PlaceHolderVar节点（由mutator版本特殊处理） */
 	Assert(!IsA(node, PlaceHolderVar));
+	/* 对节点应用通用修复 */
 	fix_expr_common(context->root, node);
+	/* 递归遍历子表达式 */
 	return expression_tree_walker(node, fix_scan_expr_walker,
-								  (void *) context);
+					  (void *) context);
 }
+
 
 /*
  * set_join_references
@@ -1909,58 +2022,86 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
  * needed in the output then we want to reference the subplan tlist element
  * rather than recomputing the expression.
  */
+/*
+ * 更新上层计划节点的目标列表和条件表达式，使其引用左子树子计划返回的元组
+ * 
+ * 此函数在查询优化器的计划生成阶段扮演关键角色，确保计划树中上层节点能够正确引用下层节点的输出
+ * 主要用于处理单输入计划类型，如聚合(Agg)、分组(Group)和结果(Result)节点
+ * 
+ * 参数:
+ *   root - 规划器信息结构
+ *   plan - 需要更新引用的上层计划节点
+ *   rtoffset - 关系表编号偏移量，用于调整Var节点的varno属性
+ */
 static void
 set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset)
 {
-	Plan	   *subplan = plan->lefttree;
-	indexed_tlist *subplan_itlist;
-	List	   *output_targetlist;
-	ListCell   *l;
+	Plan *subplan = plan->lefttree;       /* 获取左子树子计划 */
+	indexed_tlist *subplan_itlist;        /* 子计划目标列表的索引结构 */
+	List *output_targetlist;              /* 构建新的输出目标列表 */
+	ListCell *l;                          /* 列表遍历指针 */
 
+	/* 为子计划的目标列表构建索引数据结构，优化后续查找性能 */
+	/* 这个索引结构包含对Var节点的快速访问以及非Var表达式的信息 */
 	subplan_itlist = build_tlist_index(subplan->targetlist);
 
+	/* 初始化输出目标列表 */
 	output_targetlist = NIL;
+	
+	/* 遍历上层计划节点的目标列表中的每个TargetEntry */
 	foreach(l, plan->targetlist)
 	{
-		TargetEntry *tle = (TargetEntry *) lfirst(l);
-		Node	   *newexpr;
+		TargetEntry *tle = (TargetEntry *) lfirst(l);  /* 当前处理的目标项 */
+		Node *newexpr;                                 /* 处理后的新表达式 */
 
-		/* If it's a sort/group item, first try to match by sortref */
+		/* 如果是排序/分组项，首先尝试通过sortgroupref进行匹配 */
+		/* 这确保在有多个文本相等但易变的排序表达式时，我们选择正确的子计划TLE */
 		if (tle->ressortgroupref != 0)
 		{
+			/* 尝试通过sortgroupref查找匹配的子计划目标项 */
 			newexpr = (Node *)
 				search_indexed_tlist_for_sortgroupref(tle->expr,
-													  tle->ressortgroupref,
-													  subplan_itlist,
-													  OUTER_VAR);
+									   tle->ressortgroupref,
+									   subplan_itlist,
+									   OUTER_VAR);
+			/* 如果未找到匹配项，则使用通用表达式修复函数 */
 			if (!newexpr)
 				newexpr = fix_upper_expr(root,
-										 (Node *) tle->expr,
-										 subplan_itlist,
-										 OUTER_VAR,
-										 rtoffset);
+						  (Node *) tle->expr,
+						  subplan_itlist,
+						  OUTER_VAR,
+						  rtoffset);
 		}
 		else
+			/* 非排序/分组项，直接使用通用表达式修复函数 */
 			newexpr = fix_upper_expr(root,
-									 (Node *) tle->expr,
-									 subplan_itlist,
-									 OUTER_VAR,
-									 rtoffset);
+					  (Node *) tle->expr,
+					  subplan_itlist,
+					  OUTER_VAR,
+					  rtoffset);
+		
+		/* 复制目标项并更新其表达式为修复后的版本 */
 		tle = flatCopyTargetEntry(tle);
 		tle->expr = (Expr *) newexpr;
+		/* 将更新后的目标项添加到输出目标列表 */
 		output_targetlist = lappend(output_targetlist, tle);
 	}
+	
+	/* 用新构建的目标列表替换计划节点的原始目标列表 */
 	plan->targetlist = output_targetlist;
 
+	/* 处理计划节点的过滤条件表达式 */
 	plan->qual = (List *)
 		fix_upper_expr(root,
-					   (Node *) plan->qual,
-					   subplan_itlist,
-					   OUTER_VAR,
-					   rtoffset);
+			  (Node *) plan->qual,
+			  subplan_itlist,
+			  OUTER_VAR,
+			  rtoffset);
 
+	/* 释放临时创建的索引结构 */
 	pfree(subplan_itlist);
 }
+
 
 /*
  * set_param_references
@@ -2024,61 +2165,79 @@ set_param_references(PlannerInfo *root, Plan *plan)
  * so cross-plan-node-level matches will fail.  So this has to happen after
  * the plan node above the Agg has resolved its subplan references.
  */
+/*
+ * 递归扫描表达式树，将聚合引用(Aggrefs)转换为用于组合聚合的适当中间形式
+ * 
+ * 这个函数是PostgreSQL查询优化器中聚合拆分(Aggregation Splitting)功能的关键组件，
+ * 它实现了将单个聚合表达式转换为两个阶段的聚合处理：部分聚合和最终合并。
+ * 
+ * 参数:
+ *   node - 待处理的表达式树节点
+ *   context - 上下文指针(此函数中未使用)
+ * 返回值:
+ *   转换后的表达式节点树
+ */
 static Node *
 convert_combining_aggrefs(Node *node, void *context)
 {
+	/* 处理空节点的边界情况 */
 	if (node == NULL)
 		return NULL;
+	
+	/* 如果节点是聚合引用(Aggref)，则进行转换处理 */
 	if (IsA(node, Aggref))
 	{
-		Aggref	   *orig_agg = (Aggref *) node;
-		Aggref	   *child_agg;
-		Aggref	   *parent_agg;
+		Aggref *orig_agg = (Aggref *) node; /* 原始聚合引用节点 */
+		Aggref *child_agg;  /* 子聚合引用(用于第一阶段部分聚合) */
+		Aggref *parent_agg; /* 父聚合引用(用于第二阶段合并聚合) */
 
-		/* Assert we've not chosen to partial-ize any unsupported cases */
-		Assert(orig_agg->aggorder == NIL);
-		Assert(orig_agg->aggdistinct == NIL);
+		/* 断言确保我们没有选择对不支持的情况进行部分聚合处理 */
+		Assert(orig_agg->aggorder == NIL);    /* 不支持有序聚合 */
+		Assert(orig_agg->aggdistinct == NIL); /* 不支持DISTINCT聚合 */
 
 		/*
-		 * Since aggregate calls can't be nested, we needn't recurse into the
-		 * arguments.  But for safety, flat-copy the Aggref node itself rather
-		 * than modifying it in-place.
+		 * 由于聚合调用不能嵌套，我们不需要递归到参数中。
+		 * 但为安全起见，我们复制Aggref节点本身，而不是就地修改。
 		 */
-		child_agg = makeNode(Aggref);
-		memcpy(child_agg, orig_agg, sizeof(Aggref));
+		child_agg = makeNode(Aggref);          /* 创建新的Aggref节点 */
+		memcpy(child_agg, orig_agg, sizeof(Aggref)); /* 复制原始节点的所有字段 */
 
 		/*
-		 * For the parent Aggref, we want to copy all the fields of the
-		 * original aggregate *except* the args list, which we'll replace
-		 * below, and the aggfilter expression, which should be applied only
-		 * by the child not the parent.  Rather than explicitly knowing about
-		 * all the other fields here, we can momentarily modify child_agg to
-		 * provide a suitable source for copyObject.
+		 * 对于父聚合引用，我们希望复制原始聚合的所有字段，除了:
+		 * 1. 参数列表(args)，将在下面替换
+		 * 2. 聚合过滤器(aggfilter)，应该只由子聚合应用
+		 * 为避免在这里显式了解所有其他字段，我们临时修改child_agg作为copyObject的合适源
 		 */
-		child_agg->args = NIL;
-		child_agg->aggfilter = NULL;
-		parent_agg = copyObject(child_agg);
-		child_agg->args = orig_agg->args;
-		child_agg->aggfilter = orig_agg->aggfilter;
+		child_agg->args = NIL;        /* 临时清空参数列表 */
+		child_agg->aggfilter = NULL;  /* 临时清空聚合过滤器 */
+		parent_agg = copyObject(child_agg); /* 复制修改后的child_agg到parent_agg */
+		child_agg->args = orig_agg->args;        /* 恢复child_agg的原始参数列表 */
+		child_agg->aggfilter = orig_agg->aggfilter; /* 恢复child_agg的原始过滤器 */
 
 		/*
-		 * Now, set up child_agg to represent the first phase of partial
-		 * aggregation.  For now, assume serialization is required.
+		 * 现在，设置child_agg表示部分聚合的第一阶段。
+		 * 对于初始阶段，我们假设需要序列化。
+		 * 这对应于在数据分片上执行的部分聚合操作。
 		 */
 		mark_partial_aggref(child_agg, AGGSPLIT_INITIAL_SERIAL);
 
 		/*
-		 * And set up parent_agg to represent the second phase.
+		 * 设置parent_agg表示第二阶段。
+		 * 父聚合引用的参数列表只包含一个TargetEntry，其表达式为child_agg
+		 * 这将在后续阶段由set_upper_references替换为引用子Agg计划节点输出的Var
 		 */
 		parent_agg->args = list_make1(makeTargetEntry((Expr *) child_agg,
-													  1, NULL, false));
+							  1, NULL, false));
 		mark_partial_aggref(parent_agg, AGGSPLIT_FINAL_DESERIAL);
 
-		return (Node *) parent_agg;
+		return (Node *) parent_agg; /* 返回转换后的父聚合引用节点 */
 	}
+	
+	/* 对于非Aggref节点，递归处理其子节点 */
 	return expression_tree_mutator(node, convert_combining_aggrefs,
-								   (void *) context);
+				   (void *) context);
 }
+
 
 /*
  * set_dummy_tlist_references

@@ -2376,202 +2376,199 @@ add_child_join_rel_equivalences(PlannerInfo *root,
 
 /*
  * generate_implied_equalities_for_column
- *	  Create EC-derived joinclauses usable with a specific column.
+ *      为特定列创建可用于连接的EC派生连接子句，等价类推导连接条件。
  *
- * This is used by indxpath.c to extract potentially indexable joinclauses
- * from ECs, and can be used by foreign data wrappers for similar purposes.
- * We assume that only expressions in Vars of a single table are of interest,
- * but the caller provides a callback function to identify exactly which
- * such expressions it would like to know about.
+ * 此函数主要由indxpath.c使用，用于从等价类(EC)中提取潜在可用于索引的连接子句，
+ * 也可被外部数据包装器用于类似目的。我们假设只关注单个表的Vars表达式，
+ * 但调用者需提供回调函数来精确识别它感兴趣的表达式。
  *
- * We assume that any given table/index column could appear in only one EC.
- * (This should be true in all but the most pathological cases, and if it
- * isn't, we stop on the first match anyway.)  Therefore, what we return
- * is a redundant list of clauses equating the table/index column to each of
- * the other-relation values it is known to be equal to.  Any one of
- * these clauses can be used to create a parameterized path, and there
- * is no value in using more than one.  (But it *is* worthwhile to create
- * a separate parameterized path for each one, since that leads to different
- * join orders.)
+ * 我们假设任何给定的表/索引列只能出现在一个EC中。（这在除极特殊情况外都应成立，
+ * 即使不成立，我们也会在找到第一个匹配时停止。）因此，我们返回的是一个冗余列表，
+ * 其中包含将表/索引列等同于它已知相等的每个其他关系值的子句。任何一个这样的子句
+ * 都可用于创建参数化路径，使用多个子句没有价值。（但为每个子句创建单独的参数化路径
+ * 是值得的，因为这会导致不同的连接顺序。）
  *
- * The caller can pass a Relids set of rels we aren't interested in joining
- * to, so as to save the work of creating useless clauses.
+ * 调用者可以传递一个Relids集合，表示我们不感兴趣的连接关系，以节省创建无用子句的工作。
  */
 List *
-generate_implied_equalities_for_column(PlannerInfo *root,
-									   RelOptInfo *rel,
-									   ec_matches_callback_type callback,
-									   void *callback_arg,
-									   Relids prohibited_rels)
+generate_implied_equalities_for_column(PlannerInfo *root,       /* 查询规划器信息 */
+                                       RelOptInfo *rel,          /* 目标关系 */
+                                       ec_matches_callback_type callback, /* 匹配回调函数 */
+                                       void *callback_arg,       /* 回调函数参数 */
+                                       Relids prohibited_rels)   /* 禁止连接的关系集 */
 {
-	List	   *result = NIL;
-	bool		is_child_rel = (rel->reloptkind == RELOPT_OTHER_MEMBER_REL);
-	Relids		parent_relids;
-	ListCell   *lc1;
+    List       *result = NIL;        /* 存储结果的列表 */
+    bool        is_child_rel = (rel->reloptkind == RELOPT_OTHER_MEMBER_REL); /* 是否为子关系 */
+    Relids      parent_relids;       /* 父关系ID集 */
+    ListCell   *lc1;                 /* 等价类遍历指针 */
 
-	/* Indexes are available only on base or "other" member relations. */
-	Assert(IS_SIMPLE_REL(rel));
+    /* 索引只适用于基础关系或"其他"成员关系 */
+    Assert(IS_SIMPLE_REL(rel));
 
-	/* If it's a child rel, we'll need to know what its parent(s) are */
-	if (is_child_rel)
-		parent_relids = find_childrel_parents(root, rel);
-	else
-		parent_relids = NULL;	/* not used, but keep compiler quiet */
+    /* 如果是子关系，需要知道其父关系 */
+    if (is_child_rel)
+        parent_relids = find_childrel_parents(root, rel);
+    else
+        parent_relids = NULL;        /* 非子关系不需要，但避免编译器警告 */
 
-	foreach(lc1, root->eq_classes)
-	{
-		EquivalenceClass *cur_ec = (EquivalenceClass *) lfirst(lc1);
-		EquivalenceMember *cur_em;
-		ListCell   *lc2;
+    /* 遍历所有等价类 */
+    foreach(lc1, root->eq_classes)
+    {
+        EquivalenceClass *cur_ec = (EquivalenceClass *) lfirst(lc1); /* 当前等价类 */
+        EquivalenceMember *cur_em;  /* 当前等价成员 */
+        ListCell   *lc2;            /* 等价成员遍历指针 */
 
-		/*
-		 * Won't generate joinclauses if const or single-member (the latter
-		 * test covers the volatile case too)
-		 */
-		if (cur_ec->ec_has_const || list_length(cur_ec->ec_members) <= 1)
-			continue;
+        /*
+         * 如果等价类包含常量或只有一个成员，则不会生成连接子句
+         * （后者测试也涵盖了volatile情况）
+         */
+        if (cur_ec->ec_has_const || list_length(cur_ec->ec_members) <= 1)
+            continue;
 
-		/*
-		 * No point in searching if rel not mentioned in eclass (but we can't
-		 * tell that for a child rel).
-		 */
-		if (!is_child_rel &&
-			!bms_is_subset(rel->relids, cur_ec->ec_relids))
-			continue;
+        /*
+         * 如果等价类中不包含目标关系，则无需搜索（但对子关系无法这样判断）
+         */
+        if (!is_child_rel &&
+            !bms_is_subset(rel->relids, cur_ec->ec_relids))
+            continue;
 
-		/*
-		 * Scan members, looking for a match to the target column.  Note that
-		 * child EC members are considered, but only when they belong to the
-		 * target relation.  (Unlike regular members, the same expression
-		 * could be a child member of more than one EC.  Therefore, it's
-		 * potentially order-dependent which EC a child relation's target
-		 * column gets matched to.  This is annoying but it only happens in
-		 * corner cases, so for now we live with just reporting the first
-		 * match.  See also get_eclass_for_sort_expr.)
-		 */
-		cur_em = NULL;
-		foreach(lc2, cur_ec->ec_members)
-		{
-			cur_em = (EquivalenceMember *) lfirst(lc2);
-			if (bms_equal(cur_em->em_relids, rel->relids) &&
-				callback(root, rel, cur_ec, cur_em, callback_arg))
-				break;
-			cur_em = NULL;
-		}
+        /*
+         * 扫描等价类成员，查找与目标列的匹配。注意，子EC成员也会被考虑，
+         * 但只有当它们属于目标关系时才会。（与常规成员不同，同一个表达式
+         * 可能是多个EC的子成员。因此，子关系的目标列匹配到哪个EC可能依赖于顺序。
+         * 这很麻烦，但只会在极端情况下发生，所以目前我们只报告第一个匹配。
+         * 另见get_eclass_for_sort_expr函数。）
+         */
+        cur_em = NULL;
+        foreach(lc2, cur_ec->ec_members)
+        {
+            cur_em = (EquivalenceMember *) lfirst(lc2);
+            /* 检查等价成员的关系ID是否与目标关系匹配，并调用回调函数确认是否匹配目标列 */
+            if (bms_equal(cur_em->em_relids, rel->relids) &&
+                callback(root, rel, cur_ec, cur_em, callback_arg))
+                break;  /* 找到匹配，退出循环 */
+            cur_em = NULL;
+        }
 
-		if (!cur_em)
-			continue;
+        /* 如果没有找到匹配的等价成员，继续下一个等价类 */
+        if (!cur_em)
+            continue;
 
-		/*
-		 * Found our match.  Scan the other EC members and attempt to generate
-		 * joinclauses.
-		 */
-		foreach(lc2, cur_ec->ec_members)
-		{
-			EquivalenceMember *other_em = (EquivalenceMember *) lfirst(lc2);
-			Oid			eq_op;
-			RestrictInfo *rinfo;
+        /*
+         * 找到匹配后，扫描其他EC成员并尝试生成连接子句
+         */
+        foreach(lc2, cur_ec->ec_members)
+        {
+            EquivalenceMember *other_em = (EquivalenceMember *) lfirst(lc2); /* 其他等价成员 */
+            Oid          eq_op;       /* 相等操作符 */
+            RestrictInfo *rinfo;       /* 生成的限制信息节点 */
 
-			if (other_em->em_is_child)
-				continue;		/* ignore children here */
+            /* 忽略子成员 */
+            if (other_em->em_is_child)
+                continue;
 
-			/* Make sure it'll be a join to a different rel */
-			if (other_em == cur_em ||
-				bms_overlap(other_em->em_relids, rel->relids))
-				continue;
+            /* 确保是与不同关系的连接 */
+            if (other_em == cur_em ||
+                bms_overlap(other_em->em_relids, rel->relids))
+                continue;
 
-			/* Forget it if caller doesn't want joins to this rel */
-			if (bms_overlap(other_em->em_relids, prohibited_rels))
-				continue;
+            /* 如果是调用者不希望连接的关系，跳过 */
+            if (bms_overlap(other_em->em_relids, prohibited_rels))
+                continue;
 
-			/*
-			 * Also, if this is a child rel, avoid generating a useless join
-			 * to its parent rel(s).
-			 */
-			if (is_child_rel &&
-				bms_overlap(parent_relids, other_em->em_relids))
-				continue;
+            /*
+             * 此外，如果是子关系，避免生成与父关系的无用连接
+             */
+            if (is_child_rel &&
+                bms_overlap(parent_relids, other_em->em_relids))
+                continue;
 
-			eq_op = select_equality_operator(cur_ec,
-											 cur_em->em_datatype,
-											 other_em->em_datatype);
-			if (!OidIsValid(eq_op))
-				continue;
+            /* 选择适当的相等操作符 */
+            eq_op = select_equality_operator(cur_ec,
+                                            cur_em->em_datatype,
+                                            other_em->em_datatype);
+            if (!OidIsValid(eq_op))
+                continue;  /* 无法找到有效的相等操作符，跳过 */
 
-			/* set parent_ec to mark as redundant with other joinclauses */
-			rinfo = create_join_clause(root, cur_ec, eq_op,
-									   cur_em, other_em,
-									   cur_ec);
+            /* 创建连接子句，设置parent_ec标记与其他连接子句冗余 */
+            rinfo = create_join_clause(root, cur_ec, eq_op,
+                                    cur_em, other_em,
+                                    cur_ec);
 
-			result = lappend(result, rinfo);
-		}
+            /* 将生成的连接子句添加到结果列表 */
+            result = lappend(result, rinfo);
+        }
 
-		/*
-		 * If somehow we failed to create any join clauses, we might as well
-		 * keep scanning the ECs for another match.  But if we did make any,
-		 * we're done, because we don't want to return non-redundant clauses.
-		 */
-		if (result)
-			break;
-	}
+        /*
+         * 如果未能创建任何连接子句，继续扫描其他EC寻找匹配。
+         * 但如果创建了至少一个子句，就完成了，因为我们不想返回非冗余子句。
+         */
+        if (result)
+            break;
+    }
 
-	return result;
+    return result;  /* 返回生成的连接子句列表 */
 }
 
 /*
  * have_relevant_eclass_joinclause
- *		Detect whether there is an EquivalenceClass that could produce
- *		a joinclause involving the two given relations.
- *
- * This is essentially a very cut-down version of
- * generate_join_implied_equalities().  Note it's OK to occasionally say "yes"
- * incorrectly.  Hence we don't bother with details like whether the lack of a
- * cross-type operator might prevent the clause from actually being generated.
+ *      检测是否存在可以生成涉及给定两个关系的连接子句的等价类。
+ *      
+ * 函数作用：在查询优化阶段，识别两个关系之间是否存在通过等价类隐含的连接关系，
+ *            为连接顺序和连接类型决策提供补充依据，特别是对于那些没有显式连接条件的情况。
+ * 
+ * 参数说明：
+ * - root: 查询规划器的全局信息结构，包含查询上下文和所有等价类信息
+ * - rel1: 第一个要检查的关系节点（表或已连接的关系集合）
+ * - rel2: 第二个要检查的关系节点（表或已连接的关系集合）
+ * 
+ * 返回值：
+ * 
+ * - bool: 如果存在可以生成连接子句的等价类，返回true；否则返回false
+ * 实现说明：
+ * 这本质上是generate_join_implied_equalities()函数的一个简化版本。
+ * 注意，偶尔错误地返回"yes"是可以接受的。因此，我们不处理诸如缺少跨类型操作符
+ * 可能阻止实际生成子句等细节。这是一种性能与准确性的权衡，优先考虑执行速度。
  */
 bool
 have_relevant_eclass_joinclause(PlannerInfo *root,
-								RelOptInfo *rel1, RelOptInfo *rel2)
+                               RelOptInfo *rel1, RelOptInfo *rel2)
 {
-	ListCell   *lc1;
+    ListCell   *lc1;  /* 用于遍历等价类列表的指针 */
 
-	foreach(lc1, root->eq_classes)
-	{
-		EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc1);
+    /* 遍历查询中的所有等价类 */
+    foreach(lc1, root->eq_classes)
+    {
+        EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc1);  /* 获取当前等价类 */
 
-		/*
-		 * Won't generate joinclauses if single-member (this test covers the
-		 * volatile case too)
-		 */
-		if (list_length(ec->ec_members) <= 1)
-			continue;
+        /*
+         * 如果等价类只有一个成员，则无法生成连接子句
+         * 此检查也涵盖了易变表达式的情况，因为它们不会被放入包含多个成员的等价类中
+         */
+        if (list_length(ec->ec_members) <= 1)
+            continue;
 
-		/*
-		 * We do not need to examine the individual members of the EC, because
-		 * all that we care about is whether each rel overlaps the relids of
-		 * at least one member, and a test on ec_relids is sufficient to prove
-		 * that.  (As with have_relevant_joinclause(), it is not necessary
-		 * that the EC be able to form a joinclause relating exactly the two
-		 * given rels, only that it be able to form a joinclause mentioning
-		 * both, and this will surely be true if both of them overlap
-		 * ec_relids.)
-		 *
-		 * Note we don't test ec_broken; if we did, we'd need a separate code
-		 * path to look through ec_sources.  Checking the membership anyway is
-		 * OK as a possibly-overoptimistic heuristic.
-		 *
-		 * We don't test ec_has_const either, even though a const eclass won't
-		 * generate real join clauses.  This is because if we had "WHERE a.x =
-		 * b.y and a.x = 42", it is worth considering a join between a and b,
-		 * since the join result is likely to be small even though it'll end
-		 * up being an unqualified nestloop.
-		 */
-		if (bms_overlap(rel1->relids, ec->ec_relids) &&
-			bms_overlap(rel2->relids, ec->ec_relids))
-			return true;
-	}
+        /*
+         * 我们不需要检查等价类的每个成员，因为我们只关心每个关系是否与至少一个成员的关系ID重叠。
+         * 对ec_relids的检查足以证明这一点。与have_relevant_joinclause()一样，
+         * 不需要等价类能够形成恰好关联两个给定关系的连接子句，只需要它能够形成同时提及两者的连接子句。
+         * 如果两者都与ec_relids重叠，则这一点肯定成立。
+         *
+         * 注意我们不检查ec_broken标记；如果检查的话，我们需要单独的代码路径来查看ec_sources。
+         * 无论如何检查成员资格作为一种可能过于乐观的启发式方法是可以接受的。
+         *
+         * 我们也不检查ec_has_const标记，即使常量等价类不会生成真正的连接子句。
+         * 这是因为如果我们有"WHERE a.x = b.y AND a.x = 42"，值得考虑a和b之间的连接，
+         * 因为连接结果可能很小，即使最终它将是一个无条件的嵌套循环连接。
+         */
+        if (bms_overlap(rel1->relids, ec->ec_relids) &&
+            bms_overlap(rel2->relids, ec->ec_relids))
+            return true;  /* 找到符合条件的等价类，立即返回true */
+    }
 
-	return false;
+    return false;  /* 遍历完所有等价类后仍未找到符合条件的，返回false */
 }
+
 
 
 /*

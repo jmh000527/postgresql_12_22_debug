@@ -172,37 +172,53 @@ get_tablespace(Oid spcid)
 
 /*
  * get_tablespace_page_costs
- *		Return random and/or sequential page costs for a given tablespace.
+ *    获取给定表空间的随机和/或顺序页面访问成本
  *
- *		This value is not locked by the transaction, so this value may
- *		be changed while a SELECT that has used these values for planning
- *		is still executing.
+ *    这些值不会被事务锁定，因此当使用这些值进行规划的SELECT仍在执行时，
+ *    这些值可能会被更改。这意味着同一执行中的查询可能使用不同的成本估计值。
+ *
+ * 参数：
+ *   spcid - 表空间的OID标识符
+ *   spc_random_page_cost - 输出参数，用于存储表空间的随机页面访问成本
+ *   spc_seq_page_cost - 输出参数，用于存储表空间的顺序页面访问成本
+ *
+ * 返回值：
+ *   无直接返回值，结果通过输出参数返回
  */
 void
 get_tablespace_page_costs(Oid spcid,
-						  double *spc_random_page_cost,
-						  double *spc_seq_page_cost)
+                          double *spc_random_page_cost,
+                          double *spc_seq_page_cost)
 {
-	TableSpaceCacheEntry *spc = get_tablespace(spcid);
+	// 从表空间缓存中获取指定OID的表空间缓存条目
+	TableSpaceCacheEntry* spc = get_tablespace(spcid);
 
-	Assert(spc != NULL);
+    // 断言：确保表空间缓存条目不为空
+    Assert(spc != NULL);
 
-	if (spc_random_page_cost)
-	{
-		if (!spc->opts || spc->opts->random_page_cost < 0)
-			*spc_random_page_cost = random_page_cost;
-		else
-			*spc_random_page_cost = spc->opts->random_page_cost;
-	}
+    /* 处理随机页面访问成本 */
+    if (spc_random_page_cost != NULL)  // 仅当请求随机页面成本时
+    {
+        // 如果表空间没有自定义选项或随机页面成本为负值，则使用系统默认值
+        if (!spc->opts || spc->opts->random_page_cost < 0)
+            *spc_random_page_cost = random_page_cost;  // 系统全局变量
+        else
+            // 否则使用表空间特定的随机页面成本值
+            *spc_random_page_cost = spc->opts->random_page_cost;
+    }
 
-	if (spc_seq_page_cost)
-	{
-		if (!spc->opts || spc->opts->seq_page_cost < 0)
-			*spc_seq_page_cost = seq_page_cost;
-		else
-			*spc_seq_page_cost = spc->opts->seq_page_cost;
-	}
+    /* 处理顺序页面访问成本 */
+    if (spc_seq_page_cost != NULL)  // 仅当请求顺序页面成本时
+    {
+        // 如果表空间没有自定义选项或顺序页面成本为负值，则使用系统默认值
+        if (!spc->opts || spc->opts->seq_page_cost < 0)
+            *spc_seq_page_cost = seq_page_cost;  // 系统全局变量
+        else
+            // 否则使用表空间特定的顺序页面成本值
+            *spc_seq_page_cost = spc->opts->seq_page_cost;
+    }
 }
+
 
 /*
  * get_tablespace_io_concurrency

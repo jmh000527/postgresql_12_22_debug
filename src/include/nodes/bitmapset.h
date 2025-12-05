@@ -46,28 +46,29 @@ typedef int32 signedbitmapword; /* must be the matching signed type */
 
 #endif
 
+// 位图集合结构体
 typedef struct Bitmapset
 {
-	int			nwords;			/* number of words in array */
-	bitmapword	words[FLEXIBLE_ARRAY_MEMBER];	/* really [nwords] */
+	int			nwords;			// 数组中的字数
+	bitmapword	words[FLEXIBLE_ARRAY_MEMBER];	// 实际长度为 [nwords] 的位图数组
 } Bitmapset;
 
 
-/* result of bms_subset_compare */
+// bms_subset_compare 的结果类型
 typedef enum
 {
-	BMS_EQUAL,					/* sets are equal */
-	BMS_SUBSET1,				/* first set is a subset of the second */
-	BMS_SUBSET2,				/* second set is a subset of the first */
-	BMS_DIFFERENT				/* neither set is a subset of the other */
+	BMS_EQUAL,					// 两个集合相等
+	BMS_SUBSET1,				// 第一个集合是第二个集合的子集
+	BMS_SUBSET2,				// 第二个集合是第一个集合的子集
+	BMS_DIFFERENT				// 两个集合互不为子集
 } BMS_Comparison;
 
-/* result of bms_membership */
+// bms_membership 的结果类型
 typedef enum
 {
-	BMS_EMPTY_SET,				/* 0 members */
-	BMS_SINGLETON,				/* 1 member */
-	BMS_MULTIPLE				/* >1 member */
+	BMS_EMPTY_SET,				// 空集合（0 个成员）
+	BMS_SINGLETON,				// 单元素集合（1 个成员）
+	BMS_MULTIPLE				// 多元素集合（>1 个成员）
 } BMS_Membership;
 
 

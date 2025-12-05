@@ -1660,11 +1660,10 @@ fix_opfuncids_walker(Node *node, void *context)
 
 /*
  * set_opfuncid
- *		Set the opfuncid (procedure OID) in an OpExpr node,
- *		if it hasn't been set already.
+ *		设置 OpExpr 节点中的 opfuncid（过程 OID），
+ *		如果尚未设置的话。
  *
- * Because of struct equivalence, this can also be used for
- * DistinctExpr and NullIfExpr nodes.
+ * 由于结构体等价，也可用于 DistinctExpr 和 NullIfExpr 节点。
  */
 void
 set_opfuncid(OpExpr *opexpr)
@@ -1675,7 +1674,7 @@ set_opfuncid(OpExpr *opexpr)
 
 /*
  * set_sa_opfuncid
- *		As above, for ScalarArrayOpExpr nodes.
+ *		如上，针对 ScalarArrayOpExpr 节点。
  */
 void
 set_sa_opfuncid(ScalarArrayOpExpr *opexpr)
@@ -2307,19 +2306,15 @@ expression_tree_walker(Node *node,
 }
 
 /*
- * query_tree_walker --- initiate a walk of a Query's expressions
+ * query_tree_walker --- 启动对 Query 的表达式的遍历
  *
- * This routine exists just to reduce the number of places that need to know
- * where all the expression subtrees of a Query are.  Note it can be used
- * for starting a walk at top level of a Query regardless of whether the
- * walker intends to descend into subqueries.  It is also useful for
- * descending into subqueries within a walker.
+ * 这个例程的存在是为了减少需要知道 Query 中所有表达式子树位置的地方。
+ * 注意它可用于在 Query 的顶层启动遍历，无论 walker 是否打算深入子查询。
+ * 它也可用于在 walker 内部下降到子查询。
  *
- * Some callers want to suppress visitation of certain items in the sub-Query,
- * typically because they need to process them specially, or don't actually
- * want to recurse into subqueries.  This is supported by the flags argument,
- * which is the bitwise OR of flag values to add or suppress visitation of
- * indicated items.  (More flag bits may be added as needed.)
+ * 有些调用者希望在子查询中抑制对某些项的访问，通常因为他们需要对这些项
+ * 进行特殊处理，或实际上不想递归到子查询。通过 flags 参数的按位或来支持
+ * 抑制对指定项的访问。（可以根据需要添加更多的 flag 位。）
  */
 bool
 query_tree_walker(Query *query,
@@ -2330,10 +2325,9 @@ query_tree_walker(Query *query,
 	Assert(query != NULL && IsA(query, Query));
 
 	/*
-	 * We don't walk any utilityStmt here. However, we can't easily assert
-	 * that it is absent, since there are at least two code paths by which
-	 * action statements from CREATE RULE end up here, and NOTIFY is allowed
-	 * in a rule action.
+	 * 我们这里不遍历任何 utilityStmt。但是我们不能轻易断言它不存在，
+	 * 因为至少有两条代码路径会把来自 CREATE RULE 的动作语句传到这里，
+	 * 并且 NOTIFY 在规则动作中是允许的。
 	 */
 
 	if (walker((Node *) query->targetList, context))
@@ -2356,9 +2350,8 @@ query_tree_walker(Query *query,
 		return true;
 
 	/*
-	 * Most callers aren't interested in SortGroupClause nodes since those
-	 * don't contain actual expressions. However they do contain OIDs which
-	 * may be needed by dependency walkers etc.
+	 * 大多数调用者不关心 SortGroupClause 节点，因为它们不包含实际的表达式。
+	 * 但是它们包含 OID，依赖性遍历器等可能需要这些 OID。
 	 */
 	if ((flags & QTW_EXAMINE_SORTGROUP))
 	{
@@ -2374,8 +2367,8 @@ query_tree_walker(Query *query,
 	else
 	{
 		/*
-		 * But we need to walk the expressions under WindowClause nodes even
-		 * if we're not interested in SortGroupClause nodes.
+		 * 但是即便我们对 SortGroupClause 节点不感兴趣，也需要遍历 WindowClause
+		 * 节点下的表达式。
 		 */
 		ListCell   *lc;
 
@@ -2391,15 +2384,14 @@ query_tree_walker(Query *query,
 	}
 
 	/*
-	 * groupingSets and rowMarks are not walked:
+	 * groupingSets 和 rowMarks 不会被遍历：
 	 *
-	 * groupingSets contain only ressortgrouprefs (integers) which are
-	 * meaningless without the corresponding groupClause or tlist.
-	 * Accordingly, any walker that needs to care about them needs to handle
-	 * them itself in its Query processing.
+	 * groupingSets 仅包含 ressortgrouprefs（整数），在没有对应的 groupClause
+	 * 或 tlist 的情况下是没有意义的。因此，任何需要关心它们的 walker 都应
+	 * 在其处理 Query 时自行处理。
 	 *
-	 * rowMarks is not walked because it contains only rangetable indexes (and
-	 * flags etc.) and therefore should be handled at Query level similarly.
+	 * rowMarks 不被遍历，因为它仅包含 rangetable 索引（和标志等），因此也应
+	 * 在 Query 级别由调用者处理。
 	 */
 
 	if (!(flags & QTW_IGNORE_CTE_SUBQUERIES))
@@ -2419,6 +2411,9 @@ query_tree_walker(Query *query,
  * range_table_walker is just the part of query_tree_walker that scans
  * a query's rangetable.  This is split out since it can be useful on
  * its own.
+ *
+ * range_table_walker 仅是 query_tree_walker 中用于遍历查询 rangetable 的部分。
+ * 将其拆分出来是因为单独使用时也很有用。
  */
 bool
 range_table_walker(List *rtable,
@@ -2440,6 +2435,8 @@ range_table_walker(List *rtable,
 
 /*
  * Some callers even want to scan the expressions in individual RTEs.
+ *
+ * 一些调用者甚至希望遍历单个 RTE（RangeTblEntry）中的表达式。
  */
 bool
 range_table_entry_walker(RangeTblEntry *rte,
@@ -2451,6 +2448,9 @@ range_table_entry_walker(RangeTblEntry *rte,
 	 * Walkers might need to examine the RTE node itself either before or
 	 * after visiting its contents (or, conceivably, both).  Note that if you
 	 * specify neither flag, the walker won't be called on the RTE at all.
+	 *
+	 * 遍历器可能需要在访问 RTE 内容之前或之后（或两者）检查 RTE 节点本身。
+	 * 注意如果既不指定 BEFORE 也不指定 AFTER 标志，遍历器将不会被用于 RTE 本身。
 	 */
 	if (flags & QTW_EXAMINE_RTES_BEFORE)
 		if (walker(rte, context))
@@ -2459,41 +2459,55 @@ range_table_entry_walker(RangeTblEntry *rte,
 	switch (rte->rtekind)
 	{
 		case RTE_RELATION:
+			/* RTE 表示普通表：检查 tablesample 表达式（如果有） */
 			if (walker(rte->tablesample, context))
 				return true;
 			break;
 		case RTE_SUBQUERY:
+			/*
+			 * RTE 表示子查询：除非请求忽略 RT 子查询，否则调用 walker
+			 * 子查询通常是一个 Query 节点。
+			 */
 			if (!(flags & QTW_IGNORE_RT_SUBQUERIES))
 				if (walker(rte->subquery, context))
 					return true;
 			break;
 		case RTE_JOIN:
+			/*
+			 * RTE 表示连接别名：除非忽略 join aliases，否则遍历 joinaliasvars，
+			 * 它包含别名下的表达式列表（可能是 TargetEntry 等）。
+			 */
 			if (!(flags & QTW_IGNORE_JOINALIASES))
 				if (walker(rte->joinaliasvars, context))
 					return true;
 			break;
 		case RTE_FUNCTION:
+			/* RTE 表示函数调用：遍历 functions 字段（函数表达式列表） */
 			if (walker(rte->functions, context))
 				return true;
 			break;
 		case RTE_TABLEFUNC:
+			/* tablefunc 类型：遍历 tablefunc 结构（可能包含表达式） */
 			if (walker(rte->tablefunc, context))
 				return true;
 			break;
 		case RTE_VALUES:
+			/* VALUES 列表：遍历 values_lists（表达式列表） */
 			if (walker(rte->values_lists, context))
 				return true;
 			break;
 		case RTE_CTE:
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
-			/* nothing to do */
+			/* 这些类型没有表达式子项，直接跳过 */
 			break;
 	}
 
+	/* 安全性或权限相关的谓词（可能是表达式列表），也需遍历 */
 	if (walker(rte->securityQuals, context))
 		return true;
 
+	/* 在遍历 RTE 内容之后，按需再调用一次 walker */
 	if (flags & QTW_EXAMINE_RTES_AFTER)
 		if (walker(rte, context))
 			return true;
@@ -2503,65 +2517,52 @@ range_table_entry_walker(RangeTblEntry *rte,
 
 
 /*
- * expression_tree_mutator() is designed to support routines that make a
- * modified copy of an expression tree, with some nodes being added,
- * removed, or replaced by new subtrees.  The original tree is (normally)
- * not changed.  Each recursion level is responsible for returning a copy of
- * (or appropriately modified substitute for) the subtree it is handed.
- * A mutator routine should look like this:
+ * expression_tree_mutator() 旨在支持那些创建表达式树修改副本的例程，
+ * 在副本中某些节点可能被添加、删除或替换为新的子树。原始树（通常）
+ * 不被修改。每个递归层负责返回其收到子树的副本（或适当修改的替代）。
+ * 一个 mutator 例程应如下所示：
  *
  * Node * my_mutator (Node *node, my_struct *context)
  * {
  *		if (node == NULL)
  *			return NULL;
- *		// check for nodes that special work is required for, eg:
+ *		// 检查那些需要特殊处理的节点，例如：
  *		if (IsA(node, Var))
  *		{
- *			... create and return modified copy of Var node
+ *			... 创建并返回 Var 节点的修改副本
  *		}
  *		else if (IsA(node, ...))
  *		{
- *			... do special transformations of other node types
+ *			... 对其他节点类型做特殊变换
  *		}
- *		// for any node type not specially processed, do:
+ *		// 对于未特别处理的节点类型，执行：
  *		return expression_tree_mutator(node, my_mutator, (void *) context);
  * }
  *
- * The "context" argument points to a struct that holds whatever context
- * information the mutator routine needs --- it can be used to return extra
- * data gathered by the mutator, too.  This argument is not touched by
- * expression_tree_mutator, but it is passed down to recursive sub-invocations
- * of my_mutator.  The tree walk is started from a setup routine that
- * fills in the appropriate context struct, calls my_mutator with the
- * top-level node of the tree, and does any required post-processing.
+ * "context" 参数指向 mutator 所需的上下文结构 —— 也可用于通过 mutator
+ * 返回额外的数据。expression_tree_mutator 不会修改此参数，但会将其传递给
+ * 递归调用的 my_mutator。遍历从一个设置例程开始，它填充相应的上下文结构，
+ * 用顶层节点调用 my_mutator，并执行任何必要的后处理。
  *
- * Each level of recursion must return an appropriately modified Node.
- * If expression_tree_mutator() is called, it will make an exact copy
- * of the given Node, but invoke my_mutator() to copy the sub-node(s)
- * of that Node.  In this way, my_mutator() has full control over the
- * copying process but need not directly deal with expression trees
- * that it has no interest in.
+ * 每个递归层必须返回一个适当修改的 Node。如果调用 expression_tree_mutator()
+ * 它将对给定节点做精确拷贝，但会调用 my_mutator() 来复制该节点的子节点。
+ * 通过这种方式，my_mutator() 对复制过程拥有完全控制，但不必直接处理它不
+ * 感兴趣的表达式子树。
  *
- * Just as for expression_tree_walker, the node types handled by
- * expression_tree_mutator include all those normally found in target lists
- * and qualifier clauses during the planning stage.
+ * 与 expression_tree_walker 类似，expression_tree_mutator 所处理的节点类型
+ * 包含在规划阶段通常出现在目标列表和谓词中的所有类型。
  *
- * expression_tree_mutator will handle SubLink nodes by recursing normally
- * into the "testexpr" subtree (which is an expression belonging to the outer
- * plan).  It will also call the mutator on the sub-Query node; however, when
- * expression_tree_mutator itself is called on a Query node, it does nothing
- * and returns the unmodified Query node.  The net effect is that unless the
- * mutator does something special at a Query node, sub-selects will not be
- * visited or modified; the original sub-select will be linked to by the new
- * SubLink node.  Mutators that want to descend into sub-selects will usually
- * do so by recognizing Query nodes and calling query_tree_mutator (below).
+ * expression_tree_mutator 会对 SubLink 节点常规地递归到 "testexpr" 子树
+ * （属于外层计划）。它也会对 sublink 的子查询节点调用 mutator；但是当
+ * expression_tree_mutator 自身被调用于一个 Query 节点时，它什么也不做并
+ * 返回未修改的 Query 节点。这样一来，除非 mutator 在 Query 节点处有特殊处理，
+ * 否则子查询不会被访问或修改；新的 SubLink 节点会链接到原始的子查询。
+ * 想要深入子查询的 mutator 通常会在识别到 Query 节点时调用 query_tree_mutator。
  *
- * expression_tree_mutator will handle a SubPlan node by recursing into the
- * "testexpr" and the "args" list (which belong to the outer plan), but it
- * will simply copy the link to the inner plan, since that's typically what
- * expression tree mutators want.  A mutator that wants to modify the subplan
- * can force appropriate behavior by recognizing SubPlan expression nodes
- * and doing the right thing.
+ * expression_tree_mutator 会对 SubPlan 节点递归变换 "testexpr" 和 "args" 列表
+ *（它们属于外层计划），但会简单地复制对内部 Plan 的引用，因为这通常是
+ *表达式树变换所期望的。若 mutator 想修改子计划，应在识别 SubPlan 表达式
+ *节点时自行做适当处理。
  */
 
 Node *
@@ -2570,8 +2571,7 @@ expression_tree_mutator(Node *node,
 						void *context)
 {
 	/*
-	 * The mutator has already decided not to modify the current node, but we
-	 * must call the mutator for any sub-nodes.
+	 * mutator 已经决定不修改当前节点，但我们必须对任何子节点调用 mutator。
 	 */
 
 #define FLATCOPY(newnode, node, nodetype)  \
@@ -2589,15 +2589,14 @@ expression_tree_mutator(Node *node,
 	if (node == NULL)
 		return NULL;
 
-	/* Guard against stack overflow due to overly complex expressions */
+	/* 防止由于表达式过于复杂导致的栈溢出 */
 	check_stack_depth();
 
 	switch (nodeTag(node))
 	{
 			/*
-			 * Primitive node types with no expression subnodes.  Var and
-			 * Const are frequent enough to deserve special cases, the others
-			 * we just use copyObject for.
+			 * 无表达式子节点的原语节点类型。Var 和 Const 出现频繁，
+			 * 值得特殊处理，其它类型使用 copyObject 即可。
 			 */
 		case T_Var:
 			{
@@ -2614,7 +2613,7 @@ expression_tree_mutator(Node *node,
 				Const	   *newnode;
 
 				FLATCOPY(newnode, oldnode, Const);
-				/* XXX we don't bother with datumCopy; should we? */
+				/* XXX 我们不对 Datum 做深拷贝；是否需要？ */
 				return (Node *) newnode;
 			}
 			break;
@@ -2643,7 +2642,7 @@ expression_tree_mutator(Node *node,
 				Aggref	   *newnode;
 
 				FLATCOPY(newnode, aggref, Aggref);
-				/* assume mutation doesn't change types of arguments */
+				/* 假定变换不会改变参数类型 */
 				newnode->aggargtypes = list_copy(aggref->aggargtypes);
 				MUTATE(newnode->aggdirectargs, aggref->aggdirectargs, List *);
 				MUTATE(newnode->args, aggref->args, List *);
@@ -2662,13 +2661,10 @@ expression_tree_mutator(Node *node,
 				MUTATE(newnode->args, grouping->args, List *);
 
 				/*
-				 * We assume here that mutating the arguments does not change
-				 * the semantics, i.e. that the arguments are not mutated in a
-				 * way that makes them semantically different from their
-				 * previously matching expressions in the GROUP BY clause.
+				 * 这里假定变换参数不会改变语义，即参数不会被变换成与
+				 * GROUP BY 子句中原来的表达式语义不同的内容。
 				 *
-				 * If a mutator somehow wanted to do this, it would have to
-				 * handle the refs and cols lists itself as appropriate.
+				 * 如果某个 mutator 想这么做，它必须自行处理 refs 和 cols 列表。
 				 */
 				newnode->refs = list_copy(grouping->refs);
 				newnode->cols = list_copy(grouping->cols);
@@ -2784,8 +2780,8 @@ expression_tree_mutator(Node *node,
 				MUTATE(newnode->testexpr, sublink->testexpr, Node *);
 
 				/*
-				 * Also invoke the mutator on the sublink's Query node, so it
-				 * can recurse into the sub-query if it wants to.
+				 * 也对 sublink 的 Query 节点调用 mutator，使其可以选择
+				 * 递归进入子查询。
 				 */
 				MUTATE(newnode->subselect, sublink->subselect, Node *);
 				return (Node *) newnode;
@@ -2797,11 +2793,11 @@ expression_tree_mutator(Node *node,
 				SubPlan    *newnode;
 
 				FLATCOPY(newnode, subplan, SubPlan);
-				/* transform testexpr */
+				/* 转换 testexpr */
 				MUTATE(newnode->testexpr, subplan->testexpr, Node *);
-				/* transform args list (params to be passed to subplan) */
+				/* 转换 args 列表（传递给子计划的参数） */
 				MUTATE(newnode->args, subplan->args, List *);
-				/* but not the sub-Plan itself, which is referenced as-is */
+				/* 但不变换被引用的子 Plan 本身 */
 				return (Node *) newnode;
 			}
 			break;
@@ -2928,7 +2924,7 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, rowexpr, RowExpr);
 				MUTATE(newnode->args, rowexpr->args, List *);
-				/* Assume colnames needn't be duplicated */
+				/* 假定 colnames 不需要复制 */
 				return (Node *) newnode;
 			}
 			break;
@@ -2970,7 +2966,7 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, xexpr, XmlExpr);
 				MUTATE(newnode->named_args, xexpr->named_args, List *);
-				/* assume mutator does not care about arg_names */
+				/* 假定 mutator 不在意 arg_names */
 				MUTATE(newnode->args, xexpr->args, List *);
 				return (Node *) newnode;
 			}
@@ -3016,7 +3012,7 @@ expression_tree_mutator(Node *node,
 			}
 			break;
 		case T_Query:
-			/* Do nothing with a sub-Query, per discussion above */
+			/* 按上文讨论，对子 Query 什么也不做 */
 			return node;
 		case T_WindowClause:
 			{
@@ -3039,8 +3035,7 @@ expression_tree_mutator(Node *node,
 				FLATCOPY(newnode, cte, CommonTableExpr);
 
 				/*
-				 * Also invoke the mutator on the CTE's Query node, so it can
-				 * recurse into the sub-query if it wants to.
+				 * 也对 CTE 的 Query 节点调用 mutator，使其可以选择递归进入子查询。
 				 */
 				MUTATE(newnode->ctequery, cte->ctequery, Node *);
 				return (Node *) newnode;
@@ -3049,9 +3044,8 @@ expression_tree_mutator(Node *node,
 		case T_List:
 			{
 				/*
-				 * We assume the mutator isn't interested in the list nodes
-				 * per se, so just invoke it on each list element. NOTE: this
-				 * would fail badly on a list with integer elements!
+				 * 假定 mutator 不关心 List 节点本身，因此只对每个元素调用它。
+				 * 注意：若列表的元素是整数，此处会出错！
 				 */
 				List	   *resultlist;
 				ListCell   *temp;
@@ -3104,7 +3098,7 @@ expression_tree_mutator(Node *node,
 			}
 			break;
 		case T_PartitionPruneStepCombine:
-			/* no expression sub-nodes */
+			/* 无表达式子节点 */
 			return (Node *) copyObject(node);
 		case T_JoinExpr:
 			{
@@ -3115,7 +3109,7 @@ expression_tree_mutator(Node *node,
 				MUTATE(newnode->larg, join->larg, Node *);
 				MUTATE(newnode->rarg, join->rarg, Node *);
 				MUTATE(newnode->quals, join->quals, Node *);
-				/* We do not mutate alias or using by default */
+				/* 默认不变换 alias 或 using */
 				return (Node *) newnode;
 			}
 			break;
@@ -3127,7 +3121,7 @@ expression_tree_mutator(Node *node,
 				FLATCOPY(newnode, setop, SetOperationStmt);
 				MUTATE(newnode->larg, setop->larg, Node *);
 				MUTATE(newnode->rarg, setop->rarg, Node *);
-				/* We do not mutate groupClauses by default */
+				/* 默认不变换 groupClauses */
 				return (Node *) newnode;
 			}
 			break;
@@ -3149,7 +3143,7 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, phv, PlaceHolderVar);
 				MUTATE(newnode->phexpr, phv->phexpr, Expr *);
-				/* Assume we need not copy the relids bitmapset */
+				/* 假定不需要复制 relids bitmapset */
 				return (Node *) newnode;
 			}
 			break;
@@ -3180,7 +3174,7 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, phinfo, PlaceHolderInfo);
 				MUTATE(newnode->ph_var, phinfo->ph_var, PlaceHolderVar *);
-				/* Assume we need not copy the relids bitmapsets */
+				/* 假定不需要复制 relids bitmapsets */
 				return (Node *) newnode;
 			}
 			break;
@@ -3191,7 +3185,7 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, rtfunc, RangeTblFunction);
 				MUTATE(newnode->funcexpr, rtfunc->funcexpr, Node *);
-				/* Assume we need not copy the coldef info lists */
+				/* 假定不需要复制 coldef 信息列表 */
 				return (Node *) newnode;
 			}
 			break;
@@ -3225,29 +3219,24 @@ expression_tree_mutator(Node *node,
 				 (int) nodeTag(node));
 			break;
 	}
-	/* can't get here, but keep compiler happy */
+	/* 理论上不会到达此处，但使编译器不报错 */
 	return NULL;
 }
 
 
 /*
- * query_tree_mutator --- initiate modification of a Query's expressions
+ * query_tree_mutator --- 启动对 Query 表达式的修改
  *
- * This routine exists just to reduce the number of places that need to know
- * where all the expression subtrees of a Query are.  Note it can be used
- * for starting a walk at top level of a Query regardless of whether the
- * mutator intends to descend into subqueries.  It is also useful for
- * descending into subqueries within a mutator.
+ * 这个例程的存在是为了减少需要知道 Query 中所有表达式子树位置的地方。
+ * 注意它可用于在 Query 的顶层启动遍历，无论 mutator 是否打算深入子查询。
+ * 它也可用于在 mutator 内部下降到子查询。
  *
- * Some callers want to suppress mutating of certain items in the Query,
- * typically because they need to process them specially, or don't actually
- * want to recurse into subqueries.  This is supported by the flags argument,
- * which is the bitwise OR of flag values to suppress mutating of
- * indicated items.  (More flag bits may be added as needed.)
+ * 有些调用者希望在 Query 中抑制对某些项的变换，通常是因为他们需要对这些
+ * 项进行特殊处理，或实际上不想深入子查询。通过 flags 参数的按位或来支持
+ * 抑制对指定项的变换。可以按需添加更多的 flag 位。
  *
- * Normally the Query node itself is copied, but some callers want it to be
- * modified in-place; they must pass QTW_DONT_COPY_QUERY in flags.  All
- * modified substructure is safely copied in any case.
+ * 通常会复制 Query 节点本身，但有些调用者希望在原地修改它；这时应在 flags
+ * 中传入 QTW_DONT_COPY_QUERY。无论如何，所有被修改的子结构都会被安全地复制。
  */
 Query *
 query_tree_mutator(Query *query,
@@ -3276,9 +3265,8 @@ query_tree_mutator(Query *query,
 	MUTATE(query->limitCount, query->limitCount, Node *);
 
 	/*
-	 * Most callers aren't interested in SortGroupClause nodes since those
-	 * don't contain actual expressions. However they do contain OIDs, which
-	 * may be of interest to some mutators.
+	 * 大多数调用者对 SortGroupClause 节点不感兴趣，因为它们不包含实际的表达式。
+	 * 但是这些节点包含 OID，某些 mutator 可能会对它们感兴趣。
 	 */
 
 	if ((flags & QTW_EXAMINE_SORTGROUP))
@@ -3291,8 +3279,7 @@ query_tree_mutator(Query *query,
 	else
 	{
 		/*
-		 * But we need to mutate the expressions under WindowClause nodes even
-		 * if we're not interested in SortGroupClause nodes.
+		 * 即便我们对 SortGroupClause 节点不感兴趣，也需要变换 WindowClause 节点下的表达式。
 		 */
 		List	   *resultlist;
 		ListCell   *temp;
@@ -3313,20 +3300,17 @@ query_tree_mutator(Query *query,
 	}
 
 	/*
-	 * groupingSets and rowMarks are not mutated:
+	 * groupingSets 和 rowMarks 不会被变换：
 	 *
-	 * groupingSets contain only ressortgroup refs (integers) which are
-	 * meaningless without the groupClause or tlist. Accordingly, any mutator
-	 * that needs to care about them needs to handle them itself in its Query
-	 * processing.
+	 * groupingSets 仅包含 ressortgroup 引用（整数），在没有对应的 groupClause 或 tlist
+	 * 的情况下是没有意义的。因此，任何需要关心它们的 mutator 都应在其处理 Query 时自行处理。
 	 *
-	 * rowMarks contains only rangetable indexes (and flags etc.) and
-	 * therefore should be handled at Query level similarly.
+	 * rowMarks 仅包含 rangetable 索引（和标志等），因此也应在 Query 级别由调用者处理。
 	 */
 
 	if (!(flags & QTW_IGNORE_CTE_SUBQUERIES))
 		MUTATE(query->cteList, query->cteList, List *);
-	else						/* else copy CTE list as-is */
+	else						/* 否则，将 CTE 列表作为原样拷贝 */
 		query->cteList = copyObject(query->cteList);
 	query->rtable = range_table_mutator(query->rtable,
 										mutator, context, flags);
@@ -3334,9 +3318,8 @@ query_tree_mutator(Query *query,
 }
 
 /*
- * range_table_mutator is just the part of query_tree_mutator that processes
- * a query's rangetable.  This is split out since it can be useful on
- * its own.
+ * range_table_mutator 只是 query_tree_mutator 中处理查询的 rangetable 的一部分。
+ * 将其单独拆出是因为在某些场景下单独使用也很有用。
  */
 List *
 range_table_mutator(List *rtable,
@@ -3358,7 +3341,7 @@ range_table_mutator(List *rtable,
 			case RTE_RELATION:
 				MUTATE(newrte->tablesample, rte->tablesample,
 					   TableSampleClause *);
-				/* we don't bother to copy eref, aliases, etc; OK? */
+				/* 我们不复制 eref、别名等；这样处理可以吗？ */
 				break;
 			case RTE_SUBQUERY:
 				if (!(flags & QTW_IGNORE_RT_SUBQUERIES))
@@ -3368,7 +3351,7 @@ range_table_mutator(List *rtable,
 				}
 				else
 				{
-					/* else, copy RT subqueries as-is */
+					/* 否则，按原样复制 RT 子查询 */
 					newrte->subquery = copyObject(rte->subquery);
 				}
 				break;
@@ -3377,7 +3360,7 @@ range_table_mutator(List *rtable,
 					MUTATE(newrte->joinaliasvars, rte->joinaliasvars, List *);
 				else
 				{
-					/* else, copy join aliases as-is */
+					/* 否则，按原样复制 join 别名 */
 					newrte->joinaliasvars = copyObject(rte->joinaliasvars);
 				}
 				break;
@@ -3393,7 +3376,7 @@ range_table_mutator(List *rtable,
 			case RTE_CTE:
 			case RTE_NAMEDTUPLESTORE:
 			case RTE_RESULT:
-				/* nothing to do */
+				/* 无需处理 */
 				break;
 		}
 		MUTATE(newrte->securityQuals, rte->securityQuals, List *);

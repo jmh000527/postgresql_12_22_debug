@@ -741,26 +741,20 @@ contain_mutable_functions_after_planning(Expr *expr)
 
 /*
  * contain_volatile_functions
- *	  Recursively search for volatile functions within a clause.
+ *	  递归地在子句中搜索易变函数。
  *
- * Returns true if any volatile function (or operator implemented by a
- * volatile function) is found. This test prevents, for example,
- * invalid conversions of volatile expressions into indexscan quals.
+ * 如果发现任何易变函数（或由易变函数实现的操作符），则返回 true。
+ * 此测试可防止例如将易变表达式错误地转换为索引扫描条件。
  *
- * This will give the right answer only for clauses that have been put
- * through expression preprocessing.  Callers outside the planner typically
- * should use contain_volatile_functions_after_planning() instead, for the
- * reasons given there.
+ * 只有经过表达式预处理的子句，此函数才能给出正确答案。
+ * 规划器外部的调用者通常应使用 contain_volatile_functions_after_planning()，
+ * 原因见该函数注释。
  *
- * We will recursively look into Query nodes (i.e., SubLink sub-selects)
- * but not into SubPlans.  This is a bit odd, but intentional.  If we are
- * looking at a SubLink, we are probably deciding whether a query tree
- * transformation is safe, and a contained sub-select should affect that;
- * for example, duplicating a sub-select containing a volatile function
- * would be bad.  However, once we've got to the stage of having SubPlans,
- * subsequent planning need not consider volatility within those, since
- * the executor won't change its evaluation rules for a SubPlan based on
- * volatility.
+ * 我们会递归查找 Query 节点（即 SubLink 子查询），但不会查找 SubPlan。
+ * 这有些奇怪，但属于有意为之。如果我们正在查看 SubLink，通常是在决定
+ * 查询树转换是否安全，包含的子查询应该影响这一点；例如，复制包含易变
+ * 函数的子查询是不好的。然而，一旦进入 SubPlan 阶段，后续规划无需考虑
+ * 其中的易变性，因为执行器不会根据易变性改变对 SubPlan 的求值规则。
  */
 bool
 contain_volatile_functions(Node *clause)

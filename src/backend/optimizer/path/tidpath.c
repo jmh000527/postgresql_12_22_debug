@@ -380,9 +380,9 @@ ec_member_matches_ctid(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * create_tidscan_paths
- *	  Create paths corresponding to direct TID scans of the given rel.
+ *	  为给定的 rel 创建直接 TID 扫描的路径。
  *
- *	  Candidate paths are added to the rel's pathlist (using add_path).
+ *	  候选路径会被添加到 rel 的 pathlist（通过 add_path）。
  */
 void
 create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
@@ -390,16 +390,14 @@ create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
 	List	   *tidquals;
 
 	/*
-	 * If any suitable quals exist in the rel's baserestrict list, generate a
-	 * plain (unparameterized) TidPath with them.
+	 * 如果在 rel 的 baserestrict 列表中存在合适的条件，则生成一个普通（非参数化）的 TidPath。
 	 */
 	tidquals = TidQualFromRestrictInfoList(root, rel->baserestrictinfo, rel);
 
 	if (tidquals)
 	{
 		/*
-		 * This path uses no join clauses, but it could still have required
-		 * parameterization due to LATERAL refs in its tlist.
+		 * 该路径不使用连接条件，但由于 tlist 中的 LATERAL 引用，仍可能需要参数化。
 		 */
 		Relids		required_outer = rel->lateral_relids;
 
@@ -408,29 +406,27 @@ create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel)
 	}
 
 	/*
-	 * Try to generate parameterized TidPaths using equality clauses extracted
-	 * from EquivalenceClasses.  (This is important since simple "t1.ctid =
-	 * t2.ctid" clauses will turn into ECs.)
+	 * 尝试使用从等价类（EquivalenceClasses）中提取的等值条件生成参数化的 TidPath。
+	 * （这很重要，因为简单的 "t1.ctid = t2.ctid" 条件会转化为等价类。）
 	 */
 	if (rel->has_eclass_joins)
 	{
 		List	   *clauses;
 
-		/* Generate clauses, skipping any that join to lateral_referencers */
+		/* 生成条件，跳过任何连接到 lateral_referencers 的条件 */
 		clauses = generate_implied_equalities_for_column(root,
 														 rel,
 														 ec_member_matches_ctid,
 														 NULL,
 														 rel->lateral_referencers);
 
-		/* Generate a path for each usable join clause */
+		/* 为每个可用的连接条件生成路径 */
 		BuildParameterizedTidPaths(root, rel, clauses);
 	}
 
 	/*
-	 * Also consider parameterized TidPaths using "loose" join quals.  Quals
-	 * of the form "t1.ctid = t2.ctid" would turn into these if they are outer
-	 * join quals, for example.
+	 * 同时考虑使用“松散”连接条件的参数化 TidPath。
+	 * 例如，"t1.ctid = t2.ctid" 这种条件如果是外连接条件，就会变成这种情况。
 	 */
 	BuildParameterizedTidPaths(root, rel, rel->joininfo);
 }
