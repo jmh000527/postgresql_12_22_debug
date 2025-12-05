@@ -42,29 +42,23 @@
 #define make_simple_restrictinfo(root, clause)  \
 	make_restrictinfo_new(root, clause, true, false, false, 0, NULL, NULL, NULL)
 
-/* XXX 参见 PartCollMatchesExprColl
- * 判断索引的排序规则（idxcollation）与表达式的排序规则（exprcollation）是否匹配
- * 如果索引未指定排序规则（InvalidOid），则认为总是匹配；
- * 否则要求两者完全相等
- */
+/* XXX see PartCollMatchesExprColl */
 #define IndexCollMatchesExprColl(idxcollation, exprcollation) \
 	((idxcollation) == InvalidOid || (idxcollation) == (exprcollation))
 
-
-/* 我们是在寻找普通索引扫描、位图扫描，还是两者皆可 */
+/* Whether we are looking for plain indexscan, bitmap scan, or either */
 typedef enum
 {
-	ST_INDEXSCAN,				/* 必须支持 amgettuple */
-	ST_BITMAPSCAN,				/* 必须支持 amgetbitmap */
-	ST_ANYSCAN					/* 两者皆可 */
+	ST_INDEXSCAN,				/* must support amgettuple */
+	ST_BITMAPSCAN,				/* must support amgetbitmap */
+	ST_ANYSCAN					/* either is okay */
 } ScanTypeControl;
 
-/* 用于收集与索引匹配的条件子句的数据结构 */
+/* Data structure for collecting qual clauses that match an index */
 typedef struct
 {
-	bool		nonempty;		/* 如果存在任何非空列表则为 true */
-
-	/* 每个索引列对应一个 IndexClause 节点列表 */
+	bool		nonempty;		/* True if lists are not all empty */
+	/* Lists of IndexClause nodes, one list per index column */
 	List	   *indexclauses[INDEX_MAX_KEYS];
 } IndexClauseSet;
 
@@ -208,227 +202,223 @@ static bool ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * create_index_paths()
- *	  为给定关系生成所有有意义的索引路径。
- *	  候选路径会通过 add_path 添加到 rel 的 pathlist 中。
+ *	  Generate all interesting index paths for the given relation.
+ *	  Candidate paths are added to the rel's pathlist (using add_path).
  *
- * 要考虑索引扫描，索引必须匹配查询条件中的一个或多个限制条件或连接条件，
- * 或者匹配查询的 ORDER BY 条件，或者其谓词能被查询条件满足。
+ * To be considered for an index scan, an index must match one or more
+ * restriction clauses or join clauses from the query's qual condition,
+ * or match the query's ORDER BY condition, or have a predicate that
+ * matches the query's qual condition.
  *
- * 索引扫描有两种基本类型。"普通"索引扫描只使用限制条件（可以没有），
- * 所以可以在任何上下文中应用。"参数化"索引扫描会使用连接条件（以及可用的限制条件），
- * 这种扫描只能作为嵌套循环连接的内表，不能作为外表，也不能用于合并或哈希连接。
- * 在这种情况下，其他关系的属性值在每次索引路径扫描时都是可用且固定的。
+ * There are two basic kinds of index scans.  A "plain" index scan uses
+ * only restriction clauses (possibly none at all) in its indexqual,
+ * so it can be applied in any context.  A "parameterized" index scan uses
+ * join clauses (plus restriction clauses, if available) in its indexqual.
+ * When joining such a scan to one of the relations supplying the other
+ * variables used in its indexqual, the parameterized scan must appear as
+ * the inner relation of a nestloop join; it can't be used on the outer side,
+ * nor in a merge or hash join.  In that context, values for the other rels'
+ * attributes are available and fixed during any one scan of the indexpath.
  *
- * 对于每个普通或参数化索引扫描，本函数都会生成一个 IndexPath 并提交给 add_path()。
+ * An IndexPath is generated and submitted to add_path() for each plain or
+ * parameterized index scan this routine deems potentially interesting for
+ * the current query.
  *
- * 'rel' 是我们要为其生成索引路径的关系
+ * 'rel' is the relation for which we want to generate index paths
  *
- * 注意：必须先对该关系运行过 check_index_predicates()。
+ * Note: check_index_predicates() must have been run previously for this rel.
  *
- * 注意：如果关系的 tlist 中涉及 LATERAL 引用，rel->lateral_relids 可能非空。
- * 当前我们会把 lateral_relids 加入每个路径的参数化集合，但除此之外不做特殊处理。
- * 任何这些关系必须作为参数源，这可能应该影响我们对索引条件的选择，但目前没有处理。
- * 下面关于“非参数化”路径的注释应理解为“就索引条件而言是非参数化”。
+ * Note: in cases involving LATERAL references in the relation's tlist, it's
+ * possible that rel->lateral_relids is nonempty.  Currently, we include
+ * lateral_relids into the parameterization reported for each path, but don't
+ * take it into account otherwise.  The fact that any such rels *must* be
+ * available as parameter sources perhaps should influence our choices of
+ * index quals ... but for now, it doesn't seem worth troubling over.
+ * In particular, comments below about "unparameterized" paths should be read
+ * as meaning "unparameterized so far as the indexquals are concerned".
  */
 void
 create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 {
-	List	   *indexpaths; 	/* 普通索引路径列表 */
-	List	   *bitindexpaths;	/* 位图索引路径列表 */
-	List	   *bitjoinpaths;	/* 位图连接路径列表 */
-	List	   *joinorclauses;	/* 连接OR条件列表 */
-	IndexClauseSet rclauseset;  /* 限制条件集合 */
-	IndexClauseSet jclauseset;  /* 连接条件集合 */
-	IndexClauseSet eclauseset;  /* 等价类条件集合 */
+	List	   *indexpaths;
+	List	   *bitindexpaths;
+	List	   *bitjoinpaths;
+	List	   *joinorclauses;
+	IndexClauseSet rclauseset;
+	IndexClauseSet jclauseset;
+	IndexClauseSet eclauseset;
 	ListCell   *lc;
 
-	/* 如果关系没有索引，直接返回 */
+	/* Skip the whole mess if no indexes */
 	if (rel->indexlist == NIL)
 		return;
 
-	/* 初始化位图路径和连接OR条件列表 */
+	/* Bitmap paths are collected and then dealt with at the end */
 	bitindexpaths = bitjoinpaths = joinorclauses = NIL;
 
-	/* 遍历关系的每个索引，为每个索引生成可能的路径 */
+	/* Examine each index in turn */
 	foreach(lc, rel->indexlist)
 	{
-		/* 从链表中获取当前索引 */
-		IndexOptInfo* index = (IndexOptInfo*)lfirst(lc);
+		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
 
-		/* 确保索引键数量不超过系统定义的最大限制 */
+		/* Protect limited-size array in IndexClauseSets */
 		Assert(index->nkeycolumns <= INDEX_MAX_KEYS);
 
 		/*
-		 * 跳过不满足查询条件的部分索引，确保查询优化器不会错误地使用”部分索引“
-		 * 部分索引只在其谓词条件被查询条件满足时才可用
-		 * （见 check_index_predicates()  ）
-		 *
-		 *	如果index->indpred不为NIL，表示这是一个部分索引
-		 *	如果 predOK 为 true，表示查询的 WHERE 条件蕴含（implies）了索引的 WHERE 条件。
-		 *	也就是说，查询所需的数据完全落在索引覆盖的范围内。
-		 *  因此，只有在 predOK 为 true 时，部分索引才可用。
+		 * Ignore partial indexes that do not match the query.
+		 * (generate_bitmap_or_paths() might be able to do something with
+		 * them, but that's of no concern here.)
 		 */
 		if (index->indpred != NIL && !index->predOK)
 			continue;
 
 		/*
-		 * 阶段1：匹配和处理限制条件
-		 * 清空限制条件集合并查找能与当前索引匹配的限制条件
-		 *
-		 * 在 rclauseset 结构体中：
-		 * 键（Key） 是数组 indexclauses 的下标索引，它是一个整数，代表索引定义中的列序号（从 0 开始计数）。
-		 * 例如，0 代表索引的第一列，1 代表索引的第二列，以此类推。
-		 * 值（Value） 是该下标位置存储的一个链表（List）。
-		 * 这个链表里包含了一个或多个 IndexClause 对象。每一个 IndexClause 对象都代表一个具体的 SQL 查询条件。
+		 * Identify the restriction clauses that can match the index.
 		 */
-		MemSet(&rclauseset, 0, sizeof(rclauseset)); /* 重置条件集合 */
-		/* 查找能与当前索引匹配的限制条件，将它们添加到rclauseset中 */
+		MemSet(&rclauseset, 0, sizeof(rclauseset));
 		match_restriction_clauses_to_index(root, index, &rclauseset);
 
 		/*
-		 * 使用匹配的限制条件生成索引路径
-		 * - 普通索引路径直接添加到rel->pathlist
-		 * - 位图索引路径暂时收集到bitindexpaths，后续统一处理
+		 * Build index paths from the restriction clauses.  These will be
+		 * non-parameterized paths.  Plain paths go directly to add_path(),
+		 * bitmap paths are added to bitindexpaths to be handled below.
 		 */
 		get_index_paths(root, rel, index, &rclauseset,
 						&bitindexpaths);
 
 		/*
-		 * 阶段2：匹配和处理连接条件
-		 * 查找未合并到等价类中的松散连接条件
-		 * 同时收集连接OR条件供后续处理
+		 * Identify the join clauses that can match the index.  For the moment
+		 * we keep them separate from the restriction clauses.  Note that this
+		 * step finds only "loose" join clauses that have not been merged into
+		 * EquivalenceClasses.  Also, collect join OR clauses for later.
 		 */
-		MemSet(&jclauseset, 0, sizeof(jclauseset)); /* 重置连接条件集合 */
-		/* 查找未合并到等价类中的松散连接条件，将它们添加到jclauseset中 */
+		MemSet(&jclauseset, 0, sizeof(jclauseset));
 		match_join_clauses_to_index(root, rel, index,
-							&jclauseset, &joinorclauses);
+									&jclauseset, &joinorclauses);
 
 		/*
-		 * 阶段3：匹配和处理等价类条件
-		 * 从等价类中提取能与索引匹配的条件
+		 * Look for EquivalenceClasses that can generate joinclauses matching
+		 * the index.
 		 */
-		MemSet(&eclauseset, 0, sizeof(eclauseset)); /* 重置等价类条件集合 */
-		/* 从等价类中提取能与索引匹配的条件，将它们添加到eclauseset中 */
+		MemSet(&eclauseset, 0, sizeof(eclauseset));
 		match_eclass_clauses_to_index(root, index,
-							&eclauseset);
+									  &eclauseset);
 
 		/*
-		 * 如果找到连接条件或等价类条件，则生成参数化索引路径
-		 * 参数化路径主要用于嵌套循环连接的内表
+		 * If we found any plain or eclass join clauses, build parameterized
+		 * index paths using them.
 		 */
 		if (jclauseset.nonempty || eclauseset.nonempty)
 			consider_index_join_clauses(root, rel, index,
-								&rclauseset,
-								&jclauseset,
-								&eclauseset,
-								&bitjoinpaths);
+										&rclauseset,
+										&jclauseset,
+										&eclauseset,
+										&bitjoinpaths);
 	}
 
 	/*
-	 * 处理OR条件：为限制条件中的OR条件生成BitmapOrPath
-	 * 这允许多个条件通过位图操作高效组合
+	 * Generate BitmapOrPaths for any suitable OR-clauses present in the
+	 * restriction list.  Add these to bitindexpaths.
 	 */
 	indexpaths = generate_bitmap_or_paths(root, rel,
-							rel->baserestrictinfo, NIL);
+										  rel->baserestrictinfo, NIL);
 	bitindexpaths = list_concat(bitindexpaths, indexpaths);
 
 	/*
-	 * 同理，为连接OR条件生成BitmapOrPath
+	 * Likewise, generate BitmapOrPaths for any suitable OR-clauses present in
+	 * the joinclause list.  Add these to bitjoinpaths.
 	 */
 	indexpaths = generate_bitmap_or_paths(root, rel,
-							joinorclauses, rel->baserestrictinfo);
+										  joinorclauses, rel->baserestrictinfo);
 	bitjoinpaths = list_concat(bitjoinpaths, indexpaths);
 
 	/*
-	 * 处理位图索引路径：为所有位图索引路径生成一个最优的BitmapHeapPath
-	 * 即使有多个索引，也只生成一个路径，因为最终会根据总成本选择最优组合
+	 * If we found anything usable, generate a BitmapHeapPath for the most
+	 * promising combination of restriction bitmap index paths.  Note there
+	 * will be only one such path no matter how many indexes exist.  This
+	 * should be sufficient since there's basically only one figure of merit
+	 * (total cost) for such a path.
 	 */
 	if (bitindexpaths != NIL)
 	{
-		Path	   *bitmapqual; /* 位图条件的最优组合 */
-		BitmapHeapPath *bpath;  /* 生成的位图堆路径 */
+		Path	   *bitmapqual;
+		BitmapHeapPath *bpath;
 
-		/* 选择位图索引路径的最优AND组合 */
 		bitmapqual = choose_bitmap_and(root, rel, bitindexpaths);
-		/* 创建位图堆路径，使用关系的lateral_relids作为参数化要求 */
 		bpath = create_bitmap_heap_path(root, rel, bitmapqual,
-								rel->lateral_relids, 1.0, 0);
-		/* 将生成的路径添加到关系的路径列表中 */
+										rel->lateral_relids, 1.0, 0);
 		add_path(rel, (Path *) bpath);
 
-		/*
-		 * 如果支持并行查询且无lateral引用，创建并行位图路径
-		 * 并行查询可以利用多个CPU核心加速数据扫描
-		 */
+		/* create a partial bitmap heap path */
 		if (rel->consider_parallel && rel->lateral_relids == NULL)
 			create_partial_bitmap_paths(root, rel, bitmapqual);
 	}
 
 	/*
-	 * 处理位图连接路径：为每种不同的参数化方式生成对应的BitmapHeapPath
-	 * 这允许在不同的连接上下文中使用位图索引
+	 * Likewise, if we found anything usable, generate BitmapHeapPaths for the
+	 * most promising combinations of join bitmap index paths.  Our strategy
+	 * is to generate one such path for each distinct parameterization seen
+	 * among the available bitmap index paths.  This may look pretty
+	 * expensive, but usually there won't be very many distinct
+	 * parameterizations.  (This logic is quite similar to that in
+	 * consider_index_join_clauses, but we're working with whole paths not
+	 * individual clauses.)
 	 */
 	if (bitjoinpaths != NIL)
 	{
-		List	   *all_path_outers; /* 所有不同的参数化集合 */
+		List	   *all_path_outers;
 		ListCell   *lc;
 
-		/* 步骤1：收集所有不同的参数化集合 */
+		/* Identify each distinct parameterization seen in bitjoinpaths */
 		all_path_outers = NIL;
 		foreach(lc, bitjoinpaths)
 		{
 			Path	   *path = (Path *) lfirst(lc);
 			Relids		required_outer = PATH_REQ_OUTER(path);
 
-			/* 仅添加新的参数化集合（避免重复） */
 			if (!bms_equal_any(required_outer, all_path_outers))
 				all_path_outers = lappend(all_path_outers, required_outer);
 		}
 
-		/* 步骤2：为每种参数化集合生成对应的位图堆路径 */
+		/* Now, for each distinct parameterization set ... */
 		foreach(lc, all_path_outers)
 		{
 			Relids		max_outers = (Relids) lfirst(lc);
-			List	   *this_path_set; /* 特定参数化集合的路径集合 */
-			Path	   *bitmapqual; /* 位图条件的最优组合 */
-			Relids		required_outer; /* 最终路径需要的外部关系 */
-			double		loop_count; /* 循环迭代次数估计 */
-			BitmapHeapPath *bpath; /* 生成的位图堆路径 */
+			List	   *this_path_set;
+			Path	   *bitmapqual;
+			Relids		required_outer;
+			double		loop_count;
+			BitmapHeapPath *bpath;
 			ListCell   *lcp;
 
-			/* 收集所有与当前参数化集合兼容的位图连接路径 */
+			/* Identify all the bitmap join paths needing no more than that */
 			this_path_set = NIL;
 			foreach(lcp, bitjoinpaths)
 			{
 				Path	   *path = (Path *) lfirst(lcp);
 
-				/* 只选择参数化需求是当前集合子集的路径 */
 				if (bms_is_subset(PATH_REQ_OUTER(path), max_outers))
 					this_path_set = lappend(this_path_set, path);
 			}
 
 			/*
-			 * 添加限制条件的位图路径，因为它们不依赖特定连接上下文
-			 * 可以与任何连接条件组合使用
+			 * Add in restriction bitmap paths, since they can be used
+			 * together with any join paths.
 			 */
 			this_path_set = list_concat(this_path_set, bitindexpaths);
 
-			/* 选择该参数化集合下的最优位图组合 */
+			/* Select best AND combination for this parameterization */
 			bitmapqual = choose_bitmap_and(root, rel, this_path_set);
 
-			/* 获取最终路径所需的外部关系集合 */
+			/* And push that path into the mix */
 			required_outer = PATH_REQ_OUTER(bitmapqual);
-			/* 估计嵌套循环的迭代次数 */
 			loop_count = get_loop_count(root, rel->relid, required_outer);
-			/* 创建位图堆路径，包含参数化信息和循环次数估计 */
 			bpath = create_bitmap_heap_path(root, rel, bitmapqual,
-									required_outer, loop_count, 0);
-			/* 添加生成的路径到关系的路径列表 */
+											required_outer, loop_count, 0);
 			add_path(rel, (Path *) bpath);
 		}
 	}
 }
-
 
 /*
  * consider_index_join_clauses
@@ -729,17 +719,21 @@ bms_equal_any(Relids relids, List *relids_list)
 	return false;
 }
 
+
 /*
  * get_index_paths
- *	  给定一个索引和一组索引条件，为其构造 IndexPath 路径。
+ *	  Given an index and a set of index clauses for it, construct IndexPaths.
  *
- * 普通索引路径直接通过 add_path 添加到 rel 的 pathlist，
- * 位图索引路径则加入 *bitindexpaths，后续统一处理。
+ * Plain indexpaths are sent directly to add_path, while potential
+ * bitmap indexpaths are added to *bitindexpaths for later processing.
  *
- * 该函数主要用于正确处理 ScalarArrayOpExpr 条件。
- * 如果索引访问方法（AM）原生支持 ScalarArrayOpExpr，则直接包含在普通索引路径中；
- * 否则，构造普通索引路径时要排除这些条件，并单独尝试将其用于位图路径。
- * 此外，还要考虑排除非首列的 ScalarArrayOpExpr，以便生成有序路径。
+ * This is a fairly simple frontend to build_index_paths().  Its reason for
+ * existence is mainly to handle ScalarArrayOpExpr quals properly.  If the
+ * index AM supports them natively, we should just include them in simple
+ * index paths.  If not, we should exclude them while building simple index
+ * paths, and then make a separate attempt to include them in bitmap paths.
+ * Furthermore, we should consider excluding lower-order ScalarArrayOpExpr
+ * quals so as to create ordered paths.
  */
 static void
 get_index_paths(PlannerInfo *root, RelOptInfo *rel,
@@ -752,14 +746,10 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	ListCell   *lc;
 
 	/*
-	 * 首先用条件构造普通索引路径。
-	 * 只有索引 AM 原生支持 ScalarArrayOpExpr，
-	 * 且该条件在首列时才允许包含，否则跳过以便生成有序路径。
-	 *
-	 * clauses：索引条件集合，之前 match_restriction_clauses_to_index 函数的产出。
-	 * skip_nonnative_saop：是否跳过非首列的 ScalarArrayOpExpr。
-	 * skip_lower_saop：是否跳过非首列的 ScalarArrayOpExpr（索引 AM 支持原生处理）。
-	 * predOK：索引谓词是否被查询条件满足。
+	 * Build simple index paths using the clauses.  Allow ScalarArrayOpExpr
+	 * clauses only if the index AM supports them natively, and skip any such
+	 * clauses for index columns after the first (so that we produce ordered
+	 * paths if possible).
 	 */
 	indexpaths = build_index_paths(root, rel,
 								   index, clauses,
@@ -769,8 +759,9 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 								   &skip_lower_saop);
 
 	/*
-	 * 如果跳过了非首列的 ScalarArrayOpExpr（且索引 AM 支持），
-	 * 则再尝试一次，把这些条件也包含进来（但会失去排序）。
+	 * If we skipped any lower-order ScalarArrayOpExprs on an index with an AM
+	 * that supports them, then try again including those clauses.  This will
+	 * produce paths with more selectivity but no ordering.
 	 */
 	if (skip_lower_saop)
 	{
@@ -784,12 +775,16 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * 把能用于普通 IndexScan 的路径提交给 add_path。
-	 * （普通 IndexPath 既可用于普通索引扫描，也可用于索引仅扫描，
-	 * 这里不区分。部分索引只支持位图扫描的不能提交。）
+	 * Submit all the ones that can form plain IndexScan plans to add_path. (A
+	 * plain IndexPath can represent either a plain IndexScan or an
+	 * IndexOnlyScan, but for our purposes here that distinction does not
+	 * matter.  However, some of the indexes might support only bitmap scans,
+	 * and those we mustn't submit to add_path here.)
 	 *
-	 * 同时，挑选出能用于位图扫描的路径。只考虑支持位图扫描的索引，
-	 * 且只要路径有选择性（即不是仅用于排序的路径）。
+	 * Also, pick out the ones that are usable as bitmap scans.  For that, we
+	 * must discard indexes that don't support bitmap scans, and we also are
+	 * only interested in paths that have some selectivity; we should discard
+	 * anything that was generated solely for ordering purposes.
 	 */
 	foreach(lc, indexpaths)
 	{
@@ -805,8 +800,9 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * 如果有 ScalarArrayOpExpr 条件但索引不支持原生处理，
-	 * 则生成依赖于执行器处理 ScalarArrayOpExpr 的位图扫描路径。
+	 * If there were ScalarArrayOpExpr clauses that the index can't handle
+	 * natively, generate bitmap scan paths relying on executor-managed
+	 * ScalarArrayOpExpr.
 	 */
 	if (skip_nonnative_saop)
 	{
@@ -822,397 +818,323 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * build_index_paths
- *    根据给定索引和索引条件集合，构建零个或多个IndexPath，同时构建零个或多个部分并行索引路径(partial IndexPaths)
+ *	  Given an index and a set of index clauses for it, construct zero
+ *	  or more IndexPaths. It also constructs zero or more partial IndexPaths.
  *
- * 函数返回路径列表的原因：(1) 该函数检查某些不应生成任何IndexPath的情况；(2) 在某些情况下
- * 我们需要同时考虑正向和反向扫描，以获取两种排序顺序。注意：这些路径只是返回给调用者，
- * 不会立即通过add_path()添加。
+ * We return a list of paths because (1) this routine checks some cases
+ * that should cause us to not generate any IndexPath, and (2) in some
+ * cases we want to consider both a forward and a backward scan, so as
+ * to obtain both sort orders.  Note that the paths are just returned
+ * to the caller and not immediately fed to add_path().
  *
- * 在顶层调用时，useful_predicate参数应精确对应索引的predOK标志（即如果索引有一个已被限制
- * 条件证明的谓词，则为true）。当处理OR子句的一个分支时，如果该谓词要求证明当前OR列表，则
- * useful_predicate应为true。注意：如果索引具有不可证明的谓词，则根本不应调用此函数。
+ * At top level, useful_predicate should be exactly the index's predOK flag
+ * (ie, true if it has a predicate that was proven from the restriction
+ * clauses).  When working on an arm of an OR clause, useful_predicate
+ * should be true if the predicate required the current OR list to be proven.
+ * Note that this routine should never be called at all if the index has an
+ * unprovable predicate.
  *
- * scantype指示我们是否要创建普通索引扫描、位图索引扫描或两者都创建。当它为ST_BITMAPSCAN时，
- * 我们在决定是否生成路径时不会考虑索引顺序。
+ * scantype indicates whether we want to create plain indexscans, bitmap
+ * indexscans, or both.  When it's ST_BITMAPSCAN, we will not consider
+ * index ordering while deciding if a Path is worth generating.
  *
- * 如果skip_nonnative_saop不为NULL，除非索引AM直接支持，否则我们将忽略ScalarArrayOpExpr条件，
- * 并且如果我们发现任何此类条件，我们将*skip_nonnative_saop设置为true（调用者必须将变量初始化为false）。
- * 如果它为NULL，我们不会忽略ScalarArrayOpExpr条件。
+ * If skip_nonnative_saop is non-NULL, we ignore ScalarArrayOpExpr clauses
+ * unless the index AM supports them directly, and we set *skip_nonnative_saop
+ * to true if we found any such clauses (caller must initialize the variable
+ * to false).  If it's NULL, we do not ignore ScalarArrayOpExpr clauses.
  *
- * 如果skip_lower_saop不为NULL，我们将忽略非第一索引列的ScalarArrayOpExpr条件，如果我们发现
- * 任何此类条件，我们将*skip_lower_saop设置为true（调用者必须将变量初始化为false）。如果它为NULL，
- * 我们不会忽略非第一列的ScalarArrayOpExpr条件，但它们会导致扫描输出被视为无序。
+ * If skip_lower_saop is non-NULL, we ignore ScalarArrayOpExpr clauses for
+ * non-first index columns, and we set *skip_lower_saop to true if we found
+ * any such clauses (caller must initialize the variable to false).  If it's
+ * NULL, we do not ignore non-first ScalarArrayOpExpr clauses, but they will
+ * result in considering the scan's output to be unordered.
  *
- * 参数：
- *   root - 查询规划器的根结构，包含查询的所有规划信息
- *   rel - 索引对应的堆表关系
- *   index - 我们要为其生成路径的索引
- *   clauses - 可用于索引的条件集合(IndexClause节点)
- *   useful_predicate - 指示索引是否有有用的谓词
- *   scantype - 指示我们需要普通还是位图扫描支持
- *   skip_nonnative_saop - 指示如果索引AM不支持，是否接受SAOP
- *   skip_lower_saop - 指示是否接受非首列的SAOP
- *
- * 返回值：
- *   生成的IndexPath路径列表，可能为空
+ * 'rel' is the index's heap relation
+ * 'index' is the index for which we want to generate paths
+ * 'clauses' is the collection of indexable clauses (IndexClause nodes)
+ * 'useful_predicate' indicates whether the index has a useful predicate
+ * 'scantype' indicates whether we need plain or bitmap scan support
+ * 'skip_nonnative_saop' indicates whether to accept SAOP if index AM doesn't
+ * 'skip_lower_saop' indicates whether to accept non-first-column SAOP
  */
 static List *
 build_index_paths(PlannerInfo *root, RelOptInfo *rel,
-                  IndexOptInfo *index, IndexClauseSet *clauses,
-                  bool useful_predicate,
-                  ScanTypeControl scantype,
-                  bool *skip_nonnative_saop,
-                  bool *skip_lower_saop)
+				  IndexOptInfo *index, IndexClauseSet *clauses,
+				  bool useful_predicate,
+				  ScanTypeControl scantype,
+				  bool *skip_nonnative_saop,
+				  bool *skip_lower_saop)
 {
-    // 局部变量声明
-    List       *result = NIL;           // 存储生成的索引路径结果列表
-    IndexPath  *ipath;                  // 当前生成的索引路径
-    List       *index_clauses;          // 收集可用于索引的条件
-    Relids      outer_relids;           // 外部关系ID集合
-    double      loop_count;             // 循环计数，用于成本估算
-    List       *orderbyclauses;         // ORDER BY子句
-    List       *orderbyclausecols;      // ORDER BY子句对应的列
-    List       *index_pathkeys;         // 索引的排序键
-    List       *useful_pathkeys;        // 对当前查询有用的排序键
-    bool        found_lower_saop_clause; // 标记是否发现非首列的SAOP条件
-    bool        pathkeys_possibly_useful; // 标记排序键是否可能有用
-    bool        index_is_ordered;       // 标记索引是否有序
-    bool        index_only_scan;        // 标记是否可以进行仅索引扫描
-    int         indexcol;               // 当前处理的索引列
+	List	   *result = NIL;
+	IndexPath  *ipath;
+	List	   *index_clauses;
+	Relids		outer_relids;
+	double		loop_count;
+	List	   *orderbyclauses;
+	List	   *orderbyclausecols;
+	List	   *index_pathkeys;
+	List	   *useful_pathkeys;
+	bool		found_lower_saop_clause;
+	bool		pathkeys_possibly_useful;
+	bool		index_is_ordered;
+	bool		index_only_scan;
+	int			indexcol;
 
-    /*
-     * 检查索引是否支持所需的扫描类型
-     * 根据scantype参数验证索引的访问方法是否支持对应扫描
-     */
-    switch (scantype)
-    {
-        case ST_INDEXSCAN:  // 普通索引扫描
-            // 检查索引访问方法是否支持gettuple操作
-            if (!index->amhasgettuple)
-                return NIL;  // 不支持则返回空列表
-            break;
-        case ST_BITMAPSCAN: // 位图索引扫描
-            // 检查索引访问方法是否支持getbitmap操作
-            if (!index->amhasgetbitmap)
-                return NIL;  // 不支持则返回空列表
-            break;
-        case ST_ANYSCAN:    // 任意类型扫描（普通或位图）
-            /* 两种类型都可以，无需检查 */
-            break;
-    }
-
-    /*
-	 * 第一步：把分散在各个列上的查询条件，收集并整理成一个有序的大列表，为后续生成索引扫描路径做准备。
-     *
-     * 结果列表中的条件按索引键排序，使得列号形成非递减序列。
-     * （btree和可能的其他地方依赖于此顺序）。如果索引AM允许，
-     * 该列表可以为空。
-     *
-     * found_lower_saop_clause在我们接受非第一索引列的ScalarArrayOpExpr
-     * 索引条件时设置为true。这会阻止我们假设扫描结果是有序的。
-     * （实际上，如果所有前面的列都有相等约束，结果仍然是有序的，但
-     * 让这段代码了解这种改进似乎太昂贵且不符合模块化原则）。
-     *
-     * 我们还构建一个Relids集，显示所选条件所需的外部关系。
-     * lateral_relids包含在其中，但不单独考虑。
-     */
-	index_clauses = NIL;                // 准备一个空列表，用来装最终结果
-    found_lower_saop_clause = false;    // 初始化为未发现非首列SAOP条件
 	/*
-	 * 复制关系的lateral_relids作为外部关系的初始集合
-	 * 如果这些条件里引用了其他表（比如 a = t2.x），
-	 * 我们需要记录下来，因为这意味着这个索引扫描是参数化的（必须先算出 t2.x 才能扫 t1）。
+	 * Check that index supports the desired scan type(s)
 	 */
+	switch (scantype)
+	{
+		case ST_INDEXSCAN:
+			if (!index->amhasgettuple)
+				return NIL;
+			break;
+		case ST_BITMAPSCAN:
+			if (!index->amhasgetbitmap)
+				return NIL;
+			break;
+		case ST_ANYSCAN:
+			/* either or both are OK */
+			break;
+	}
+
+	/*
+	 * 1. Combine the per-column IndexClause lists into an overall list.
+	 *
+	 * In the resulting list, clauses are ordered by index key, so that the
+	 * column numbers form a nondecreasing sequence.  (This order is depended
+	 * on by btree and possibly other places.)  The list can be empty, if the
+	 * index AM allows that.
+	 *
+	 * found_lower_saop_clause is set true if we accept a ScalarArrayOpExpr
+	 * index clause for a non-first index column.  This prevents us from
+	 * assuming that the scan result is ordered.  (Actually, the result is
+	 * still ordered if there are equality constraints for all earlier
+	 * columns, but it seems too expensive and non-modular for this code to be
+	 * aware of that refinement.)
+	 *
+	 * We also build a Relids set showing which outer rels are required by the
+	 * selected clauses.  Any lateral_relids are included in that, but not
+	 * otherwise accounted for.
+	 */
+	index_clauses = NIL;
+	found_lower_saop_clause = false;
 	outer_relids = bms_copy(rel->lateral_relids);
-    // 遍历索引的所有键列
-    for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
-    {
-        ListCell   *lc;
+	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
+	{
+		ListCell   *lc;
 
-        // 遍历当前列的所有索引条件
-        foreach(lc, clauses->indexclauses[indexcol])
-        {
-            IndexClause *iclause = (IndexClause *) lfirst(lc);
-            RestrictInfo *rinfo = iclause->rinfo;
+		foreach(lc, clauses->indexclauses[indexcol])
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
+			RestrictInfo *rinfo = iclause->rinfo;
 
-			/* 处理ScalarArrayOpExpr类型的条件（例如 IN (...) 或 ANY (...)） */
+			/* We might need to omit ScalarArrayOpExpr clauses */
 			if (IsA(rinfo->clause, ScalarArrayOpExpr))
 			{
-				/*
-				 * 检查索引是否原生支持数组搜索操作（如 B-Tree 支持，但某些索引可能不支持）。
-				 * 如果不支持，我们通常不能在普通索引扫描中使用它。
-				 */
 				if (!index->amsearcharray)
 				{
 					if (skip_nonnative_saop)
 					{
-						/*
-						 * 如果调用者要求跳过非原生支持的数组操作（通常是为了构建普通索引路径），
-						 * 则标记 skip_nonnative_saop 为 true 并跳过此条件。
-						 * 这种条件只能在位图扫描（Bitmap Scan）中使用。
-						 */
+						/* Ignore because not supported by index */
 						*skip_nonnative_saop = true;
 						continue;
 					}
-					/* 如果没跳过，那必须是位图扫描，因为位图扫描可以通过多次查找来模拟数组搜索 */
+					/* Caller had better intend this only for bitmap scan */
 					Assert(scantype == ST_BITMAPSCAN);
 				}
-
-				/*
-				 * 处理非首列（indexcol > 0）的数组操作条件。
-				 * 在 B-Tree 索引中，如果在非首列使用 IN/ANY，通常会导致扫描结果不再有序。
-				 *
-				 * 解释：
-				 * B-Tree 索引的有序性是基于“字典序”的。如果在前面的列上使用了多个值（IN 或 ANY），
-				 * 那么对于后面的列来说，它们在整个结果集中就不再是连续且有序的了。
-				 *
-				 * 例如：索引 (a, b)，查询 WHERE a IN (1, 2) ORDER BY b
-				 * 扫描顺序可能是：
-				 * a=1: (1, 10), (1, 20)
-				 * a=2: (2, 5), (2, 15)
-				 * 最终结果序列 b: 10, 20, 5, 15 -> 乱序。
-				 *
-				 * 同理，如果索引是 (a, b, c)，查询 WHERE a=1 AND b IN (2, 3)，
-				 * 那么 c 的有序性也会被破坏。
-				 */
 				if (indexcol > 0)
 				{
 					if (skip_lower_saop)
 					{
-						/*
-						 * 如果调用者想要保留索引的排序能力（例如为了 ORDER BY），
-						 * 我们必须跳过这些会破坏排序的非首列数组条件。
-						 * 标记 skip_lower_saop 为 true 并跳过。
-						 */
+						/* Caller doesn't want to lose index ordering */
 						*skip_lower_saop = true;
 						continue;
 					}
-					/*
-					 * 如果不跳过，说明我们优先考虑过滤性能而非排序。
-					 * 记录 found_lower_saop_clause = true，表示结果可能是乱序的。
-					 */
 					found_lower_saop_clause = true;
 				}
-			}            /* 条件可用，将其添加到索引条件列表 */
-            index_clauses = lappend(index_clauses, iclause);
-            /*
-             * 将条件涉及的外部关系添加到 outer_relids 集合。
-             * outer_relids 记录了当前索引扫描路径所依赖的所有外部表（Outer Relations）的 ID 集合。
-             * 如果 outer_relids 不为空，意味着这是一个参数化路径（Parameterized Path），
-             * 必须在获取了这些外部表的值之后才能执行。
-             */
-            outer_relids = bms_add_members(outer_relids,
-                                           rinfo->clause_relids);
-        }
+			}
+
+			/* OK to include this clause */
+			index_clauses = lappend(index_clauses, iclause);
+			outer_relids = bms_add_members(outer_relids,
+										   rinfo->clause_relids);
+		}
 
 		/*
-		 * 早期退出（Early Exit）检查。
-		 * 如果这种索引类型必须要有查询条件才能工作（比如 Hash 索引），
-		 * 但我们连第一个列的查询条件都没找到，那就别试了，这个索引没法用。
-		 *
-		 * index_clauses == NIL 表示到目前为止没有任何可用的索引条件。
-		 * !index->amoptionalkey 表示该索引类型不允许没有任何键条件的扫描。
-		 *		比如 Hash 索引就要求至少有一个键条件才能使用。
-		 *		而 B-Tree 索引则允许没有键条件的全表扫描。
-		 *
-		 * 如果两者都成立，说明当前索引无法满足查询条件的要求，
-		 * 因此直接返回空列表，表示无法生成任何索引路径。
+		 * If no clauses match the first index column, check for amoptionalkey
+		 * restriction.  We can't generate a scan over an index with
+		 * amoptionalkey = false unless there's at least one index clause.
+		 * (When working on columns after the first, this test cannot fail. It
+		 * is always okay for columns after the first to not have any
+		 * clauses.)
 		 */
-        if (index_clauses == NIL && !index->amoptionalkey)
-            return NIL;  // 不满足条件，返回空列表
-    }
+		if (index_clauses == NIL && !index->amoptionalkey)
+			return NIL;
+	}
 
-	/*
-	 * 从outer_relids中移除索引自己的关系ID
-	 * 清理和规范化 outer_relids 集合，确保它只包含真正的“外部”依赖。
-	 */
+	/* We do not want the index's rel itself listed in outer_relids */
 	outer_relids = bms_del_member(outer_relids, rel->relid);
-	/*
-	 * 将空的 Bitmapset 指针规范化为 NULL
-	 * 虽然空的 Bitmapset 在逻辑上也是空集，但为了后续代码判断方便（直接检查 if (outer_relids)），
-	 * 这里统一将其置为 NULL。
-	 */
+	/* Enforce convention that outer_relids is exactly NULL if empty */
 	if (bms_is_empty(outer_relids))
-        outer_relids = NULL;
+		outer_relids = NULL;
 
-    /* 计算用于成本估算的循环计数 */
-    loop_count = get_loop_count(root, rel->relid, outer_relids);
+	/* Compute loop_count for cost estimation purposes */
+	loop_count = get_loop_count(root, rel->relid, outer_relids);
 
 	/*
-	 * 第二步：确定这个索引扫描路径是否能提供有用的排序（PathKeys）。
-	 * 优化器想知道：“如果我用这个索引扫描，出来的结果是不是天然有序的？
-	 * 如果是，这个顺序对当前的查询（比如 ORDER BY 或 Merge Join）有用吗？”
-	 * 这与我们只尝试构建位图索引扫描的情况无关，也与我们必须假设扫描无序的情况无关
-     */
-	/*
-	 * 只有同时满足以下三个条件，我们才关心排序：
-	 * 1、不是位图扫描 (scantype != ST_BITMAPSCAN)：位图扫描出来的结果是按物理块号排序的，
-	 * 索引本身的逻辑顺序会丢失，所以位图扫描永远不提供逻辑排序。
-	 * 2、没有乱序因素 (!found_lower_saop_clause)：之前提到过，如果在非首列用了 IN，B-Tree 的排序就乱了。如果乱了，那也就没法提供排序了。
-	 * 3、查询确实需要排序 (has_useful_pathkeys)：如果用户查询既没有 ORDER BY，也没有 GROUP BY，也不需要 Merge Join，那就算索引有序也没啥用，不用费劲去算了。
+	 * 2. Compute pathkeys describing index's ordering, if any, then see how
+	 * many of them are actually useful for this query.  This is not relevant
+	 * if we are only trying to build bitmap indexscans, nor if we have to
+	 * assume the scan is unordered.
 	 */
 	pathkeys_possibly_useful = (scantype != ST_BITMAPSCAN &&
-                               !found_lower_saop_clause &&
-                               has_useful_pathkeys(root, rel));
-    // 检查索引是否有序（通过sortopfamily是否存在判断）
-    index_is_ordered = (index->sortopfamily != NULL);
-    if (index_is_ordered && pathkeys_possibly_useful)
-    {
-        // 构建正向扫描方向的索引排序键
-        index_pathkeys = build_index_pathkeys(root, index,
-                                              ForwardScanDirection);
-        // 截断无用的排序键
-        useful_pathkeys = truncate_useless_pathkeys(root, rel,
-                                                   index_pathkeys);
-        orderbyclauses = NIL;
-        orderbyclausecols = NIL;
-    }
-    else if (index->amcanorderbyop && pathkeys_possibly_useful)
-    {
-        /* 查看我们是否可以为query_pathkeys生成排序操作符 */
-        match_pathkeys_to_index(index, root->query_pathkeys,
-                               &orderbyclauses,
-                               &orderbyclausecols);
-        if (orderbyclauses)
-            useful_pathkeys = root->query_pathkeys;
-        else
-            useful_pathkeys = NIL;
-    }
-    else
-    {
-        // 排序键无用的情况
-        useful_pathkeys = NIL;
-        orderbyclauses = NIL;
-        orderbyclausecols = NIL;
-    }
+								!found_lower_saop_clause &&
+								has_useful_pathkeys(root, rel));
+	index_is_ordered = (index->sortopfamily != NULL);
+	if (index_is_ordered && pathkeys_possibly_useful)
+	{
+		index_pathkeys = build_index_pathkeys(root, index,
+											  ForwardScanDirection);
+		useful_pathkeys = truncate_useless_pathkeys(root, rel,
+													index_pathkeys);
+		orderbyclauses = NIL;
+		orderbyclausecols = NIL;
+	}
+	else if (index->amcanorderbyop && pathkeys_possibly_useful)
+	{
+		/* see if we can generate ordering operators for query_pathkeys */
+		match_pathkeys_to_index(index, root->query_pathkeys,
+								&orderbyclauses,
+								&orderbyclausecols);
+		if (orderbyclauses)
+			useful_pathkeys = root->query_pathkeys;
+		else
+			useful_pathkeys = NIL;
+	}
+	else
+	{
+		useful_pathkeys = NIL;
+		orderbyclauses = NIL;
+		orderbyclausecols = NIL;
+	}
 
-    /*
-     * 第三步：检查是否可以进行仅索引扫描
-     * 如果我们不构建普通索引扫描，则这无关紧要，因为位图扫描无论如何都不支持索引数据检索
-     */
-    index_only_scan = (scantype != ST_BITMAPSCAN &&
-                      check_index_only(rel, index));
+	/*
+	 * 3. Check if an index-only scan is possible.  If we're not building
+	 * plain indexscans, this isn't relevant since bitmap scans don't support
+	 * index data retrieval anyway.
+	 */
+	index_only_scan = (scantype != ST_BITMAPSCAN &&
+					   check_index_only(rel, index));
 
-    /*
-     * 第四步：如果当前条件中有相关的限制条件，或者索引排序可能对后续合并或最终输出排序有用，
-     * 或者索引有有用的谓词，或者可以进行仅索引扫描，则生成索引扫描路径
-     */
-    if (index_clauses != NIL || useful_pathkeys != NIL || useful_predicate ||
-        index_only_scan)
-    {
-        // 创建索引路径（非并行）
-        ipath = create_index_path(root, index,
-                                 index_clauses,
-                                 orderbyclauses,
-                                 orderbyclausecols,
-                                 useful_pathkeys,
-                                 index_is_ordered ?
-                                 ForwardScanDirection :
-                                 NoMovementScanDirection,
-                                 index_only_scan,
-                                 outer_relids,
-                                 loop_count,
-                                 false);
-        // 将路径添加到结果列表
-        result = lappend(result, ipath);
+	/*
+	 * 4. Generate an indexscan path if there are relevant restriction clauses
+	 * in the current clauses, OR the index ordering is potentially useful for
+	 * later merging or final output ordering, OR the index has a useful
+	 * predicate, OR an index-only scan is possible.
+	 */
+	if (index_clauses != NIL || useful_pathkeys != NIL || useful_predicate ||
+		index_only_scan)
+	{
+		ipath = create_index_path(root, index,
+								  index_clauses,
+								  orderbyclauses,
+								  orderbyclausecols,
+								  useful_pathkeys,
+								  index_is_ordered ?
+								  ForwardScanDirection :
+								  NoMovementScanDirection,
+								  index_only_scan,
+								  outer_relids,
+								  loop_count,
+								  false);
+		result = lappend(result, ipath);
 
-        /*
-         * 如果适合，考虑并行索引扫描
-         * 位图索引扫描不允许并行索引扫描
-         */
-        if (index->amcanparallel &&          // 索引支持并行操作
-            rel->consider_parallel &&        // 关系允许并行
-            outer_relids == NULL &&          // 没有外部关系依赖
-            scantype != ST_BITMAPSCAN)       // 不是位图扫描
-        {
-            // 创建并行索引路径
-            ipath = create_index_path(root, index,
-                                     index_clauses,
-                                     orderbyclauses,
-                                     orderbyclausecols,
-                                     useful_pathkeys,
-                                     index_is_ordered ?
-                                     ForwardScanDirection :
-                                     NoMovementScanDirection,
-                                     index_only_scan,
-                                     outer_relids,
-                                     loop_count,
-                                     true); // 启用并行
+		/*
+		 * If appropriate, consider parallel index scan.  We don't allow
+		 * parallel index scan for bitmap index scans.
+		 */
+		if (index->amcanparallel &&
+			rel->consider_parallel && outer_relids == NULL &&
+			scantype != ST_BITMAPSCAN)
+		{
+			ipath = create_index_path(root, index,
+									  index_clauses,
+									  orderbyclauses,
+									  orderbyclausecols,
+									  useful_pathkeys,
+									  index_is_ordered ?
+									  ForwardScanDirection :
+									  NoMovementScanDirection,
+									  index_only_scan,
+									  outer_relids,
+									  loop_count,
+									  true);
 
-            /*
-             * 成本计算后，如果发现使用并行工作进程不值得，就释放它
-             * 否则将其添加为部分路径
-             */
-            if (ipath->path.parallel_workers > 0)
-                add_partial_path(rel, (Path *) ipath);
-            else
-                pfree(ipath);
-        }
-    }
+			/*
+			 * if, after costing the path, we find that it's not worth using
+			 * parallel workers, just free it.
+			 */
+			if (ipath->path.parallel_workers > 0)
+				add_partial_path(rel, (Path *) ipath);
+			else
+				pfree(ipath);
+		}
+	}
 
-    /*
-     * 第五步：如果索引是有序的，反向扫描可能也很有用
-     * 对于需要反向排序的查询，反向索引扫描可能更有效
-     */
-    if (index_is_ordered && pathkeys_possibly_useful)
-    {
-        // 构建反向扫描方向的索引排序键
-        index_pathkeys = build_index_pathkeys(root, index,
-                                              BackwardScanDirection);
-        // 截断无用的排序键
-        useful_pathkeys = truncate_useless_pathkeys(root, rel,
-                                                   index_pathkeys);
-        // 只有当反向排序键有用时，才生成反向扫描路径
-        if (useful_pathkeys != NIL)
-        {
-            // 创建反向索引路径（非并行）
-            ipath = create_index_path(root, index,
-                                     index_clauses,
-                                     NIL,
-                                     NIL,
-                                     useful_pathkeys,
-                                     BackwardScanDirection,
-                                     index_only_scan,
-                                     outer_relids,
-                                     loop_count,
-                                     false);
-            // 将路径添加到结果列表
-            result = lappend(result, ipath);
+	/*
+	 * 5. If the index is ordered, a backwards scan might be interesting.
+	 */
+	if (index_is_ordered && pathkeys_possibly_useful)
+	{
+		index_pathkeys = build_index_pathkeys(root, index,
+											  BackwardScanDirection);
+		useful_pathkeys = truncate_useless_pathkeys(root, rel,
+													index_pathkeys);
+		if (useful_pathkeys != NIL)
+		{
+			ipath = create_index_path(root, index,
+									  index_clauses,
+									  NIL,
+									  NIL,
+									  useful_pathkeys,
+									  BackwardScanDirection,
+									  index_only_scan,
+									  outer_relids,
+									  loop_count,
+									  false);
+			result = lappend(result, ipath);
 
-            /* 如果适合，考虑并行反向索引扫描 */
-            if (index->amcanparallel &&          // 索引支持并行操作
-                rel->consider_parallel &&        // 关系允许并行
-                outer_relids == NULL &&          // 没有外部关系依赖
-                scantype != ST_BITMAPSCAN)       // 不是位图扫描
-            {
-                // 创建并行反向索引路径
-                ipath = create_index_path(root, index,
-                                         index_clauses,
-                                         NIL,
-                                         NIL,
-                                         useful_pathkeys,
-                                         BackwardScanDirection,
-                                         index_only_scan,
-                                         outer_relids,
-                                         loop_count,
-                                         true); // 启用并行
+			/* If appropriate, consider parallel index scan */
+			if (index->amcanparallel &&
+				rel->consider_parallel && outer_relids == NULL &&
+				scantype != ST_BITMAPSCAN)
+			{
+				ipath = create_index_path(root, index,
+										  index_clauses,
+										  NIL,
+										  NIL,
+										  useful_pathkeys,
+										  BackwardScanDirection,
+										  index_only_scan,
+										  outer_relids,
+										  loop_count,
+										  true);
 
-                /*
-                 * 成本计算后，如果发现使用并行工作进程不值得，就释放它
-                 * 否则将其添加为部分路径
-                 */
-                if (ipath->path.parallel_workers > 0)
-                    add_partial_path(rel, (Path *) ipath);
-                else
-                    pfree(ipath);
-            }
-        }
-    }
+				/*
+				 * if, after costing the path, we find that it's not worth
+				 * using parallel workers, just free it.
+				 */
+				if (ipath->path.parallel_workers > 0)
+					add_partial_path(rel, (Path *) ipath);
+				else
+					pfree(ipath);
+			}
+		}
+	}
 
-    /* 返回生成的所有索引路径列表 */
-    return result;
+	return result;
 }
-
 
 /*
  * build_paths_for_OR
@@ -1325,127 +1247,110 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 
 	return result;
 }
+
 /*
  * generate_bitmap_or_paths
- *    遍历条件列表寻找OR子句，并为每个可以处理的OR子句生成一个BitmapOrPath
- *    返回生成的BitmapOrPaths列表
+ *		Look through the list of clauses to find OR clauses, and generate
+ *		a BitmapOrPath for each one we can handle that way.  Return a list
+ *		of the generated BitmapOrPaths.
  *
- * other_clauses是一个额外条件列表，在生成indexquals时可以假设这些条件为真，
- * 但不会在其中搜索OR子句。（详见build_paths_for_OR()的动机说明）
- *
- * 参数：
- *   root - 查询规划器的根结构，包含查询的规划信息
- *   rel - 要生成路径的关系
- *   clauses - 要检查OR子句的条件列表
- *   other_clauses - 额外的上下文条件列表
- *
- * 返回值：
- *   生成的BitmapOrPath路径列表
+ * other_clauses is a list of additional clauses that can be assumed true
+ * for the purpose of generating indexquals, but are not to be searched for
+ * ORs.  (See build_paths_for_OR() for motivation.)
  */
 static List *
 generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
-                         List *clauses, List *other_clauses)
+						 List *clauses, List *other_clauses)
 {
-    List       *result = NIL;          // 存储生成的BitmapOrPath结果列表
-    List       *all_clauses;           // 所有条件（clauses和other_clauses的合并）
-    ListCell   *lc;                    // 用于遍历clauses列表的迭代器
+	List	   *result = NIL;
+	List	   *all_clauses;
+	ListCell   *lc;
 
-    /*
-     * 我们可以将当前条件和其他条件都用作build_paths_for_OR的上下文；
-     * 无需从列表中移除OR子句
-     */
-    // 复制clauses列表并与other_clauses合并
-    all_clauses = list_concat(list_copy(clauses), other_clauses);
+	/*
+	 * We can use both the current and other clauses as context for
+	 * build_paths_for_OR; no need to remove ORs from the lists.
+	 */
+	all_clauses = list_concat(list_copy(clauses), other_clauses);
 
-    // 遍历每个条件，寻找OR子句
-    foreach(lc, clauses)
-    {
-        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);  // 当前条件
-        List       *pathlist;          // 存储每个OR分支匹配的最佳位图路径
-        Path       *bitmapqual;        // 位图条件路径
-        ListCell   *j;                 // 用于遍历OR子句参数的迭代器
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		List	   *pathlist;
+		Path	   *bitmapqual;
+		ListCell   *j;
 
-        /* 忽略不是OR子句的RestrictInfo */
-        if (!restriction_is_or_clause(rinfo))
-            continue;
+		/* Ignore RestrictInfos that aren't ORs */
+		if (!restriction_is_or_clause(rinfo))
+			continue;
 
-        /*
-         * 我们必须能够为OR的每个分支匹配至少一个索引，否则无法使用它
-         */
-        pathlist = NIL;  // 初始化OR分支路径列表
-        // 遍历OR子句的每个参数
-        foreach(j, ((BoolExpr *) rinfo->orclause)->args)
-        {
-            Node       *orarg = (Node *) lfirst(j);  // OR子句的一个分支
-            List       *indlist;                     // 该分支匹配的索引路径列表
+		/*
+		 * We must be able to match at least one index to each of the arms of
+		 * the OR, else we can't use it.
+		 */
+		pathlist = NIL;
+		foreach(j, ((BoolExpr *) rinfo->orclause)->args)
+		{
+			Node	   *orarg = (Node *) lfirst(j);
+			List	   *indlist;
 
-            /* OR参数应该是AND子句或子RestrictInfo */
-            if (is_andclause(orarg))
-            {
-                // OR分支是AND子句
-                List       *andargs = ((BoolExpr *) orarg)->args;
+			/* OR arguments should be ANDs or sub-RestrictInfos */
+			if (is_andclause(orarg))
+			{
+				List	   *andargs = ((BoolExpr *) orarg)->args;
 
-                // 为AND子句构建索引路径
-                indlist = build_paths_for_OR(root, rel,
-                                            andargs,
-                                            all_clauses);
+				indlist = build_paths_for_OR(root, rel,
+											 andargs,
+											 all_clauses);
 
-                /* 递归处理可能存在的子OR子句 */
-                indlist = list_concat(indlist,
-                                    generate_bitmap_or_paths(root, rel,
-                                                            andargs,
-                                                            all_clauses));
-            }
-            else
-            {
-                // OR分支是单个条件
-                RestrictInfo *or_rinfo = castNode(RestrictInfo, orarg);
-                List       *orargs;
+				/* Recurse in case there are sub-ORs */
+				indlist = list_concat(indlist,
+									  generate_bitmap_or_paths(root, rel,
+															   andargs,
+															   all_clauses));
+			}
+			else
+			{
+				RestrictInfo *rinfo = castNode(RestrictInfo, orarg);
+				List	   *orargs;
 
-                // 断言：单个OR分支不应该是OR子句
-                Assert(!restriction_is_or_clause(or_rinfo));
-                // 创建只有一个元素的列表
-                orargs = list_make1(or_rinfo);
+				Assert(!restriction_is_or_clause(rinfo));
+				orargs = list_make1(rinfo);
 
-                // 为单个条件构建索引路径
-                indlist = build_paths_for_OR(root, rel,
-                                            orargs,
-                                            all_clauses);
-            }
+				indlist = build_paths_for_OR(root, rel,
+											 orargs,
+											 all_clauses);
+			}
 
-            /*
-             * 如果这个分支没有匹配到任何索引路径，
-             * 我们就无法处理这个OR子句
-             */
-            if (indlist == NIL)
-            {
-                pathlist = NIL;  // 标记整个OR子句无法处理
-                break;          // 跳出循环，不再处理其他分支
-            }
+			/*
+			 * If nothing matched this arm, we can't do anything with this OR
+			 * clause.
+			 */
+			if (indlist == NIL)
+			{
+				pathlist = NIL;
+				break;
+			}
 
-            /*
-             * 从匹配的索引路径中选择最有希望的AND组合，
-             * 并将其添加到pathlist
-             */
-            bitmapqual = choose_bitmap_and(root, rel, indlist);
-            pathlist = lappend(pathlist, bitmapqual);
-        }
+			/*
+			 * OK, pick the most promising AND combination, and add it to
+			 * pathlist.
+			 */
+			bitmapqual = choose_bitmap_and(root, rel, indlist);
+			pathlist = lappend(pathlist, bitmapqual);
+		}
 
-        /*
-         * 如果我们为OR的每个分支都找到了匹配的路径，
-         * 那么将它们转换为BitmapOrPath，并添加到结果列表
-         */
-        if (pathlist != NIL)
-        {
-            // 创建位图OR路径
-            bitmapqual = (Path *) create_bitmap_or_path(root, rel, pathlist);
-            // 将路径添加到结果列表
-            result = lappend(result, bitmapqual);
-        }
-    }
+		/*
+		 * If we have a match for every arm, then turn them into a
+		 * BitmapOrPath, and add to result list.
+		 */
+		if (pathlist != NIL)
+		{
+			bitmapqual = (Path *) create_bitmap_or_path(root, rel, pathlist);
+			result = lappend(result, bitmapqual);
+		}
+	}
 
-    // 返回生成的所有BitmapOrPath列表
-    return result;
+	return result;
 }
 
 
@@ -1998,20 +1903,29 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 
 /*
  * get_loop_count
- *		为带有给定外部关系ID集合的参数化路径选择用于成本估算的循环次数。
+ *		Choose the loop count estimate to use for costing a parameterized path
+ *		with the given set of outer relids.
  *
- * 由于我们在生成连接关系之前就会生成参数化路径，因此无法准确预测参数化路径会被迭代多少次；
- * 我们不知道嵌套循环外层的关系有多大。不过，我们应该在路径成本估算时以某种方式考虑多次迭代的影响。
- * 这里采用的启发式方法是：使用路径所需的所有外部基本关系中，行数最小的那个的行数作为循环次数。
- * （也可以考虑用最大的那个，但那样太乐观了。）对于只有一个外部关系的情况，这当然是正确的；
- * 对于多表连接，这也是一种合理的零阶近似。
+ * Since we produce parameterized paths before we've begun to generate join
+ * relations, it's impossible to predict exactly how many times a parameterized
+ * path will be iterated; we don't know the size of the relation that will be
+ * on the outside of the nestloop.  However, we should try to account for
+ * multiple iterations somehow in costing the path.  The heuristic embodied
+ * here is to use the rowcount of the smallest other base relation needed in
+ * the join clauses used by the path.  (We could alternatively consider the
+ * largest one, but that seems too optimistic.)  This is of course the right
+ * answer for single-other-relation cases, and it seems like a reasonable
+ * zero-order approximation for multiway-join cases.
  *
- * 此外，我们还会检查每个连接条件的另一侧是否处于某个半连接（semijoin）的内表，
- * 而当前关系处于外表。如果是这样，参数化路径只有在半连接右表已经去重（unique-ified）时才能使用，
- * 因此我们应该用右表唯一行数而不是原始行数。
+ * In addition, we check to see if the other side of each join clause is on
+ * the inside of some semijoin that the current relation is on the outside of.
+ * If so, the only way that a parameterized path could be used is if the
+ * semijoin RHS has been unique-ified, so we should use the number of unique
+ * RHS rows rather than using the relation's raw rowcount.
  *
- * 注意：为了让本函数工作，allpaths.c 必须在开始计算路径之前（或至少在调用 create_index_paths() 之前）
- * 就为所有基表关系建立好行数估算。
+ * Note: for this to work, allpaths.c must establish all baserel size
+ * estimates before it begins to compute paths, or at least before it
+ * calls create_index_paths().
  */
 static double
 get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids)
@@ -2019,7 +1933,7 @@ get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids)
 	double		result;
 	int			outer_relid;
 
-	/* 非参数化路径，直接返回 1.0 */
+	/* For a non-parameterized path, just return 1.0 quickly */
 	if (outer_relids == NULL)
 		return 1.0;
 
@@ -2030,32 +1944,32 @@ get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids)
 		RelOptInfo *outer_rel;
 		double		rowcount;
 
-		/* 健壮性检查：忽略非法的 relid 下标 */
+		/* Paranoia: ignore bogus relid indexes */
 		if (outer_relid >= root->simple_rel_array_size)
 			continue;
 		outer_rel = root->simple_rel_array[outer_relid];
 		if (outer_rel == NULL)
 			continue;
-		Assert(outer_rel->relid == outer_relid);	/* 数组一致性检查 */
+		Assert(outer_rel->relid == outer_relid);	/* sanity check on array */
 
-		/* 其他关系如果被证明为空，则忽略 */
+		/* Other relation could be proven empty, if so ignore */
 		if (IS_DUMMY_REL(outer_rel))
 			continue;
 
-		/* 否则，该关系的行数估算应该已经有效 */
+		/* Otherwise, rel's rows estimate should be valid by now */
 		Assert(outer_rel->rows > 0);
 
-		/* 检查该关系是否处于某个半连接的内表 */
+		/* Check to see if rel is on the inside of any semijoins */
 		rowcount = adjust_rowcount_for_semijoins(root,
 												 cur_relid,
 												 outer_relid,
 												 outer_rel->rows);
 
-		/* 记录所有外部关系中最小的行数估算 */
+		/* Remember smallest row count estimate among the outer rels */
 		if (result == 0.0 || result > rowcount)
 			result = rowcount;
 	}
-	/* 如果没有找到有效关系，则返回 1.0（理论上不应发生） */
+	/* Return 1.0 if we found no valid relations (shouldn't happen) */
 	return (result > 0.0) ? result : 1.0;
 }
 
@@ -2148,163 +2062,124 @@ approximate_joinrel_size(PlannerInfo *root, Relids relids)
 
 /*
  * match_restriction_clauses_to_index
- *	  找出与索引匹配的限制条件，并将匹配的条件加入 *clauseset。
+ *	  Identify restriction clauses for the rel that match the index.
+ *	  Matching clauses are added to *clauseset.
  */
 static void
 match_restriction_clauses_to_index(PlannerInfo *root,
 								   IndexOptInfo *index,
 								   IndexClauseSet *clauseset)
 {
-	/* 可以忽略被索引谓词隐含的条件 */
+	/* We can ignore clauses that are implied by the index predicate */
 	match_clauses_to_index(root, index->indrestrictinfo, index, clauseset);
 }
 
 /*
  * match_join_clauses_to_index
- *    识别关系中与索引匹配的连接条件子句
- *    将匹配的子句添加到*clauseset中
- *    同时，将任何潜在可用的连接OR子句添加到*joinorclauses中
- *
- * 参数说明：
- * - root: 规划器信息根结构，包含查询的整体规划上下文
- * - rel: 正在考虑的关系优化信息结构
- * - index: 要匹配的索引优化信息结构
- * - clauseset: 输出参数，用于存储匹配索引的子句集合
- * - joinorclauses: 输出参数，用于存储潜在可用的连接OR子句列表
- *
- * 功能：此函数在查询优化过程中，寻找能够利用指定索引的连接条件，
- *      为后续生成高效的连接执行计划提供支持
+ *	  Identify join clauses for the rel that match the index.
+ *	  Matching clauses are added to *clauseset.
+ *	  Also, add any potentially usable join OR clauses to *joinorclauses.
  */
 static void
 match_join_clauses_to_index(PlannerInfo *root,
-                          RelOptInfo *rel, IndexOptInfo *index,
-                          IndexClauseSet *clauseset,
-                          List **joinorclauses)
+							RelOptInfo *rel, IndexOptInfo *index,
+							IndexClauseSet *clauseset,
+							List **joinorclauses)
 {
-    ListCell   *lc; /* 用于遍历列表的迭代器 */
+	ListCell   *lc;
 
-    /* 扫描关系的所有连接条件子句 */
-    foreach(lc, rel->joininfo)
-    {
-        /* 获取当前连接条件的RestrictInfo结构 */
-        RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+	/* Scan the rel's join clauses */
+	foreach(lc, rel->joininfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-        /* 检查该连接条件是否可以移动到当前关系上执行
-		 * 这是谓词下推(predicate pushdown)优化的关键步骤，确保条件尽可能早地执行
-		 * 如果约束条件不满足谓词下推的要求，则它没有产生参数化路径的可能性
-		 * 因此，我们跳过
-		 */
-        if (!join_clause_is_movable_to(rinfo, rel))
-            continue; /* 如果不可移动，则跳过该子句 */
+		/* Check if clause can be moved to this rel */
+		if (!join_clause_is_movable_to(rinfo, rel))
+			continue;
 
-        /* 子句可能可用，检查它是否是OR子句或是可匹配索引的子句 */
-        if (restriction_is_or_clause(rinfo))
-            /* 如果是OR子句，添加到joinorclauses列表中供后续处理 */
-            *joinorclauses = lappend(*joinorclauses, rinfo);
-        else
-			/* 否则，尝试将该子句与索引进行匹配 */
+		/* Potentially usable, so see if it matches the index or is an OR */
+		if (restriction_is_or_clause(rinfo))
+			*joinorclauses = lappend(*joinorclauses, rinfo);
+		else
 			match_clause_to_index(root, rinfo, index, clauseset);
-    }
+	}
 }
-
 
 /*
  * match_eclass_clauses_to_index
- *    识别与索引匹配的等价类(EquivalenceClass)连接子句
- *    将匹配的子句添加到*clauseset中
- *
- * 参数说明：
- * - root: 规划器信息根结构，包含查询的整体规划上下文
- * - index: 要匹配的索引优化信息结构
- * - clauseset: 输出参数，用于存储匹配索引的子句集合
- *
- * 功能：此函数在查询优化过程中，利用PostgreSQL的等价类(EC)机制，
- *      寻找能够用于索引访问的隐含连接条件，即使这些条件并未在原始查询中明确写出
+ *	  Identify EquivalenceClass join clauses for the rel that match the index.
+ *	  Matching clauses are added to *clauseset.
  */
 static void
 match_eclass_clauses_to_index(PlannerInfo *root, IndexOptInfo *index,
-                           IndexClauseSet *clauseset)
+							  IndexClauseSet *clauseset)
 {
-    int         indexcol; /* 用于遍历索引列的循环变量 */
+	int			indexcol;
 
-    /* 如果关系不在任何等价类连接中，则无需处理，直接返回 */
-    if (!index->rel->has_eclass_joins)
-        return;
+	/* No work if rel is not in any such ECs */
+	if (!index->rel->has_eclass_joins)
+		return;
 
-    /* 遍历索引的每个键列 */
-    for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
-    {
-        ec_member_matches_arg arg; /* 用于传递给回调函数的参数结构体 */
-        List       *clauses;       /* 存储生成的隐含相等性子句 */
+	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
+	{
+		ec_member_matches_arg arg;
+		List	   *clauses;
 
-        /* 设置回调函数参数，指定当前处理的索引和列 */
-        arg.index = index;
-        arg.indexcol = indexcol;
-        
-        /* 为索引列生成隐含的相等性条件
-         * 该函数会查找与指定列相关的等价类，并生成所有可能的等式条件
-         * ec_member_matches_indexcol作为回调函数，用于过滤出与索引列兼容的等价成员
-         * 最后一个参数排除连接到LATERAL引用表的条件，因为这些条件不能下推
-         */
-        clauses = generate_implied_equalities_for_column(root,
-                                                       index->rel,
-                                                       ec_member_matches_indexcol,
-                                                       (void *) &arg,
-                                                       index->rel->lateral_referencers);
+		/* Generate clauses, skipping any that join to lateral_referencers */
+		arg.index = index;
+		arg.indexcol = indexcol;
+		clauses = generate_implied_equalities_for_column(root,
+														 index->rel,
+														 ec_member_matches_indexcol,
+														 (void *) &arg,
+														 index->rel->lateral_referencers);
 
-        /*
-         * 对于非B树索引，需要进一步验证生成的条件是否真正匹配索引
-         * 因为等价类中的相等性操作符可能不在索引操作符类中
-         * 例如，某些特殊索引类型可能有自己特定的相等性语义
-         */
-        match_clauses_to_index(root, clauses, index, clauseset);
-    }
+		/*
+		 * We have to check whether the results actually do match the index,
+		 * since for non-btree indexes the EC's equality operators might not
+		 * be in the index opclass (cf ec_member_matches_indexcol).
+		 */
+		match_clauses_to_index(root, clauses, index, clauseset);
+	}
 }
 
 /*
  * match_clauses_to_index
- *	  尝试将条件列表中的每个条件与索引进行匹配。
- *
- * 对于每个匹配的条件，将其作为 IndexClause 加入到 *clauseset 的对应列表中。
- * （*clauseset 必须在首次调用前初始化为零。）
+ *	  Perform match_clause_to_index() for each clause in a list.
+ *	  Matching clauses are added to *clauseset.
  */
 static void
 match_clauses_to_index(PlannerInfo *root,
-                       List *clauses,
-                       IndexOptInfo *index,
-                       IndexClauseSet *clauseset)
+					   List *clauses,
+					   IndexOptInfo *index,
+					   IndexClauseSet *clauseset)
 {
-    ListCell   *lc;	/* 遍历条件列表的指针 */
+	ListCell   *lc;
 
-    /*
-     * 对列表中的每个条件执行 match_clause_to_index()
-     * 匹配的条件会被加入到 *clauseset 中。
-     */
-    foreach(lc, clauses)
-    {
-        // 1. 获取当前节点
-        // lfirst_node 是一个宏，用于从链表节点 lc 中提取数据，并将其强制转换为 RestrictInfo* 类型。
-        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-        // 2. 尝试匹配
-        // 调用核心逻辑函数 match_clause_to_index（注意这是单数形式），
-        // 判断单个条件 rinfo 是否能被 index 使用。
-        match_clause_to_index(root, rinfo, index, clauseset);
-    }
+		match_clause_to_index(root, rinfo, index, clauseset);
+	}
 }
 
 /*
  * match_clause_to_index
- *	  测试一个条件是否可以用于索引。
+ *	  Test whether a qual clause can be used with an index.
  *
- * 如果条件可用，则将其作为 IndexClause 加入到 *clauseset 的对应列表中。
- * （*clauseset 必须在首次调用前初始化为零。）
+ * If the clause is usable, add an IndexClause entry for it to the appropriate
+ * list in *clauseset.  (*clauseset must be initialized to zeroes before first
+ * call.)
  *
- * 注意：某些情况下同一个 RestrictInfo 可能来自多个地方。为避免重复输出，
- * 如果已经添加过该条件（指针相等即可），则拒绝再次添加。
+ * Note: in some circumstances we may find the same RestrictInfos coming from
+ * multiple places.  Defend against redundant outputs by refusing to add a
+ * clause twice (pointer equality should be a good enough check for this).
  *
- * 注意：如果索引定义不合理，可能会有多个匹配的列。我们总是选择第一个匹配，
- * 这样可以避免同一个条件被多次用于不同索引列，导致选择性估算过高。
+ * Note: it's possible that a badly-defined index could have multiple matching
+ * columns.  We always select the first match if so; this avoids scenarios
+ * wherein we get an inflated idea of the index's selectivity by using the
+ * same clause multiple times with different index columns.
  */
 static void
 match_clause_to_index(PlannerInfo *root,
@@ -2315,71 +2190,44 @@ match_clause_to_index(PlannerInfo *root,
 	int			indexcol;
 
 	/*
-	 * 永远不要把伪常量条件用于索引。
-	 * （通常伪常量不会包含 Var，因此不会匹配，但如果有人在常量上建表达式索引呢？
-	 * 对于部分索引，这么做也不是完全没有道理。）
-	 *
-	 * 伪常量：这个条件不包含当前查询层级的任何变量（Vars），但在当前层级下其值是固定的（真或假）。
-	 * 通常有两种情况：
-	 * 真正的常量表达式：例如 WHERE 1 = 1 或 WHERE 1 = 2。
-	 * 参数化值：例如在嵌套循环连接（Nested Loop Join）中，
-	 * 内层表的查询条件引用了外层表的值（如 WHERE inner.x = outer.y）。对
-	 * 于内层表的单次扫描来说，outer.y 是一个定值，但在整个查询计划构建阶段，它可能被标记为伪常量或参数。
-	 *
-	 * 不过，这里的 pseudoconstant 更多指第一种情况，即与当前扫描的每一行都无关的条件。
+	 * Never match pseudoconstants to indexes.  (Normally a match could not
+	 * happen anyway, since a pseudoconstant clause couldn't contain a Var,
+	 * but what if someone builds an expression index on a constant? It's not
+	 * totally unreasonable to do so with a partial index, either.)
 	 */
 	if (rinfo->pseudoconstant)
 		return;
 
 	/*
-	 * 如果该条件不能作为索引条件（因为必须等到更低安全级别的限制条件之后才能使用），则拒绝。
+	 * If clause can't be used as an indexqual because it must wait till after
+	 * some lower-security-level restriction clause, reject it.
 	 */
 	if (!restriction_is_securely_promotable(rinfo, index->rel))
 		return;
 
-	/*
-	 * 检查每个索引键列是否匹配
-	 * nkeycolumns：真正的索引键列数
-	 */
+	/* OK, check each index key column for a match */
 	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
 	{
 		IndexClause *iclause;
 		ListCell   *lc;
 
-		/* 忽略重复项
-		 * 注意：某些情况下同一个 RestrictInfo 可能来自多个地方。为避免重复输出，
-		 * 如果已经添加过该条件（指针相等即可），则拒绝再次添加。
-		 * 这是一个防御性编程，确保无论上层逻辑多么复杂，
-		 * 无论同一个条件通过什么路径（基表条件、连接条件、推导条件）被传递进来，
-		 * 只要它是同一个内存对象，我们在最终的索引扫描条件列表中只保留一份。
-		 */
+		/* Ignore duplicates */
 		foreach(lc, clauseset->indexclauses[indexcol])
 		{
-			/* 取出一个已存在的 IndexClause */
-			IndexClause* iclause = (IndexClause*)lfirst(lc);
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
 
-			/*
-			 * 比较指针地址：
-			 * iclause->rinfo 是已保存条件的指针。
-			 * rinfo 是当前正在尝试添加的新条件的指针。
-			 */
 			if (iclause->rinfo == rinfo)
-				return; /* 如果指针相同，说明完全是同一个对象，直接返回，不做任何操作 */
+				return;
 		}
 
-		/*
-		 * 尝试将条件与索引列匹配
-		 * 判断“这个条件”是否适用于“这个索引的这一列”。
-		 * 如果匹配成功，返回一个指向 IndexClause 结构体的指针。这个结构体描述了如何使用这个条件来扫描索引。
-		 */
+		/* OK, try to match the clause to the index column */
 		iclause = match_clause_to_indexcol(root,
 										   rinfo,
 										   indexcol,
 										   index);
-
-		/* 如果匹配成功，记录下来 */
 		if (iclause)
 		{
+			/* Success, so record it */
 			clauseset->indexclauses[indexcol] =
 				lappend(clauseset->indexclauses[indexcol], iclause);
 			clauseset->nonempty = true;
@@ -2390,38 +2238,67 @@ match_clause_to_index(PlannerInfo *root,
 
 /*
  * match_clause_to_indexcol()
- *	  判断一个限制条件是否可以用于某个索引列，如果可以则构造一个 IndexClause 节点。
+ *	  Determine whether a restriction clause matches a column of an index,
+ *	  and if so, build an IndexClause node describing the details.
  *
- *	  通常，操作符条件要满足以下要求才能用于索引：
- *	  (1) 必须是 (indexkey op const) 或 (const op indexkey) 形式；
- *	  (2) 操作符必须属于该索引列的操作符族；
- *	  (3) 如果相关，条件的排序规则必须与索引一致。
+ *	  To match an index normally, an operator clause:
  *
- *	  这里对“const”的定义非常宽松：只要不包含索引表的 Var 或易变函数即可。
- *	  允许引用其他表的 Var，因为这种条件可以用于参数化索引扫描。
- *	  更高层代码负责区分限制条件和连接条件。
+ *	  (1)  must be in the form (indexkey op const) or (const op indexkey);
+ *		   and
+ *	  (2)  must contain an operator which is in the index's operator family
+ *		   for this column; and
+ *	  (3)  must match the collation of the index, if collation is relevant.
  *
- *	  注意：需要检查“const”侧是否包含索引表的 Var，否则像 (a.f1 OP (b.f2 OP a.f3))
- *	  这样的条件无法用于参数化索引扫描。
+ *	  Our definition of "const" is exceedingly liberal: we allow anything that
+ *	  doesn't involve a volatile function or a Var of the index's relation.
+ *	  In particular, Vars belonging to other relations of the query are
+ *	  accepted here, since a clause of that form can be used in a
+ *	  parameterized indexscan.  It's the responsibility of higher code levels
+ *	  to manage restriction and join clauses appropriately.
  *
- *	  目前执行器只能处理索引键在左侧的 indexqual，因此如果索引键在右侧，
- *	  必须能交换操作符并生成等价的 indexqual。
+ *	  Note: we do need to check for Vars of the index's relation on the
+ *	  "const" side of the clause, since clauses like (a.f1 OP (b.f2 OP a.f3))
+ *	  are not processable by a parameterized indexscan on a.f1, whereas
+ *	  something like (a.f1 OP (b.f2 OP c.f3)) is.
  *
- *	  如果索引有排序规则，条件也必须一致。对于无排序规则的索引，假定无所谓。
+ *	  Presently, the executor can only deal with indexquals that have the
+ *	  indexkey on the left, so we can only use clauses that have the indexkey
+ *	  on the right if we can commute the clause to put the key on the left.
+ *	  We handle that by generating an IndexClause with the correctly-commuted
+ *	  opclause as a derived indexqual.
  *
- *	  还可以匹配 RowCompareExpr（目前仅支持 btree 索引）、ScalarArrayOpExpr（ANY 形式），
- *	  布尔索引可以直接匹配布尔表达式或 NOT 表达式。
+ *	  If the index has a collation, the clause must have the same collation.
+ *	  For collation-less indexes, we assume it doesn't matter; this is
+ *	  necessary for cases like "hstore ? text", wherein hstore's operators
+ *	  don't care about collation but the clause will get marked with a
+ *	  collation anyway because of the text argument.  (This logic is
+ *	  embodied in the macro IndexCollMatchesExprColl.)
  *
- *	  某些操作符和函数可以通过 planner 支持函数生成（通常是有损的）索引条件，
- *	  如果 OpExpr 或 FuncExpr 的某个参数匹配索引键且有支持函数，则调用支持函数尝试生成索引条件。
+ *	  It is also possible to match RowCompareExpr clauses to indexes (but
+ *	  currently, only btree indexes handle this).
  *
- * 'rinfo'：待测试的条件（RestrictInfo 节点）
- * 'indexcol'：索引的列号（从 0 开始）
- * 'index'：目标索引
+ *	  It is also possible to match ScalarArrayOpExpr clauses to indexes, when
+ *	  the clause is of the form "indexkey op ANY (arrayconst)".
  *
- * 如果条件可用于该索引列，则返回 IndexClause，否则返回 NULL。
+ *	  For boolean indexes, it is also possible to match the clause directly
+ *	  to the indexkey; or perhaps the clause is (NOT indexkey).
  *
- * 注意：如果条件是 OR 或 AND，直接返回 NULL，由更高层处理。
+ *	  And, last but not least, some operators and functions can be processed
+ *	  to derive (typically lossy) indexquals from a clause that isn't in
+ *	  itself indexable.  If we see that any operand of an OpExpr or FuncExpr
+ *	  matches the index key, and the function has a planner support function
+ *	  attached to it, we'll invoke the support function to see if such an
+ *	  indexqual can be built.
+ *
+ * 'rinfo' is the clause to be tested (as a RestrictInfo node).
+ * 'indexcol' is a column number of 'index' (counting from 0).
+ * 'index' is the index of interest.
+ *
+ * Returns an IndexClause if the clause can be used with this index key,
+ * or NULL if not.
+ *
+ * NOTE:  returns NULL if clause is an OR or AND clause; it is the
+ * responsibility of higher-level routines to cope with those.
  */
 static IndexClause *
 match_clause_to_indexcol(PlannerInfo *root,
@@ -2435,38 +2312,14 @@ match_clause_to_indexcol(PlannerInfo *root,
 
 	Assert(indexcol < index->nkeycolumns);
 
-	/* 兼容历史，允许 NULL 条件，但直接返回 NULL */
+	/*
+	 * Historically this code has coped with NULL clauses.  That's probably
+	 * not possible anymore, but we might as well continue to cope.
+	 */
 	if (clause == NULL)
 		return NULL;
 
-	/*
-	 * 优先处理布尔索引的特殊情况
-	 * 如果当前索引列的操作符族（OpFamily）是布尔类型（BOOL_BTREE_FAM_OID 或 BOOL_HASH_FAM_OID），
-	 * 那么优化器会尝试一种特殊的匹配方式：将单独的布尔列作为索引条件。
-	 * 为什么需要特殊处理？
-	 * 在 SQL 中，布尔类型的列可以直接作为 WHERE 条件，而不需要显式地写成 col = true。
-	 *
-	 * 对于布尔列 is_active，用户可以这样写：
-	 * WHERE is_active = true （标准二元表达式）
-	 * WHERE is_active （简写，隐式表示 is_active = true）
-	 * WHERE NOT is_active （简写，隐式表示 is_active = false）
-	 *
-	 * 标准的 match_clause_to_index 逻辑主要处理第 1 种情况（二元操作符）。
-	 * 而这段代码专门用来处理第 2 和第 3 种情况。
-	 *
-	 * 举例说明：
-	 * 查询 1: SELECT * FROM users WHERE is_active = true;
-	 * 这是一个标准的 OpExpr，可以被普通逻辑匹配。
-	 * 因此不会经过这段特殊代码，而是直接调用 match_opclause 来处理。
-	 *
-	 * 查询 2: SELECT * FROM users WHERE active;
-     * 这是一个裸的 Var 节点，不是 OpExpr。普通逻辑无法匹配（因为它找的是操作符）。
-	 * 这段特殊代码介入：发现 active 是布尔索引列，且条件是单独的 active。于是它生成一个内部表示，相当于 active = true，从而利用索引。
-	 *
-	 * 查询 3: SELECT * FROM users WHERE NOT active;
-     * 这是一个 BoolExpr (NOT)。普通逻辑无法匹配。
-     * 这段特殊代码介入：发现是 NOT active，生成相当于 active = false 的索引条件。
-	 */
+	/* First check for boolean-index cases. */
 	opfamily = index->opfamily[indexcol];
 	if (IsBooleanOpfamily(opfamily))
 	{
@@ -2476,37 +2329,9 @@ match_clause_to_indexcol(PlannerInfo *root,
 	}
 
 	/*
-	 * 尝试将给定的 WHERE 子句（clause）与指定的索引列（indexcol）进行匹配，
-	 * 以判断该索引是否可以用于优化查询。
-	 *
-	 * 代码逻辑根据子句的表达式类型分别处理：
-	 *
-	 * 1. OpExpr (操作符表达式):
-	 *    对应形如 "col = 1", "col < 10" 的普通操作符比较。
-	 *    调用 match_opclause_to_indexcol 进行处理。
-	 *
-	 * 2. FuncExpr (函数表达式):
-	 *    对应函数调用，通常用于处理函数索引或支持特定函数的索引操作符。
-	 *    例如：对于函数索引 index(func(col))，查询条件为 "func(col) = 'val'"。
-	 *    调用 match_funcclause_to_indexcol 进行处理。
-	 *
-	 * 3. ScalarArrayOpExpr (标量数组操作符表达式):
-	 *    对应 "col = ANY(array)" (即 IN 查询) 或 "col = ALL(array)"。
-	 *    例如："id IN (1, 2, 3)"。
-	 *    调用 match_saopclause_to_indexcol 进行处理。
-	 *
-	 * 4. RowCompareExpr (行比较表达式):
-	 *    对应行构造器的比较，如 "(a, b) > (1, 2)"。
-	 *    这通常用于多列索引的匹配。
-	 *    调用 match_rowcompare_to_indexcol 进行处理。
-	 *
-	 * 5. NullTest (空值测试):
-	 *    对应 "col IS NULL" 或 "col IS NOT NULL"。
-	 *    前提是索引访问方法（AM）必须支持空值搜索 (index->amsearchnulls 为真)。
-	 *    如果匹配成功，直接构造并返回一个 IndexClause 节点，表示该索引可用于此空值测试。
-	 *
-	 * 只处理 OpExpr、FuncExpr、ScalarArrayOpExpr、RowCompareExpr，
-	 * 或者索引支持 IS NULL/NOT NULL 时处理 NullTest。
+	 * Clause must be an opclause, funcclause, ScalarArrayOpExpr, or
+	 * RowCompareExpr.  Or, if the index supports it, we can handle IS
+	 * NULL/NOT NULL clauses.
 	 */
 	if (IsA(clause, OpExpr))
 	{
@@ -2546,19 +2371,19 @@ match_clause_to_indexcol(PlannerInfo *root,
 
 /*
  * match_boolean_index_clause
- *	  识别可以匹配布尔索引的限制子句。
+ *	  Recognize restriction clauses that can be matched to a boolean index.
  *
- * 这里的思路是，对于支持 BooleanEqualOperator 的布尔列索引，
- * 我们可以将对索引键的直接引用（例如 "WHERE col"）转换为 "indexkey = true"，
- * 或者将 "NOT indexkey"（例如 "WHERE NOT col"）转换为 "indexkey = false" 等，
- * 从而使表达式可以使用索引的 "=" 操作符进行索引扫描。
+ * The idea here is that, for an index on a boolean column that supports the
+ * BooleanEqualOperator, we can transform a plain reference to the indexkey
+ * into "indexkey = true", or "NOT indexkey" into "indexkey = false", etc,
+ * so as to make the expression indexable using the index's "=" operator.
+ * Since Postgres 8.1, we must do this because constant simplification does
+ * the reverse transformation; without this code there'd be no way to use
+ * such an index at all.
  *
- * 自 Postgres 8.1 起，必须这样做，因为常量简化（constant simplification）
- * 会执行反向转换（即把 "col = true" 简化为 "col"）；
- * 如果没有这段代码，根本无法使用此类索引。
- *
- * 此函数仅在 IsBooleanOpfamily() 识别出索引的操作符族时才应被调用。
- * 我们检查子句是否匹配索引的键，如果匹配，则构建一个合适的 IndexClause。
+ * This should be called only when IsBooleanOpfamily() recognizes the
+ * index's operator family.  We check to see if the clause matches the
+ * index's key, and if so, build a suitable IndexClause.
  */
 static IndexClause *
 match_boolean_index_clause(PlannerInfo *root,
@@ -2569,33 +2394,23 @@ match_boolean_index_clause(PlannerInfo *root,
 	Node	   *clause = (Node *) rinfo->clause;
 	Expr	   *op = NULL;
 
-	/*
-	 * 直接匹配？
-	 * 这里的 clause 本身就是一个 Var 节点（或者其他匹配索引键的表达式）。
-	 *
-	 * 代码处理形如 WHERE column_name 的查询条件（其中 column_name 是布尔类型），
-	 * 将其换为 WHERE column_name = true 的形式，以便能够利用索引。
-	 */
+	/* Direct match? */
 	if (match_index_to_operand(clause, indexcol, index))
 	{
-		/* 转换为 indexkey = TRUE */
+		/* convert to indexkey = TRUE */
 		op = make_opclause(BooleanEqualOperator, BOOLOID, false,
 						   (Expr *) clause,
 						   (Expr *) makeBoolConst(true, false),
 						   InvalidOid, InvalidOid);
 	}
-	/*
-	 * NOT 子句？
-	 * 处理形如 "WHERE NOT indexkey" 的情况。
-	 */
+	/* NOT clause? */
 	else if (is_notclause(clause))
 	{
 		Node	   *arg = (Node *) get_notclausearg((Expr *) clause);
 
-		/* 检查 NOT 的参数是否匹配索引键 */
 		if (match_index_to_operand(arg, indexcol, index))
 		{
-			/* 转换为 indexkey = FALSE */
+			/* convert to indexkey = FALSE */
 			op = make_opclause(BooleanEqualOperator, BOOLOID, false,
 							   (Expr *) arg,
 							   (Expr *) makeBoolConst(false, false),
@@ -2604,44 +2419,28 @@ match_boolean_index_clause(PlannerInfo *root,
 	}
 
 	/*
-	 * 处理 BooleanTest 节点（IS TRUE / IS FALSE）。
-	 *
-	 * 它将 col IS TRUE 转换为 col = TRUE，将 col IS FALSE 转换为 col = FALSE，以便利用索引。
-	 * SQL 标准中，IS TRUE 和 = TRUE 在处理 NULL 值时是有区别的
-	 * col = TRUE:
-	 * 如果 col 是 TRUE -> 结果 TRUE
-	 * 如果 col 是 FALSE -> 结果 FALSE
-	 * 如果 col 是 NULL -> 结果 NULL (未知) 
-	 * col IS TRUE:
-	 * 如果 col 是 TRUE -> 结果 TRUE
-	 * 如果 col 是 FALSE -> 结果 FALSE
-	 * 如果 col 是 NULL -> 结果 FALSE (明确的假)
-	 *
-	 * 又有，在 WHERE 子句中，任何结果为 NULL 的行都会被过滤掉，
-	 * 在 WHERE 子句中，只有当条件结果为 TRUE 时，行才会被返回。
-	 * 如果结果是 FALSE，行被丢弃。
-	 * 如果结果是 NULL，行也被丢弃。
+	 * Since we only consider clauses at top level of WHERE, we can convert
+	 * indexkey IS TRUE and indexkey IS FALSE to index searches as well.  The
+	 * different meaning for NULL isn't important.
 	 */
 	else if (clause && IsA(clause, BooleanTest))
 	{
 		BooleanTest *btest = (BooleanTest *) clause;
 		Node	   *arg = (Node *) btest->arg;
 
-		/* 处理 IS TRUE */
 		if (btest->booltesttype == IS_TRUE &&
 			match_index_to_operand(arg, indexcol, index))
 		{
-			/* 转换为 indexkey = TRUE */
+			/* convert to indexkey = TRUE */
 			op = make_opclause(BooleanEqualOperator, BOOLOID, false,
 							   (Expr *) arg,
 							   (Expr *) makeBoolConst(true, false),
 							   InvalidOid, InvalidOid);
 		}
-		/* 处理 IS FALSE */
 		else if (btest->booltesttype == IS_FALSE &&
 				 match_index_to_operand(arg, indexcol, index))
 		{
-			/* 转换为 indexkey = FALSE */
+			/* convert to indexkey = FALSE */
 			op = make_opclause(BooleanEqualOperator, BOOLOID, false,
 							   (Expr *) arg,
 							   (Expr *) makeBoolConst(false, false),
@@ -2650,35 +2449,17 @@ match_boolean_index_clause(PlannerInfo *root,
 	}
 
 	/*
-	 * 如果我们成功地从给定的限定条件（qual）生成了一个操作符子句，
-	 * 我们必须将其包装在一个 IndexClause 中。
-	 * 这种转换是精确的，不是有损（lossy）的。
+	 * If we successfully made an operator clause from the given qual, we must
+	 * wrap it in an IndexClause.  It's not lossy.
 	 */
 	if (op)
 	{
 		IndexClause *iclause = makeNode(IndexClause);
 
 		iclause->rinfo = rinfo;
-		/*
-		 * 注意：我们需要为新生成的 op 创建一个新的 RestrictInfo。
-		 * make_simple_restrictinfo 会处理这个过程。
-		 * 这里保存的是转换后的、用于实际索引扫描的条件。
-		 */
 		iclause->indexquals = list_make1(make_simple_restrictinfo(root, op));
-		/*
-		 * 标记这个转换是精确的（Exact）。
-		 * 意思是：索引扫描返回的行，肯定百分之百满足查询条件，不需要再回表（Heap Fetch）进行二次检查（Recheck）。
-		 * 有些索引（如 GIN 的某些操作符）是“有损”的（Lossy），索引说“可能有”，还需要回表确认。
-		 * 但这里的布尔转换是精确的。
-		 */
 		iclause->lossy = false;
 		iclause->indexcol = indexcol;
-		/*
-		 * 布尔索引条件总是单列的，因此 indexcols 设为 NIL。
-		 * 这里处理行比较（RowCompareExpr）时会用到多列。
-		 * 例如，(a, b) < (5, 10) 这样的条件会涉及多列索引。
-		 * 在这种情况下，indexcols 会保存所有相关的索引列号。
-		 */
 		iclause->indexcols = NIL;
 		return iclause;
 	}
@@ -2688,8 +2469,8 @@ match_boolean_index_clause(PlannerInfo *root,
 
 /*
  * match_opclause_to_indexcol()
- *	  处理 match_clause_to_indexcol() 的 OpExpr 情况。
- *	  判断一个二元操作符表达式是否可以用于某个索引列，并构造 IndexClause。
+ *	  Handles the OpExpr case for match_clause_to_indexcol(),
+ *	  which see for comments.
  */
 static IndexClause *
 match_opclause_to_indexcol(PlannerInfo *root,
@@ -2698,8 +2479,9 @@ match_opclause_to_indexcol(PlannerInfo *root,
 						   IndexOptInfo *index)
 {
 	IndexClause *iclause;
-	OpExpr	   	*clause = (OpExpr *) rinfo->clause;
-	Node	   	*leftop, *rightop;
+	OpExpr	   *clause = (OpExpr *) rinfo->clause;
+	Node	   *leftop,
+			   *rightop;
 	Oid			expr_op;
 	Oid			expr_coll;
 	Index		index_relid;
@@ -2707,67 +2489,35 @@ match_opclause_to_indexcol(PlannerInfo *root,
 	Oid			idxcollation;
 
 	/*
-	 * 只处理二元操作符（如 a = b），一元操作符不考虑。
+	 * Only binary operators need apply.  (In theory, a planner support
+	 * function could do something with a unary operator, but it seems
+	 * unlikely to be worth the cycles to check.)
 	 */
 	if (list_length(clause->args) != 2)
 		return NULL;
 
-	/*
-	 * 提取操作符的左右操作数。
-	 */
-	leftop = (Node*)linitial(clause->args);
-	rightop = (Node*)lsecond(clause->args);
-	/*
-	 * 提取操作符的 OID 和输入排序规则。
-	 */
+	leftop = (Node *) linitial(clause->args);
+	rightop = (Node *) lsecond(clause->args);
 	expr_op = clause->opno;
 	expr_coll = clause->inputcollid;
 
-	/* 提取索引的相关信息 */
 	index_relid = index->rel->relid;
 	opfamily = index->opfamily[indexcol];
 	idxcollation = index->indexcollations[indexcol];
 
 	/*
-	 * 检查是否为 (indexkey operator 常量) 或 (常量 operator indexkey) 形式。
-	 * 参见 match_clause_to_indexcol 的注释。
-	 * 注意：只有一侧是索引列，另一侧不能包含本表的变量且不能有易变函数。
-	 * 
-	 * !bms_is_member(index_relid, rinfo->right_relids)
-	 * 		index_relid: 当前索引所属表的 ID（例如表 t1 的 ID）。
-	 * 		rinfo->right_relids: 查询条件右操作数（rightop）中引用的所有表的 ID 集合。
-	 * 		bms_is_member: 检查 index_relid 是否在集合 right_relids 中。
-	 * 		! (非): 确保它不在其中。
-	 * 		翻译成人话：“确保条件的右边（比如 a = b 中的 b）没有引用当前这张表里的任何列。”
-	 * 如果条件的右边也引用了同一张表，例如：SELECT * FROM t1 WHERE t1.a = t1.b;
-	 * 为了能使用索引扫描（Index Scan），查询条件必须是形如：
-	 * IndexKey OP Constant （索引列 操作符 常量/参数），所以这里拒绝。
+	 * Check for clauses of the form: (indexkey operator constant) or
+	 * (constant operator indexkey).  See match_clause_to_indexcol's notes
+	 * about const-ness.
 	 *
-	 * !contain_volatile_functions(rightop)
-	 * 		contain_volatile_functions: 检查表达式中是否包含易变函数（Volatile Functions）。
-	 * 		易变函数：每次调用可能返回不同结果的函数，例如 random() 或 timeofday()。
-	 *
-	 * PostgreSQL 将函数稳定性分为三类：
-	 * 		Immutable（不可变）: 输入相同，输出永远相同。如 2 + 2。
-	 * 		Stable（稳定）: 在同一个事务/查询内，输入相同，输出相同。如 now()。索引扫描允许使用 Stable 函数。
-	 * 		Volatile（易变）: 每次调用结果都可能不同，或者有副作用。如 random()、nextval()。
-	 * 索引扫描通常禁止使用 Volatile 函数作为键值。
+	 * Note that we don't ask the support function about clauses that don't
+	 * have one of these forms.  Again, in principle it might be possible to
+	 * do something, but it seems unlikely to be worth the cycles to check.
 	 */
 	if (match_index_to_operand(leftop, indexcol, index) &&
 		!bms_is_member(index_relid, rinfo->right_relids) &&
 		!contain_volatile_functions(rightop))
 	{
-		/*
-		 * 检查排序规则和操作符族是否匹配
-		 *
-		 * IndexCollMatchesExprColl(idxcollation, expr_coll)：
-		 * 		确保查询要求的排序规则与索引存储的排序规则一致。
-		 * 		如果索引是按 C 规则建立的，而查询是按 zh_CN 规则比较的，那么索引就不能用（因为顺序不一样）。
-		 *
-		 * op_in_opfamily(expr_op, opfamily):
-		 * 		检查操作符 expr_op 是否属于操作符族 opfamily。
-		 * 		如果操作符不在该族中，索引就不能用。
-		 */
 		if (IndexCollMatchesExprColl(idxcollation, expr_coll) &&
 			op_in_opfamily(expr_op, opfamily))
 		{
@@ -2781,38 +2531,35 @@ match_opclause_to_indexcol(PlannerInfo *root,
 		}
 
 		/*
-		 * 如果操作符不在索引的操作符族中，尝试调用 planner 支持函数。
-		 * 当标准的操作符匹配逻辑（直接查 pg_amop 系统表）失败，或者需要更复杂的转换时，
-		 * PostgreSQL 12+ 引入了一种新的机制：Planner Support Function。
-		 * 这段代码尝试调用与该操作符关联的支持函数，看看它能不能“变魔术”，把当前的查询条件转化为一个有效的索引扫描条件。
+		 * If we didn't find a member of the index's opfamily, try the support
+		 * function for the operator's underlying function.
 		 */
-		set_opfuncid(clause);	/* 确保 opfuncid 被正确填充，用于后续的索引扫描条件构造 */
+		set_opfuncid(clause);	/* make sure we have opfuncid */
 		return get_index_clause_from_support(root,
 											 rinfo,
 											 clause->opfuncid,
-											 0, /* 索引列在左侧 */
+											 0, /* indexarg on left */
 											 indexcol,
 											 index);
 	}
 
-	/* 试试交换操作数的情况 */
 	if (match_index_to_operand(rightop, indexcol, index) &&
 		!bms_is_member(index_relid, rinfo->left_relids) &&
 		!contain_volatile_functions(leftop))
 	{
 		if (IndexCollMatchesExprColl(idxcollation, expr_coll))
 		{
-			Oid comm_op = get_commutator(expr_op);
+			Oid			comm_op = get_commutator(expr_op);
 
 			if (OidIsValid(comm_op) &&
 				op_in_opfamily(comm_op, opfamily))
 			{
 				RestrictInfo *commrinfo;
 
-				/* 构造交换后的 OpExpr 和 RestrictInfo */
+				/* Build a commuted OpExpr and RestrictInfo */
 				commrinfo = commute_restrictinfo(rinfo, comm_op);
 
-				/* 构造 IndexClause，标记为派生条件 */
+				/* Make an IndexClause showing that as a derived qual */
 				iclause = makeNode(IndexClause);
 				iclause->rinfo = rinfo;
 				iclause->indexquals = list_make1(commrinfo);
@@ -2824,13 +2571,14 @@ match_opclause_to_indexcol(PlannerInfo *root,
 		}
 
 		/*
-		 * 如果操作符不在索引的操作符族中，尝试调用 planner 支持函数。
+		 * If we didn't find a member of the index's opfamily, try the support
+		 * function for the operator's underlying function.
 		 */
-		set_opfuncid(clause);	/* 确保有 opfuncid */
+		set_opfuncid(clause);	/* make sure we have opfuncid */
 		return get_index_clause_from_support(root,
 											 rinfo,
 											 clause->opfuncid,
-											 1, /* 索引列在右侧 */
+											 1, /* indexarg on right */
 											 indexcol,
 											 index);
 	}
@@ -3573,145 +3321,147 @@ match_clause_to_ordering_op(IndexOptInfo *index,
 
 /*
  * check_index_predicates
- *    为指定关系的每个索引设置由谓词派生的IndexOptInfo字段
+ *		Set the predicate-derived IndexOptInfo fields for each index
+ *		of the specified relation.
  *
- * 函数功能：
- *    该函数检查表上的每个索引，特别是部分索引（partial index），确定其谓词条件是否被当前查询满足。
- *    它设置两个关键字段：
- *    - predOK：如果索引是部分索引且其谓词条件被查询的WHERE子句隐含，则设为true
- *    - indrestrictinfo：关系的baserestrictinfo列表减去那些被索引谓词隐含的条件
+ * predOK is set true if the index is partial and its predicate is satisfied
+ * for this query, ie the query's WHERE clauses imply the predicate.
  *
- * 参数说明：
- *    root - 规划器的全局信息结构，包含查询的所有规划信息
- *    rel - 要检查索引的关系优化信息结构
+ * indrestrictinfo is set to the relation's baserestrictinfo list less any
+ * conditions that are implied by the index's predicate.  (Obviously, for a
+ * non-partial index, this is the same as baserestrictinfo.)  Such conditions
+ * can be dropped from the plan when using the index, in certain cases.
+ *
+ * At one time it was possible for this to get re-run after adding more
+ * restrictions to the rel, thus possibly letting us prove more indexes OK.
+ * That doesn't happen any more (at least not in the core code's usage),
+ * but this code still supports it in case extensions want to mess with the
+ * baserestrictinfo list.  We assume that adding more restrictions can't make
+ * an index not predOK.  We must recompute indrestrictinfo each time, though,
+ * to make sure any newly-added restrictions get into it if needed.
  */
 void
 check_index_predicates(PlannerInfo *root, RelOptInfo *rel)
 {
-    List	   *clauselist;        /* 用于证明索引可用性的条件列表 */
-    bool		have_partial;      /* 标记是否存在部分索引 */
-    bool		is_target_rel;     /* 标记关系是否为更新目标 */
-    Relids		otherrels;         /* 除当前关系外的其他关系ID集合 */
-    ListCell   *lc;               /* 循环列表的指针 */
+	List	   *clauselist;
+	bool		have_partial;
+	bool		is_target_rel;
+	Relids		otherrels;
+	ListCell   *lc;
 
-    /* 断言：索引仅适用于基本关系或"其他"成员关系 */
-    Assert(IS_SIMPLE_REL(rel));
+	/* Indexes are available only on base or "other" member relations. */
+	Assert(IS_SIMPLE_REL(rel));
 
-    /*
-     * 初始化阶段：
-     * 1. 将每个索引的indrestrictinfo初始化为与baserestrictinfo相同
-     * 2. 检查是否存在任何部分索引
-     * 3. 如果没有部分索引，直接返回（无需进一步处理）
-     */
-    have_partial = false;
-    foreach(lc, rel->indexlist)
-    {
-        IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
+	/*
+	 * Initialize the indrestrictinfo lists to be identical to
+	 * baserestrictinfo, and check whether there are any partial indexes.  If
+	 * not, this is all we need to do.
+	 */
+	have_partial = false;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
 
-        /* 默认情况下，索引限制条件与关系的基本限制条件相同 */
-        index->indrestrictinfo = rel->baserestrictinfo;
-        /* 检测是否存在部分索引（indpred不为空） */
-        if (index->indpred)
-            have_partial = true;
-    }
-    /* 如果没有部分索引，不需要进一步处理 */
-    if (!have_partial)
-        return;
+		index->indrestrictinfo = rel->baserestrictinfo;
+		if (index->indpred)
+			have_partial = true;
+	}
+	if (!have_partial)
+		return;
 
-    /*
-     * 构建可用条件列表：
-     * 1. 首先复制关系的基本限制条件
-     * 2. 添加可以"移动到"当前关系的连接条件
-     * 3. 添加任何可以通过等价类推导出来的连接条件
-     */
-    clauselist = list_copy(rel->baserestrictinfo);
+	/*
+	 * Construct a list of clauses that we can assume true for the purpose of
+	 * proving the index(es) usable.  Restriction clauses for the rel are
+	 * always usable, and so are any join clauses that are "movable to" this
+	 * rel.  Also, we can consider any EC-derivable join clauses (which must
+	 * be "movable to" this rel, by definition).
+	 */
+	clauselist = list_copy(rel->baserestrictinfo);
 
-    /* 扫描关系的连接条件，添加可移动的条件 */
-    foreach(lc, rel->joininfo)
-    {
-        RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+	/* Scan the rel's join clauses */
+	foreach(lc, rel->joininfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-        /* 检查连接条件是否可以移动到当前关系 */
-        if (!join_clause_is_movable_to(rinfo, rel))
-            continue;
+		/* Check if clause can be moved to this rel */
+		if (!join_clause_is_movable_to(rinfo, rel))
+			continue;
 
-        /* 添加可移动的连接条件到条件列表 */
-        clauselist = lappend(clauselist, rinfo);
-    }
+		clauselist = lappend(clauselist, rinfo);
+	}
 
-    /*
-     * 添加通过等价类推导出来的连接条件
-     * 计算正确的relid集合需要考虑特殊情况：当前关系可能是子关系而非真正的基本关系
-     * 这种情况下需要从all_baserels中移除其父关系的relid
-     */
-    if (rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
-        otherrels = bms_difference(root->all_baserels,
-                                   find_childrel_parents(root, rel));
-    else
-        otherrels = bms_difference(root->all_baserels, rel->relids);
+	/*
+	 * Add on any equivalence-derivable join clauses.  Computing the correct
+	 * relid sets for generate_join_implied_equalities is slightly tricky
+	 * because the rel could be a child rel rather than a true baserel, and in
+	 * that case we must remove its parents' relid(s) from all_baserels.
+	 */
+	if (rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+		otherrels = bms_difference(root->all_baserels,
+								   find_childrel_parents(root, rel));
+	else
+		otherrels = bms_difference(root->all_baserels, rel->relids);
 
-    /* 如果存在其他关系，生成并添加推导的连接条件 */
-    if (!bms_is_empty(otherrels))
-        clauselist =
-            list_concat(clauselist,
-                        generate_join_implied_equalities(root,
-                                                         bms_union(rel->relids,
-                                                                   otherrels),
-                                                         otherrels,
-                                                         rel));
+	if (!bms_is_empty(otherrels))
+		clauselist =
+			list_concat(clauselist,
+						generate_join_implied_equalities(root,
+														 bms_union(rel->relids,
+																   otherrels),
+														 otherrels,
+														 rel));
 
-    /*
-     * 确定关系是否为更新目标（UPDATE/DELETE/SELECT FOR UPDATE）
-     * 对于更新目标关系，不能从indrestrictinfo中移除由索引谓词隐含的条件，
-     * 因为这些条件需要在EvalPlanQual测试中被重新检查
-     */
-    is_target_rel = (rel->relid == root->parse->resultRelation ||
-                     get_plan_rowmark(root->rowMarks, rel->relid) != NULL);
+	/*
+	 * Normally we remove quals that are implied by a partial index's
+	 * predicate from indrestrictinfo, indicating that they need not be
+	 * checked explicitly by an indexscan plan using this index.  However, if
+	 * the rel is a target relation of UPDATE/DELETE/SELECT FOR UPDATE, we
+	 * cannot remove such quals from the plan, because they need to be in the
+	 * plan so that they will be properly rechecked by EvalPlanQual testing.
+	 * Some day we might want to remove such quals from the main plan anyway
+	 * and pass them through to EvalPlanQual via a side channel; but for now,
+	 * we just don't remove implied quals at all for target relations.
+	 */
+	is_target_rel = (rel->relid == root->parse->resultRelation ||
+					 get_plan_rowmark(root->rowMarks, rel->relid) != NULL);
 
-    /*
-     * 处理阶段：
-     * 1. 尝试证明每个部分索引的谓词为真
-     * 2. 为部分索引计算indrestrictinfo列表
-     * 注意：即使对于非predOK的索引，我们也要计算indrestrictinfo，
-     * 因为这些索引可能在OR子句中使用（参见generate_bitmap_or_paths）
-     */
-    foreach(lc, rel->indexlist)
-    {
-        IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
-        ListCell   *lcr;
+	/*
+	 * Now try to prove each index predicate true, and compute the
+	 * indrestrictinfo lists for partial indexes.  Note that we compute the
+	 * indrestrictinfo list even for non-predOK indexes; this might seem
+	 * wasteful, but we may be able to use such indexes in OR clauses, cf
+	 * generate_bitmap_or_paths().
+	 */
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
+		ListCell   *lcr;
 
-        /* 跳过非部分索引（没有indpred的索引） */
-        if (index->indpred == NIL)
-            continue;
+		if (index->indpred == NIL)
+			continue;			/* ignore non-partial indexes here */
 
-        /* 如果尚未证明索引谓词适用，则进行检查 */
-        if (!index->predOK)
-            index->predOK = predicate_implied_by(index->indpred, clauselist,
-                                                 false);
+		if (!index->predOK)		/* don't repeat work if already proven OK */
+			index->predOK = predicate_implied_by(index->indpred, clauselist,
+												 false);
 
-        /* 如果关系是更新目标，保持indrestrictinfo不变 */
-        if (is_target_rel)
-            continue;
+		/* If rel is an update target, leave indrestrictinfo as set above */
+		if (is_target_rel)
+			continue;
 
-        /* 否则，计算indrestrictinfo为不被索引谓词隐含的条件 */
-        index->indrestrictinfo = NIL;
-        foreach(lcr, rel->baserestrictinfo)
-        {
-            RestrictInfo *rinfo = (RestrictInfo *) lfirst(lcr);
+		/* Else compute indrestrictinfo as the non-implied quals */
+		index->indrestrictinfo = NIL;
+		foreach(lcr, rel->baserestrictinfo)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lcr);
 
-            /*
-             * predicate_implied_by()假设第一个参数是不可变的
-             * 因此，如果条件中包含可变函数，或者条件不被索引谓词隐含，
-             * 则保留该条件在indrestrictinfo中
-             */
-            if (contain_mutable_functions((Node *) rinfo->clause) ||
-                !predicate_implied_by(list_make1(rinfo->clause),
-                                      index->indpred, false))
-                index->indrestrictinfo = lappend(index->indrestrictinfo, rinfo);
-        }
-    }
+			/* predicate_implied_by() assumes first arg is immutable */
+			if (contain_mutable_functions((Node *) rinfo->clause) ||
+				!predicate_implied_by(list_make1(rinfo->clause),
+									  index->indpred, false))
+				index->indrestrictinfo = lappend(index->indrestrictinfo, rinfo);
+		}
+	}
 }
-
 
 /****************************************************************************
  *				----  ROUTINES TO CHECK EXTERNALLY-VISIBLE CONDITIONS  ----
@@ -3761,174 +3511,181 @@ ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * relation_has_unique_index_for
- *	  判断给定关系是否可以保证满足一组相等条件的记录最多只有一条，
- *	  这种保证源于这些条件约束了某个唯一索引的所有列。
+ *	  Determine whether the relation provably has at most one row satisfying
+ *	  a set of equality conditions, because the conditions constrain all
+ *	  columns of some unique index.
  *
- * 参数：
- *   root - 查询规划器的全局信息结构
- *   rel - 要检查的关系（表或视图）
- *   restrictlist - RestrictInfo节点列表，表示连接条件中的等式约束
- *   exprlist - 当前关系中的表达式列表（用于索引键匹配）
- *   oprlist - 对应exprlist的相等操作符OID列表
+ * The conditions can be represented in either or both of two ways:
+ * 1. A list of RestrictInfo nodes, where the caller has already determined
+ * that each condition is a mergejoinable equality with an expression in
+ * this relation on one side, and an expression not involving this relation
+ * on the other.  The transient outer_is_left flag is used to identify which
+ * side we should look at: left side if outer_is_left is false, right side
+ * if it is true.
+ * 2. A list of expressions in this relation, and a corresponding list of
+ * equality operators. The caller must have already checked that the operators
+ * represent equality.  (Note: the operators could be cross-type; the
+ * expressions should correspond to their RHS inputs.)
  *
- * 返回值：
- *   如果存在唯一索引覆盖了所有条件对应的列，则返回true；否则返回false
- *
- * 条件表示方式：
- *   1. RestrictInfo节点列表：每个节点是一个mergejoinable的等式，一边是当前关系的表达式，
- *      另一边是不涉及当前关系的表达式。outer_is_left标志用于标识我们应该查看哪一边。
- *   2. 表达式列表和操作符列表：每个表达式对应当前关系中的一个列，操作符必须表示相等关系。
- *
- * 注意：
- *   - 函数会自动将关系的baserestrictinfo子句中可用的var = const条件添加到restrictlist
- *   - 传递的restrictlist会被函数以破坏性方式修改
+ * The caller need only supply equality conditions arising from joins;
+ * this routine automatically adds in any usable baserestrictinfo clauses.
+ * (Note that the passed-in restrictlist will be destructively modified!)
  */
 bool
 relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
-				  List *restrictlist,
-				  List *exprlist, List *oprlist)
+							  List *restrictlist,
+							  List *exprlist, List *oprlist)
 {
-	ListCell   *ic;  /* 循环遍历指针 */
+	ListCell   *ic;
 
-	/* 断言：表达式列表和操作符列表长度必须相等 */
 	Assert(list_length(exprlist) == list_length(oprlist));
 
-	/* 快速路径：如果关系没有索引，直接返回false */
+	/* Short-circuit if no indexes... */
 	if (rel->indexlist == NIL)
 		return false;
 
 	/*
-	 * 检查关系的baserestrictinfo子句，找出可以添加到restrictlist的var = const子句
-	 * 这一步会将基础限制条件（非连接条件的约束）合并到检查中
+	 * Examine the rel's restriction clauses for usable var = const clauses
+	 * that we can add to the restrictlist.
 	 */
 	foreach(ic, rel->baserestrictinfo)
 	{
 		RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(ic);
 
 		/*
-		 * 注意：对于限制子句，can_join不会被设置，但如果它有mergejoinable操作符
-		 * 并且不包含volatile函数，mergeopfamilies会被设置
+		 * Note: can_join won't be set for a restriction clause, but
+		 * mergeopfamilies will be if it has a mergejoinable operator and
+		 * doesn't contain volatile functions.
 		 */
 		if (restrictinfo->mergeopfamilies == NIL)
-			continue;  /* 不是mergejoinable的等式，跳过 */
+			continue;			/* not mergejoinable */
 
 		/*
-		 * 该子句肯定只引用了给定的关系。如果任何一边是伪常量，我们就可以使用它。
-		 * 伪常量指的是不依赖于当前查询中任何表的表达式（如常量或参数）
+		 * The clause certainly doesn't refer to anything but the given rel.
+		 * If either side is pseudoconstant then we can use it.
 		 */
 		if (bms_is_empty(restrictinfo->left_relids))
 		{
-			/* 右手边是内部的（属于当前关系） */
+			/* righthand side is inner */
 			restrictinfo->outer_is_left = true;
 		}
 		else if (bms_is_empty(restrictinfo->right_relids))
 		{
-			/* 左手边是内部的（属于当前关系） */
+			/* lefthand side is inner */
 			restrictinfo->outer_is_left = false;
 		}
 		else
-			continue;  /* 两边都不是伪常量，跳过 */
+			continue;
 
-		/* OK，添加到列表中 */
+		/* OK, add to list */
 		restrictlist = lappend(restrictlist, restrictinfo);
 	}
 
-	/* 快速路径：如果没有任何限制条件，直接返回false */
+	/* Short-circuit the easy case */
 	if (restrictlist == NIL && exprlist == NIL)
 		return false;
 
-	/* 检查关系的每个索引... */
+	/* Examine each index of the relation ... */
 	foreach(ic, rel->indexlist)
 	{
 		IndexOptInfo *ind = (IndexOptInfo *) lfirst(ic);
-		int		c;  /* 索引列计数器 */
+		int			c;
 
 		/*
-		 * 如果索引不是唯一的，或者不是立即强制的，或者是部分索引，那么它在这里没用。
-		 * 我们无法使用predOK的部分唯一索引，因为check_index_predicates()也会使用连接谓词
-		 * 来确定部分索引是否可用。在这里我们需要的是在任何连接评估之前就成立的证明。
+		 * If the index is not unique, or not immediately enforced, or if it's
+		 * a partial index, it's useless here.  We're unable to make use of
+		 * predOK partial unique indexes due to the fact that
+		 * check_index_predicates() also makes use of join predicates to
+		 * determine if the partial index is usable. Here we need proofs that
+		 * hold true before any joins are evaluated.
 		 */
 		if (!ind->unique || !ind->immediate || ind->indpred != NIL)
 			continue;
 
 		/*
-		 * 尝试在条件列表中找到每个索引列的匹配。这是O(N^2)或更差的复杂度，
-		 * 但我们期望所有列表都很短，所以性能不是问题。
+		 * Try to find each index column in the lists of conditions.  This is
+		 * O(N^2) or worse, but we expect all the lists to be short.
 		 */
 		for (c = 0; c < ind->nkeycolumns; c++)
 		{
-			bool		matched = false;  /* 当前索引列是否找到匹配的条件 */
+			bool		matched = false;
 			ListCell   *lc;
 			ListCell   *lc2;
 
-			/* 首先尝试在restrictlist中查找匹配 */
 			foreach(lc, restrictlist)
 			{
 				RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-				Node	   *rexpr;  /* 关系侧的表达式 */
+				Node	   *rexpr;
 
 				/*
-				 * 条件的相等操作符必须是索引操作符族的成员，否则它不能保证与索引相同的相等语义。
-				 * 我们首先检查这一点，因为它可能比match_index_to_operand()更便宜。
+				 * The condition's equality operator must be a member of the
+				 * index opfamily, else it is not asserting the right kind of
+				 * equality behavior for this index.  We check this first
+				 * since it's probably cheaper than match_index_to_operand().
 				 */
 				if (!list_member_oid(rinfo->mergeopfamilies, ind->opfamily[c]))
 					continue;
 
 				/*
-				 * XXX 将来可能需要在这里检查排序规则。目前我们假设所有排序规则都归结为相同的相等概念。
+				 * XXX at some point we may need to check collations here too.
+				 * For the moment we assume all collations reduce to the same
+				 * notion of equality.
 				 */
 
-				/* OK，检查条件操作数是否与索引键匹配 */
+				/* OK, see if the condition operand matches the index key */
 				if (rinfo->outer_is_left)
-					rexpr = get_rightop(rinfo->clause);  /* 获取关系侧表达式 */
+					rexpr = get_rightop(rinfo->clause);
 				else
 					rexpr = get_leftop(rinfo->clause);
 
 				if (match_index_to_operand(rexpr, c, ind))
 				{
-					matched = true;  /* 列已被唯一约束 */
+					matched = true; /* column is unique */
 					break;
 				}
 			}
 
 			if (matched)
-				continue;  /* 继续检查下一个索引列 */
+				continue;
 
-			/* 如果在restrictlist中没找到匹配，则在exprlist和oprlist中查找 */
 			forboth(lc, exprlist, lc2, oprlist)
 			{
-				Node	   *expr = (Node *) lfirst(lc);  /* 关系中的表达式 */
-				Oid		opr = lfirst_oid(lc2);  /* 操作符OID */
+				Node	   *expr = (Node *) lfirst(lc);
+				Oid			opr = lfirst_oid(lc2);
 
-				/* 检查表达式是否与索引键匹配 */
+				/* See if the expression matches the index key */
 				if (!match_index_to_operand(expr, c, ind))
 					continue;
 
 				/*
-				 * 相等操作符必须是索引操作符族的成员，否则它不能保证与索引相同的相等语义。
-				 * 我们假设调用者已经确定它是一个相等操作符，所以不需要更严格的检查。
+				 * The equality operator must be a member of the index
+				 * opfamily, else it is not asserting the right kind of
+				 * equality behavior for this index.  We assume the caller
+				 * determined it is an equality operator, so we don't need to
+				 * check any more tightly than this.
 				 */
 				if (!op_in_opfamily(opr, ind->opfamily[c]))
 					continue;
 
 				/*
-				 * XXX 将来可能需要在这里检查排序规则。目前我们假设所有排序规则都归结为相同的相等概念。
+				 * XXX at some point we may need to check collations here too.
+				 * For the moment we assume all collations reduce to the same
+				 * notion of equality.
 				 */
 
-				matched = true;  /* 列已被唯一约束 */
+				matched = true; /* column is unique */
 				break;
 			}
 
 			if (!matched)
-				break;  /* 未找到匹配；此索引对我们没有帮助 */
+				break;			/* no match; this index doesn't help us */
 		}
 
-		/* 是否匹配了此索引的所有键列？ */
+		/* Matched all key columns of this index? */
 		if (c == ind->nkeycolumns)
-			return true;  /* 找到满足条件的唯一索引 */
+			return true;
 	}
 
-	/* 没有找到满足所有条件的唯一索引 */
 	return false;
 }
 
@@ -3987,16 +3744,17 @@ indexcol_is_bool_constant_for_query(PlannerInfo *root,
 
 /*
  * match_index_to_operand()
- *	  它的作用是判断：给定的表达式（operand）是否就是索引的第 indexcol 列？
+ *	  Generalized test for a match between an index's key
+ *	  and the operand on one side of a restriction or join clause.
  *
- * operand: 要与索引进行比较的节点树
- * indexcol: 索引的列号（从0开始计数）
- * index: 感兴趣的索引
+ * operand: the nodetree to be compared to the index
+ * indexcol: the column number of the index (counting from 0)
+ * index: the index of interest
  *
- * 注意，这里我们不关心排序规则（collation）；如果涉及对排序规则敏感的操作符，
- * 调用者必须自行检查排序规则是否匹配。
+ * Note that we aren't interested in collations here; the caller must check
+ * for a collation match, if it's dealing with an operator where that matters.
  *
- * 此函数导出供 selfuncs.c 使用。
+ * This is exported for use in selfuncs.c.
  */
 bool
 match_index_to_operand(Node *operand,
@@ -4006,32 +3764,19 @@ match_index_to_operand(Node *operand,
 	int			indkey;
 
 	/*
-	 * 预处理：剥离 RelabelType 节点
-	 * 这是为了在二进制兼容操作符的情况下能够应用索引扫描所必需的。
-	 * 注意：我们可以假设最多只有一个 RelabelType 节点；
-	 * 如果有多个，eval_const_expressions() 应该已经进行了简化。
-	 *
-	 * 它是 PostgreSQL 内部的一种节点，表示“二进制兼容的类型转换”。
-	 * 比如 varchar 到 text 的转换，底层存储是一样的，不需要重新计算，只需要改个标签
-	 * 如果用户写 WHERE my_varchar_col::text = 'abc'，
-	 * 优化器看到的 operand 是一个 RelabelType 节点。但索引是建立在 my_varchar_col 上的。
-	 * 为了匹配成功，我们需要透过这层“马甲”，看到里面的本质——即那个 Var 节点。
+	 * Ignore any RelabelType node above the operand.   This is needed to be
+	 * able to apply indexscanning in binary-compatible-operator cases. Note:
+	 * we can assume there is at most one RelabelType node;
+	 * eval_const_expressions() will have simplified if more than one.
 	 */
 	if (operand && IsA(operand, RelabelType))
 		operand = (Node *) ((RelabelType *) operand)->arg;
 
-	/*
-	 * 索引键（indexkeys）数组记录了索引的每一列对应的列号（attnum）。
-	 * 如果索引列是表达式列（indkey == 0），则数组中对应位置的值为0。
-	 */
 	indkey = index->indexkeys[indexcol];
 	if (indkey != 0)
 	{
 		/*
-		 * 检查 operand 是不是一个变量 (Var)。
-		 * 检查这个变量是不是属于当前表 (varno 匹配)。
-		 * 检查这个变量的列号 (varattno) 是不是等于索引定义的列号 (indkey)。
-		 * 如果都对，说明这个操作数就是索引列。
+		 * Simple index column; operand must be a matching Var.
 		 */
 		if (operand && IsA(operand, Var) &&
 			index->rel->relid == ((Var *) operand)->varno &&
@@ -4041,25 +3786,14 @@ match_index_to_operand(Node *operand,
 	else
 	{
 		/*
-		 * 索引表达式；找到正确的表达式。
-		 * （可以通过让调用者传递表达式来避免这种搜索，但这会使所有调用者的逻辑变复杂；
-		 * 似乎不值得这样做。）
+		 * Index expression; find the correct expression.  (This search could
+		 * be avoided, at the cost of complicating all the callers of this
+		 * routine; doesn't seem worth it.)
 		 */
 		ListCell   *indexpr_item;
 		int			i;
 		Node	   *indexkey;
 
-		/*
-		 * 找到对应的表达式列。
-		 * indexkeys 数组中存 0 表示这一列是表达式。真正的表达式存在 index->indexprs 列表中。
-		 * 在 index->indexprs 列表中找到第 indexcol 列对应的那个表达式。
-		 * 这意味着 indexprs 的长度通常小于或等于 indexkeys 的长度。
-		 * 它里面的元素顺序，对应着 indexkeys 中出现 0 的顺序。
-		 *
-		 * 示例：CREATE INDEX idx ON t1 (col1, lower(col2), col3, col4 + 1);
-		 * indexkeys = [1, 0, 3, 0]
-		 * indexprs = [lower(col2), col4 + 1]
-		 */
 		indexpr_item = list_head(index->indexprs);
 		for (i = 0; i < indexcol; i++)
 		{
@@ -4072,25 +3806,14 @@ match_index_to_operand(Node *operand,
 		}
 		if (indexpr_item == NULL)
 			elog(ERROR, "wrong number of index expressions");
+		indexkey = (Node *) lfirst(indexpr_item);
 
 		/*
-		 * 从列表中取出当前表达式列。
-		 */
-		indexkey = (Node*)lfirst(indexpr_item);
-
-		/*
-		 * 它与操作数匹配吗？同样，剥离任何 RelabelType。
-		 * 这样可以确保即使表达式上有类型转换标签，也能正确匹配。
+		 * Does it match the operand?  Again, strip any relabeling.
 		 */
 		if (indexkey && IsA(indexkey, RelabelType))
 			indexkey = (Node *) ((RelabelType *) indexkey)->arg;
 
-		/*
-		 * 深度比较两个节点树是否完全相同。
-		 * 如果相同，说明 operand 就是索引表达式列。
-		 * 例如建立表达式索引：CREATE INDEX idx ON t1 ( (col1 + 1) );
-		 * 如果 operand 是 (col1 + 1)，那么就匹配成功。
-		 */
 		if (equal(indexkey, operand))
 			return true;
 	}

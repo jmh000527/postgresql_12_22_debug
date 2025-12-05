@@ -87,134 +87,132 @@ static List *generate_setop_grouplist(SetOperationStmt *op, List *targetlist);
 
 
 /*
- * plan_set_operations - 为集合操作树(UNION/INTERSECT/EXCEPT)生成查询计划
+ * plan_set_operations
  *
- * 功能概述：
- *   此函数专门负责处理SQL查询中的集合操作树，包括UNION、INTERSECT和EXCEPT操作。
- *   它递归地处理集合操作树的各个节点，并生成相应的执行路径。
+ *	  Plans the queries for a tree of set operations (UNION/INTERSECT/EXCEPT)
  *
- * 处理范围：
- *   - 仅处理查询中的setOperations树部分
- *   - 不处理顶级ORDER BY子句（由grouping_planner处理）
- *   - 不处理LIMIT子句（由grouping_planner处理）
+ * This routine only deals with the setOperations tree of the given query.
+ * Any top-level ORDER BY requested in root->parse->sortClause will be handled
+ * when we return to grouping_planner; likewise for LIMIT.
  *
- * 参数说明：
- *   root: PlannerInfo结构体指针，包含查询的所有规划信息
- *
- * 返回值：
- *   返回一个"upperrel"类型的RelOptInfo结构体，其中包含至少一个实现集合操作树的Path
- *   同时，root->processed_tlist将被设置为表示最顶层setop节点输出的目标列表
+ * What we return is an "upperrel" RelOptInfo containing at least one Path
+ * that implements the set-operation tree.  In addition, root->processed_tlist
+ * receives a targetlist representing the output of the topmost setop node.
  */
 RelOptInfo *
 plan_set_operations(PlannerInfo *root)
 {
-	Query		   		*parse = root->parse;               /* 从规划器信息中获取查询解析树 */
-	SetOperationStmt 	*topop = castNode(SetOperationStmt, parse->setOperations); /* 顶层集合操作节点 */
-	Node		   		*node;                             	/* 用于遍历集合操作树的临时节点指针 */
-	RangeTblEntry 		*leftmostRTE;                      	/* 最左侧子查询的范围表条目 */
-	Query		   		*leftmostQuery;                     /* 最左侧子查询的查询结构 */
-	RelOptInfo	 		*setop_rel;                        	/* 用于存储生成的集合操作关系结构 */
-	List		   		*top_tlist;                         /* 顶层目标列表 */
+	Query	   *parse = root->parse;
+	SetOperationStmt *topop = castNode(SetOperationStmt, parse->setOperations);
+	Node	   *node;
+	RangeTblEntry *leftmostRTE;
+	Query	   *leftmostQuery;
+	RelOptInfo *setop_rel;
+	List	   *top_tlist;
 
-	/* 断言：确保顶层集合操作节点存在 */
 	Assert(topop);
 
-	/* 检查是否存在不支持的查询结构 */
-	Assert(parse->jointree->fromlist == NIL);       /* 确保没有FROM子句 */
-	Assert(parse->jointree->quals == NULL);         /* 确保没有WHERE子句 */
-	Assert(parse->groupClause == NIL);              /* 确保没有GROUP BY子句 */
-	Assert(parse->havingQual == NULL);              /* 确保没有HAVING子句 */
-	Assert(parse->windowClause == NIL);             /* 确保没有窗口函数子句 */
-	Assert(parse->distinctClause == NIL);           /* 确保没有DISTINCT子句 */
+	/* check for unsupported stuff */
+	Assert(parse->jointree->fromlist == NIL);
+	Assert(parse->jointree->quals == NULL);
+	Assert(parse->groupClause == NIL);
+	Assert(parse->havingQual == NULL);
+	Assert(parse->windowClause == NIL);
+	Assert(parse->distinctClause == NIL);
 
 	/*
-	 * 为每个叶级子查询（它们是此查询中的RTE_SUBQUERY类型的范围表条目）
-	 * 构建RelOptInfos结构。为此，我们需要准备索引数组。
+	 * We'll need to build RelOptInfos for each of the leaf subqueries, which
+	 * are RTE_SUBQUERY rangetable entries in this Query.  Prepare the index
+	 * arrays for that.
 	 */
 	setup_simple_rel_arrays(root);
 
 	/*
-	 * 填充append_rel_array数组，存储每个AppendRelInfo，以便通过子关系ID直接查找
+	 * Populate append_rel_array with each AppendRelInfo to allow direct
+	 * lookups by child relid.
 	 */
 	setup_append_rel_array(root);
 
 	/*
-	 * 找到最左侧的组件查询。我们需要使用它的列名来生成所有目标列表
-	 * （否则SELECT INTO操作将无法正常工作）。
+	 * Find the leftmost component Query.  We need to use its column names for
+	 * all generated tlists (else SELECT INTO won't work right).
 	 */
-	node = topop->larg;                             /* 从顶层集合操作的左侧开始 */
-	while (node && IsA(node, SetOperationStmt))     /* 如果当前节点仍然是集合操作，则继续向左遍历 */
+	node = topop->larg;
+	while (node && IsA(node, SetOperationStmt))
 		node = ((SetOperationStmt *) node)->larg;
-	Assert(node && IsA(node, RangeTblRef));         /* 断言找到的节点是RangeTblRef类型 */
-	leftmostRTE = root->simple_rte_array[((RangeTblRef *) node)->rtindex]; /* 获取最左侧RTE */
-	leftmostQuery = leftmostRTE->subquery;          /* 获取最左侧子查询 */
-	Assert(leftmostQuery != NULL);                  /* 断言子查询存在 */
+	Assert(node && IsA(node, RangeTblRef));
+	leftmostRTE = root->simple_rte_array[((RangeTblRef *) node)->rtindex];
+	leftmostQuery = leftmostRTE->subquery;
+	Assert(leftmostQuery != NULL);
 
 	/*
-	 * 如果顶层节点是递归UNION，需要特殊处理
+	 * If the topmost node is a recursive union, it needs special processing.
 	 */
 	if (root->hasRecursion)
 	{
-		/* 生成递归路径 */
 		setop_rel = generate_recursion_path(topop, root,
-								leftmostQuery->targetList,
-								&top_tlist);
+											leftmostQuery->targetList,
+											&top_tlist);
 	}
 	else
 	{
 		/*
-		 * 递归处理集合操作树，为所有集合操作生成路径。
-		 * 最终输出路径应仅包含顶层节点输出的列类型，
-		 * 以及可能的resjunk工作列（我们可以依赖上层节点处理这些）。
+		 * Recurse on setOperations tree to generate paths for set ops. The
+		 * final output paths should have just the column types shown as the
+		 * output from the top-level node, plus possibly resjunk working
+		 * columns (we can rely on upper-level nodes to deal with that).
 		 */
 		setop_rel = recurse_set_operations((Node *) topop, root,
-								topop->colTypes, topop->colCollations,
-								true, -1,
-								leftmostQuery->targetList,
-								&top_tlist,
-								NULL);
+										   topop->colTypes, topop->colCollations,
+										   true, -1,
+										   leftmostQuery->targetList,
+										   &top_tlist,
+										   NULL);
 	}
 
-	/* 必须将构建的目标列表返回给root->processed_tlist */
+	/* Must return the built tlist into root->processed_tlist. */
 	root->processed_tlist = top_tlist;
 
-	/* 返回生成的集合操作关系结构 */
 	return setop_rel;
 }
 
-
 /*
  * recurse_set_operations
- *    递归处理集合操作树中的一个步骤
+ *	  Recursively handle one step in a tree of set operations
  *
- * 参数说明：
- *   setOp: 当前处理的集合操作节点（可能是RangeTblRef或SetOperationStmt）
- *   root: 包含查询优化相关信息的PlannerInfo结构体
- *   colTypes: 集合操作结果列的数据类型OID列表
- *   colCollations: 集合操作结果列的排序规则OID列表
- *   junkOK: 如果为true，允许结果中保留resjunk类型的列
- *   flag: 如果>=0，添加一个resjunk类型的输出列来标记flag值
- *   refnames_tlist: 用于获取列名的目标列表
- *   pTargetList: 输出参数，接收子树顶层计划的完整目标列表
- *   pNumGroups: 如果非NULL，估计结果中不同组的数量并存储
+ * colTypes: OID list of set-op's result column datatypes
+ * colCollations: OID list of set-op's result column collations
+ * junkOK: if true, child resjunk columns may be left in the result
+ * flag: if >= 0, add a resjunk output column indicating value of flag
+ * refnames_tlist: targetlist to take column names from
  *
- * 返回值：
- *   返回子树对应的RelOptInfo结构体，包含生成的执行路径信息
+ * Returns a RelOptInfo for the subtree, as well as these output parameters:
+ * *pTargetList: receives the fully-fledged tlist for the subtree's top plan
+ * *pNumGroups: if not NULL, we estimate the number of distinct groups
+ *		in the result, and store it there
+ *
+ * The pTargetList output parameter is mostly redundant with the pathtarget
+ * of the returned RelOptInfo, but for the moment we need it because much of
+ * the logic in this file depends on flag columns being marked resjunk.
+ * Pending a redesign of how that works, this is the easy way out.
+ *
+ * We don't have to care about typmods here: the only allowed difference
+ * between set-op input and output typmods is input is a specific typmod
+ * and output is -1, and that does not require a coercion.
  */
 static RelOptInfo *
 recurse_set_operations(Node *setOp, PlannerInfo *root,
-			   List *colTypes, List *colCollations,
-			   bool junkOK, int flag,
-			   List *refnames_tlist,
-			   List **pTargetList,
-			   double *pNumGroups)
+					   List *colTypes, List *colCollations,
+					   bool junkOK,
+					   int flag, List *refnames_tlist,
+					   List **pTargetList,
+					   double *pNumGroups)
 {
-	RelOptInfo *rel = NULL;  /* 初始化返回值，避免编译器警告 */
+	RelOptInfo *rel = NULL;		/* keep compiler quiet */
 
-	/* 防止由于过于复杂的集合操作嵌套导致栈溢出 */
+	/* Guard against stack overflow due to overly complex setop nests */
 	check_stack_depth();
 
-	/* 处理叶子节点：RangeTblRef，表示集合操作树中的子查询引用 */
 	if (IsA(setOp, RangeTblRef))
 	{
 		RangeTblRef *rtr = (RangeTblRef *) setOp;
@@ -226,73 +224,78 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		Path	   *path;
 		List	   *tlist;
 
-		Assert(subquery != NULL); /* 确保是子查询引用 */
+		Assert(subquery != NULL);
 
-		/* 为这个叶子子查询构建RelOptInfo */
+		/* Build a RelOptInfo for this leaf subquery. */
 		rel = build_simple_rel(root, rtr->rtindex, NULL);
 
-		/* 确保当前查询级别中plan_params未被使用 */
+		/* plan_params should not be in use in current query level */
 		Assert(root->plan_params == NIL);
 
-		/* 为子查询生成子根节点和执行路径 */
+		/* Generate a subroot and Paths for the subquery */
 		subroot = rel->subroot = subquery_planner(root->glob, subquery,
-						  root,
-						  false,
-						  root->tuple_fraction);
+												  root,
+												  false,
+												  root->tuple_fraction);
 
 		/*
-		 * 检查子查询是否有对集合操作树中其他原始查询的跨引用
-		 * 这应该是不可能的，如果存在则报错
+		 * It should not be possible for the primitive query to contain any
+		 * cross-references to other primitive queries in the setop tree.
 		 */
 		if (root->plan_params)
 			elog(ERROR, "unexpected outer reference in set operation subquery");
 
-		/* 为子查询确定适当的目标列表 */
+		/* Figure out the appropriate target list for this subquery. */
 		tlist = generate_setop_tlist(colTypes, colCollations,
-						 flag,
-						 rtr->rtindex,
-						 true,
-						 subroot->processed_tlist,
-						 refnames_tlist);
+									 flag,
+									 rtr->rtindex,
+									 true,
+									 subroot->processed_tlist,
+									 refnames_tlist);
 		rel->reltarget = create_pathtarget(root, tlist);
 
-		/* 将完整的目标列表返回给调用者 */
+		/* Return the fully-fledged tlist to caller, too */
 		*pTargetList = tlist;
 
 		/*
-		 * 为rel标记估计的输出行数、宽度等信息
-		 * 注意：必须在生成外层查询路径前执行此操作，否则cost_subqueryscan会出错
+		 * Mark rel with estimated output rows, width, etc.  Note that we have
+		 * to do this before generating outer-query paths, else
+		 * cost_subqueryscan is not happy.
 		 */
 		set_subquery_size_estimates(root, rel);
 
 		/*
-		 * 由于可能需要为该关系添加部分路径，必须正确设置consider_parallel标志
+		 * Since we may want to add a partial path to this relation, we must
+		 * set its consider_parallel flag correctly.
 		 */
 		final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
 		rel->consider_parallel = final_rel->consider_parallel;
 
 		/*
-		 * 暂时只为子查询考虑单个路径
-		 * 这部分未来可能会更改（使其更像set_subquery_pathlist）
+		 * For the moment, we consider only a single Path for the subquery.
+		 * This should change soon (make it look more like
+		 * set_subquery_pathlist).
 		 */
 		subpath = get_cheapest_fractional_path(final_rel,
-						   root->tuple_fraction);
+											   root->tuple_fraction);
 
 		/*
-		 * 在子路径上添加SubqueryScanPath
+		 * Stick a SubqueryScanPath atop that.
 		 *
-		 * 由于子查询的输出排序在集合操作结果中不会被保留，
-		 * 所以简单地将SubqueryScanPath标记为nil pathkeys
-		 * （XXX这部分将来也可能更改）
+		 * We don't bother to determine the subquery's output ordering since
+		 * it won't be reflected in the set-op result anyhow; so just label
+		 * the SubqueryScanPath with nil pathkeys.  (XXX that should change
+		 * soon too, likely.)
 		 */
 		path = (Path *) create_subqueryscan_path(root, rel, subpath,
-						 NIL, NULL);
+												 NIL, NULL);
 
 		add_path(rel, path);
 
 		/*
-		 * 如果子关系有部分路径，可以用它来构建该关系的部分路径
-		 * 但只考虑最便宜的路径
+		 * If we have a partial path for the child relation, we can use that
+		 * to build a partial path for this relation.  But there's no point in
+		 * considering any path but the cheapest.
 		 */
 		if (rel->consider_parallel && bms_is_empty(rel->lateral_relids) &&
 			final_rel->partial_pathlist != NIL)
@@ -303,14 +306,24 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 			partial_subpath = linitial(final_rel->partial_pathlist);
 			partial_path = (Path *)
 				create_subqueryscan_path(root, rel, partial_subpath,
-							 NIL, NULL);
+										 NIL, NULL);
 			add_partial_path(rel, partial_path);
 		}
 
 		/*
-		 * 如果调用者需要，估计组的数量
-		 * 如果子查询使用了分组或聚合，其输出可能已经大部分是唯一的；
-		 * 否则进行统计估计
+		 * Estimate number of groups if caller wants it.  If the subquery used
+		 * grouping or aggregation, its output is probably mostly unique
+		 * anyway; otherwise do statistical estimation.
+		 *
+		 * XXX you don't really want to know about this: we do the estimation
+		 * using the subquery's original targetlist expressions, not the
+		 * subroot->processed_tlist which might seem more appropriate.  The
+		 * reason is that if the subquery is itself a setop, it may return a
+		 * processed_tlist containing "varno 0" Vars generated by
+		 * generate_append_tlist, and those would confuse estimate_num_groups
+		 * mightily.  We ought to get rid of the "varno 0" hack, but that
+		 * requires a redesign of the parsetree representation of setops, so
+		 * that there can be an RTE corresponding to each setop's output.
 		 */
 		if (pNumGroups)
 		{
@@ -320,30 +333,39 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 				*pNumGroups = subpath->rows;
 			else
 				*pNumGroups = estimate_num_groups(subroot,
-							  get_tlist_exprs(subquery->targetList, false),
-							  subpath->rows,
-							  NULL);
+												  get_tlist_exprs(subquery->targetList, false),
+												  subpath->rows,
+												  NULL);
 		}
 	}
-	/* 处理内部节点：SetOperationStmt，表示集合操作 */
 	else if (IsA(setOp, SetOperationStmt))
 	{
 		SetOperationStmt *op = (SetOperationStmt *) setOp;
 
-		/* UNION与INTERSECT/EXCEPT的处理方式有很大不同 */
+		/* UNIONs are much different from INTERSECT/EXCEPT */
 		if (op->op == SETOP_UNION)
 			rel = generate_union_paths(op, root,
-						   refnames_tlist,
-						   pTargetList);
+									   refnames_tlist,
+									   pTargetList);
 		else
 			rel = generate_nonunion_paths(op, root,
-						  refnames_tlist,
-						  pTargetList);
+										  refnames_tlist,
+										  pTargetList);
 		if (pNumGroups)
 			*pNumGroups = rel->rows;
 
 		/*
-		 * 如有必要，添加Result节点来投影调用者请求的输出列
+		 * If necessary, add a Result node to project the caller-requested
+		 * output columns.
+		 *
+		 * XXX you don't really want to know about this: setrefs.c will apply
+		 * fix_upper_expr() to the Result node's tlist. This would fail if the
+		 * Vars generated by generate_setop_tlist() were not exactly equal()
+		 * to the corresponding tlist entries of the subplan. However, since
+		 * the subplan was generated by generate_union_plan() or
+		 * generate_nonunion_plan(), and hence its tlist was generated by
+		 * generate_append_tlist(), this will work.  We just tell
+		 * generate_setop_tlist() to use varno 0.
 		 */
 		if (flag >= 0 ||
 			!tlist_same_datatypes(*pTargetList, colTypes, junkOK) ||
@@ -352,16 +374,15 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 			PathTarget *target;
 			ListCell   *lc;
 
-			/* 生成新的目标列表，使用varno 0 */
 			*pTargetList = generate_setop_tlist(colTypes, colCollations,
-						 flag,
-						 0,
-						 false,
-						 *pTargetList,
-						 refnames_tlist);
+												flag,
+												0,
+												false,
+												*pTargetList,
+												refnames_tlist);
 			target = create_pathtarget(root, *pTargetList);
 
-			/* 对每个路径应用投影 */
+			/* Apply projection to each path */
 			foreach(lc, rel->pathlist)
 			{
 				Path	   *subpath = (Path *) lfirst(lc);
@@ -369,13 +390,13 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 
 				Assert(subpath->param_info == NULL);
 				path = apply_projection_to_path(root, subpath->parent,
-							subpath, target);
-				/* 如果添加了Result，则path与subpath不同 */
+												subpath, target);
+				/* If we had to add a Result, path is different from subpath */
 				if (path != subpath)
 					lfirst(lc) = path;
 			}
 
-			/* 对每个部分路径应用投影 */
+			/* Apply projection to each partial path */
 			foreach(lc, rel->partial_pathlist)
 			{
 				Path	   *subpath = (Path *) lfirst(lc);
@@ -383,14 +404,13 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 
 				Assert(subpath->param_info == NULL);
 
-				/* 避免使用apply_projection_to_path，以防多次引用 */
+				/* avoid apply_projection_to_path, in case of multiple refs */
 				path = (Path *) create_projection_path(root, subpath->parent,
-							   subpath, target);
+													   subpath, target);
 				lfirst(lc) = path;
 			}
 		}
 	}
-	/* 处理未识别的节点类型 */
 	else
 	{
 		elog(ERROR, "unrecognized node type: %d",
@@ -398,104 +418,87 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		*pTargetList = NIL;
 	}
 
-	/* 对集合操作关系进行后处理 */
 	postprocess_setop_rel(root, rel);
 
 	return rel;
 }
 
-
 /*
- * 为递归 UNION 节点生成查询路径
- *
- * 参数说明：
- *   setOp: 集合操作语句节点，包含 UNION 操作的所有信息
- *   root: 包含查询优化相关信息的 PlannerInfo 结构体
- *   refnames_tlist: 引用名称的目标列表
- *   pTargetList: 输出参数，用于存储生成的目标列表
- *
- * 返回值：
- *   返回包含递归 UNION 路径的 RelOptInfo 结构体
+ * Generate paths for a recursive UNION node
  */
 static RelOptInfo *
 generate_recursion_path(SetOperationStmt *setOp, PlannerInfo *root,
-					List *refnames_tlist,
-					List **pTargetList)
+						List *refnames_tlist,
+						List **pTargetList)
 {
-	/* 局部变量声明 */
-	RelOptInfo *result_rel;  /* 结果关系表信息 */
-	Path	   *path;        /* 生成的执行路径 */
-	RelOptInfo *lrel,        /* 左输入的关系表信息 */
-		       *rrel;        /* 右输入的关系表信息 */
-	Path	   *lpath;       /* 左输入的最优路径 */
-	Path	   *rpath;       /* 右输入的最优路径 */
-	List	   *lpath_tlist; /* 左输入路径的目标列表 */
-	List	   *rpath_tlist; /* 右输入路径的目标列表 */
-	List	   *tlist;       /* 结果路径的目标列表 */
-	List	   *groupList;   /* 用于去重的分组列表 */
-	double	   dNumGroups;   /* 预估的不同组数量 */
+	RelOptInfo *result_rel;
+	Path	   *path;
+	RelOptInfo *lrel,
+			   *rrel;
+	Path	   *lpath;
+	Path	   *rpath;
+	List	   *lpath_tlist;
+	List	   *rpath_tlist;
+	List	   *tlist;
+	List	   *groupList;
+	double		dNumGroups;
 
-	/* 解析器应该已经拒绝了其他类型的递归操作 */
+	/* Parser should have rejected other cases */
 	if (setOp->op != SETOP_UNION)
 		elog(ERROR, "only UNION queries can be recursive");
-	/* 递归查询必须有工作表ID */
+	/* Worktable ID should be assigned */
 	Assert(root->wt_param_id >= 0);
 
 	/*
-	 * 与普通 UNION 不同，递归 UNION 需要分别处理左右输入，
-	 * 而不是将它们合并到一个 Append 节点中
+	 * Unlike a regular UNION node, process the left and right inputs
+	 * separately without any intention of combining them into one Append.
 	 */
-	/* 处理非递归部分（左输入） */
 	lrel = recurse_set_operations(setOp->larg, root,
-					  setOp->colTypes, setOp->colCollations,
-					  false, -1,
-					  refnames_tlist,
-					  &lpath_tlist,
-					  NULL);
+								  setOp->colTypes, setOp->colCollations,
+								  false, -1,
+								  refnames_tlist,
+								  &lpath_tlist,
+								  NULL);
 	lpath = lrel->cheapest_total_path;
-	/* 保存非递归路径，供递归部分参考 */
+	/* The right path will want to look at the left one ... */
 	root->non_recursive_path = lpath;
-	/* 处理递归部分（右输入） */
 	rrel = recurse_set_operations(setOp->rarg, root,
-					  setOp->colTypes, setOp->colCollations,
-					  false, -1,
-					  refnames_tlist,
-					  &rpath_tlist,
-					  NULL);
+								  setOp->colTypes, setOp->colCollations,
+								  false, -1,
+								  refnames_tlist,
+								  &rpath_tlist,
+								  NULL);
 	rpath = rrel->cheapest_total_path;
-	/* 清理非递归路径引用 */
 	root->non_recursive_path = NULL;
 
 	/*
-	 * 为 RecursiveUnion 路径节点生成目标列表
-	 * 使用与 Append 节点相同的方法
+	 * Generate tlist for RecursiveUnion path node --- same as in Append cases
 	 */
 	tlist = generate_append_tlist(setOp->colTypes, setOp->colCollations, false,
-					  list_make2(lpath_tlist, rpath_tlist),
-					  refnames_tlist);
+								  list_make2(lpath_tlist, rpath_tlist),
+								  refnames_tlist);
 
-	/* 输出目标列表 */
 	*pTargetList = tlist;
 
-	/* 构建结果关系表 */
+	/* Build result relation. */
 	result_rel = fetch_upper_rel(root, UPPERREL_SETOP,
-					 bms_union(lrel->relids, rrel->relids));
+								 bms_union(lrel->relids, rrel->relids));
 	result_rel->reltarget = create_pathtarget(root, tlist);
 
 	/*
-	 * 如果是 UNION（非 ALL 变体），需要标识分组操作符
+	 * If UNION, identify the grouping operators
 	 */
-	if (setOp->all) /* UNION ALL 不需要去重 */
+	if (setOp->all)
 	{
-		groupList = NIL;  /* 无需分组 */
-		dNumGroups = 0;   /* 组数量为0 */
+		groupList = NIL;
+		dNumGroups = 0;
 	}
-	else /* UNION 需要去重 */
+	else
 	{
-		/* 标识分组语义，用于去重操作 */
+		/* Identify the grouping semantics */
 		groupList = generate_setop_grouplist(setOp, tlist);
 
-		/* 递归 UNION 仅支持基于哈希的去重 */
+		/* We only support hashing here */
 		if (!grouping_is_hashable(groupList))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -503,99 +506,91 @@ generate_recursion_path(SetOperationStmt *setOp, PlannerInfo *root,
 					 errdetail("All column datatypes must be hashable.")));
 
 		/*
-		 * 暂时估计不同组的数量等于总输入大小，即最坏情况
-		 * 递归部分的行数乘以10作为保守估计，因为递归查询可能产生大量重复
+		 * For the moment, take the number of distinct groups as equal to the
+		 * total input size, ie, the worst case.
 		 */
 		dNumGroups = lpath->rows + rpath->rows * 10;
 	}
 
 	/*
-	 * 创建递归 UNION 路径节点
+	 * And make the path node.
 	 */
 	path = (Path *) create_recursiveunion_path(root,
-					   result_rel,
-					   lpath,
-					   rpath,
-					   result_rel->reltarget,
-					   groupList,
-					   root->wt_param_id,
-					   dNumGroups);
+											   result_rel,
+											   lpath,
+											   rpath,
+											   result_rel->reltarget,
+											   groupList,
+											   root->wt_param_id,
+											   dNumGroups);
 
-	/* 将生成的路径添加到结果关系表中 */
 	add_path(result_rel, path);
-	/* 对集合操作关系表进行后处理 */
 	postprocess_setop_rel(root, result_rel);
 	return result_rel;
 }
 
 /*
- * 为 UNION 或 UNION ALL 节点生成查询执行路径
- *
- * 参数说明：
- *   op: SetOperationStmt 结构体，包含 UNION 操作的详细信息
- *   root: 包含查询优化相关信息的 PlannerInfo 结构体
- *   refnames_tlist: 用于获取列名的目标列表
- *   pTargetList: 输出参数，接收生成的完整目标列表
- *
- * 返回值：
- *   返回包含 UNION 执行路径的 RelOptInfo 结构体
+ * Generate paths for a UNION or UNION ALL node
  */
 static RelOptInfo *
 generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
-				 List *refnames_tlist,
-				 List **pTargetList)
+					 List *refnames_tlist,
+					 List **pTargetList)
 {
-	Relids		relids = NULL;           /* 参与操作的关系表ID集合 */
-	RelOptInfo *result_rel;            /* 结果关系表信息 */
-	double		save_fraction = root->tuple_fraction;  /* 保存原始元组分数 */
-	ListCell   *lc;                    /* 列表遍历指针 */
-	List	   *pathlist = NIL;         /* 普通路径列表 */
-	List	   *partial_pathlist = NIL; /* 并行部分路径列表 */
-	bool		partial_paths_valid = true; /* 并行路径是否有效 */
-	bool		consider_parallel = true;   /* 是否考虑并行执行 */
-	List	   *rellist;                /* 子关系表列表 */
-	List	   *tlist_list;             /* 子目标列表的列表 */
-	List	   *tlist;                  /* 结果目标列表 */
-	Path	   *path;                   /* 生成的执行路径 */
+	Relids		relids = NULL;
+	RelOptInfo *result_rel;
+	double		save_fraction = root->tuple_fraction;
+	ListCell   *lc;
+	List	   *pathlist = NIL;
+	List	   *partial_pathlist = NIL;
+	bool		partial_paths_valid = true;
+	bool		consider_parallel = true;
+	List	   *rellist;
+	List	   *tlist_list;
+	List	   *tlist;
+	Path	   *path;
 
 	/*
-	 * 对于普通 UNION（非 ALL 变体），设置子查询获取所有元组
+	 * If plain UNION, tell children to fetch all tuples.
 	 *
-	 * 注意：在 UNION ALL 情况下，我们将顶层的 tuple_fraction 原样传递给每个子查询
-	 * 虽然可以考虑为后面的子查询减少元组分数（根据前面子查询结果的预期大小进行折扣），
-	 * 但似乎不值得这样做。tuple_fraction 不为零的正常情况是顶层有 LIMIT，
-	 * 原样传递它通常足以获得优先选择快速启动计划的预期结果。
+	 * Note: in UNION ALL, we pass the top-level tuple_fraction unmodified to
+	 * each arm of the UNION ALL.  One could make a case for reducing the
+	 * tuple fraction for later arms (discounting by the expected size of the
+	 * earlier arms' results) but it seems not worth the trouble. The normal
+	 * case where tuple_fraction isn't already zero is a LIMIT at top level,
+	 * and passing it down as-is is usually enough to get the desired result
+	 * of preferring fast-start plans.
 	 */
 	if (!op->all)
 		root->tuple_fraction = 0.0;
 
 	/*
-	 * 如果任何子节点是具有相同操作类型、all标志和列类型的UNION节点，
-	 * 则可以将它们合并到此节点中，以便我们只为所有这些节点生成一个Append和去重操作。
-	 * 递归查找此类节点并计算其子节点的路径。
+	 * If any of my children are identical UNION nodes (same op, all-flag, and
+	 * colTypes) then they can be merged into this node so that we generate
+	 * only one Append and unique-ification for the lot.  Recurse to find such
+	 * nodes and compute their children's paths.
 	 */
 	rellist = plan_union_children(root, op, refnames_tlist, &tlist_list);
 
 	/*
-	 * 为Append计划节点生成目标列表
+	 * Generate tlist for Append plan node.
 	 *
-	 * 对Append计划本身而言，目标列表并不重要，但为了上一级计划的需要，必须使其看起来真实
+	 * The tlist for an Append plan isn't important as far as the Append is
+	 * concerned, but we must make it look real anyway for the benefit of the
+	 * next plan level up.
 	 */
 	tlist = generate_append_tlist(op->colTypes, op->colCollations, false,
-					  tlist_list, refnames_tlist);
+								  tlist_list, refnames_tlist);
 
-	/* 输出目标列表 */
 	*pTargetList = tlist;
 
-	/* 构建路径列表和关系ID集合 */
+	/* Build path lists and relid set. */
 	foreach(lc, rellist)
 	{
 		RelOptInfo *rel = lfirst(lc);
 
-		/* 添加最便宜的完整路径 */
 		pathlist = lappend(pathlist, rel->cheapest_total_path);
 
-		/* 收集并行执行相关信息 */
 		if (consider_parallel)
 		{
 			if (!rel->consider_parallel)
@@ -607,50 +602,50 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 				partial_paths_valid = false;
 			else
 				partial_pathlist = lappend(partial_pathlist,
-							   linitial(rel->partial_pathlist));
+										   linitial(rel->partial_pathlist));
 		}
 
-		/* 合并关系ID */
 		relids = bms_union(relids, rel->relids);
 	}
 
-	/* 构建结果关系表 */
+	/* Build result relation. */
 	result_rel = fetch_upper_rel(root, UPPERREL_SETOP, relids);
 	result_rel->reltarget = create_pathtarget(root, tlist);
 	result_rel->consider_parallel = consider_parallel;
 
 	/*
-	 * 创建Append节点将子结果合并
+	 * Append the child results together.
 	 */
 	path = (Path *) create_append_path(root, result_rel, pathlist, NIL,
-					   NIL, NULL, 0, false, NIL, -1);
+									   NIL, NULL, 0, false, NIL, -1);
 
 	/*
-	 * 对于UNION ALL，只需要Append路径即可
-	 * 对于普通UNION，需要添加去重节点
+	 * For UNION ALL, we just need the Append path.  For UNION, need to add
+	 * node(s) to remove duplicates.
 	 */
 	if (!op->all)
 		path = make_union_unique(op, path, tlist, root);
 
-	/* 将生成的路径添加到结果关系表中 */
 	add_path(result_rel, path);
 
 	/*
-	 * 估计组数
-	 * 目前我们假设输出是唯一的——对于UNION情况这肯定是正确的，
-	 * 而且无论如何我们都希望最坏情况的估计
+	 * Estimate number of groups.  For now we just assume the output is unique
+	 * --- this is certainly true for the UNION case, and we want worst-case
+	 * estimates anyway.
 	 */
 	result_rel->rows = path->rows;
 
 	/*
-	 * 现在考虑使用并行路径（partial paths）、Append和Gather的组合方式
+	 * Now consider doing the same thing using the partial paths plus Append
+	 * plus Gather.
 	 */
 	if (partial_paths_valid)
 	{
-		Path	   *ppath;           /* 并行执行路径 */
-		int		parallel_workers = 0; /* 并行工作线程数 */
+		Path	   *ppath;
+		ListCell   *lc;
+		int			parallel_workers = 0;
 
-		/* 找出所有子路径中请求的最大工作线程数 */
+		/* Find the highest number of workers requested for any subpath. */
 		foreach(lc, partial_pathlist)
 		{
 			Path	   *path = lfirst(lc);
@@ -660,157 +655,138 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 		Assert(parallel_workers > 0);
 
 		/*
-		 * 如果允许使用并行Append，总是请求至少log2(子节点数量)个工作线程
-		 * 我们假设在这种情况下有额外的工作线程是有用的，因为它们会分散在多个子节点上
-		 * 精确的公式只是一个猜测；详见add_paths_to_append_rel
+		 * If the use of parallel append is permitted, always request at least
+		 * log2(# of children) paths.  We assume it can be useful to have
+		 * extra workers in this case because they will be spread out across
+		 * the children.  The precise formula is just a guess; see
+		 * add_paths_to_append_rel.
 		 */
 		if (enable_parallel_append)
 		{
 			parallel_workers = Max(parallel_workers,
-						   fls(list_length(partial_pathlist)));
+								   fls(list_length(partial_pathlist)));
 			parallel_workers = Min(parallel_workers,
-						   max_parallel_workers_per_gather);
+								   max_parallel_workers_per_gather);
 		}
 		Assert(parallel_workers > 0);
 
-		/* 创建并行Append路径 */
 		ppath = (Path *)
 			create_append_path(root, result_rel, NIL, partial_pathlist,
-					   NIL, NULL,
-					   parallel_workers, enable_parallel_append,
-					   NIL, -1);
-		/* 在Append路径上添加Gather节点 */
+							   NIL, NULL,
+							   parallel_workers, enable_parallel_append,
+							   NIL, -1);
 		ppath = (Path *)
 			create_gather_path(root, result_rel, ppath,
-					   result_rel->reltarget, NULL, NULL);
-		/* 对于普通UNION，添加去重节点 */
+							   result_rel->reltarget, NULL, NULL);
 		if (!op->all)
 			ppath = make_union_unique(op, ppath, tlist, root);
 		add_path(result_rel, ppath);
 	}
 
-	/* 恢复原始的元组分数设置 */
+	/* Undo effects of possibly forcing tuple_fraction to 0 */
 	root->tuple_fraction = save_fraction;
 
 	return result_rel;
 }
 
-
 /*
  * Generate paths for an INTERSECT, INTERSECT ALL, EXCEPT, or EXCEPT ALL node
- * 为INTERSECT、INTERSECT ALL、EXCEPT或EXCEPT ALL节点生成执行路径
- * 
- * 参数说明：
- * - op: 集合操作语句节点，包含操作类型、左右参数、类型信息等
- * - root: 规划器信息，包含整个查询的优化上下文
- * - refnames_tlist: 引用名称的目标列表，用于生成列引用
- * - pTargetList: 输出参数，用于存储生成的目标列表
- * 
- * 返回值：
- * - 代表集合操作结果的关系优化信息结构
  */
 static RelOptInfo *
 generate_nonunion_paths(SetOperationStmt *op, PlannerInfo *root,
-				List *refnames_tlist,
-				List **pTargetList)
+						List *refnames_tlist,
+						List **pTargetList)
 {
-	RelOptInfo *result_rel;       /* 最终结果关系 */
-	RelOptInfo *lrel, *rrel;      /* 左右子操作的关系 */
-	double save_fraction = root->tuple_fraction; /* 保存当前的元组分数 */
-	Path *lpath, *rpath, *path;   /* 路径节点 */
-	List *lpath_tlist,            /* 左路径的目标列表 */
-	     *rpath_tlist,            /* 右路径的目标列表 */
-	     *tlist_list,             /* 目标列表的列表 */
-	     *tlist,                  /* 最终目标列表 */
-	     *groupList,              /* 分组列表，用于去重 */
-	     *pathlist;               /* 路径列表 */
-	double dLeftGroups,           /* 左输入估计的不同组数量 */
-	       dRightGroups,          /* 右输入估计的不同组数量 */
-	       dNumGroups,            /* 估计需要哈希表条目的组数 */
-	       dNumOutputRows;        /* 估计的输出行数 */
-	bool use_hash;                /* 是否使用哈希方法 */
-	SetOpCmd cmd;                 /* 集合操作命令类型 */
-	int firstFlag;                /* 第一个输入的标志，用于区分左右操作数 */
+	RelOptInfo *result_rel;
+	RelOptInfo *lrel,
+			   *rrel;
+	double		save_fraction = root->tuple_fraction;
+	Path	   *lpath,
+			   *rpath,
+			   *path;
+	List	   *lpath_tlist,
+			   *rpath_tlist,
+			   *tlist_list,
+			   *tlist,
+			   *groupList,
+			   *pathlist;
+	double		dLeftGroups,
+				dRightGroups,
+				dNumGroups,
+				dNumOutputRows;
+	bool		use_hash;
+	SetOpCmd	cmd;
+	int			firstFlag;
 
 	/*
 	 * Tell children to fetch all tuples.
-	 * 告诉子操作获取所有元组，因为集合操作需要处理完整输入
 	 */
 	root->tuple_fraction = 0.0;
 
 	/* Recurse on children, ensuring their outputs are marked */
-	/* 递归处理左子操作，获取其关系信息、目标列表和组数量 */
 	lrel = recurse_set_operations(op->larg, root,
-					  op->colTypes, op->colCollations,
-					  false, 0,
-					  refnames_tlist,
-					  &lpath_tlist,
-					  &dLeftGroups);
-	lpath = lrel->cheapest_total_path; /* 获取左子操作的最便宜总成本路径 */
-	
-	/* 递归处理右子操作，获取其关系信息、目标列表和组数量 */
+								  op->colTypes, op->colCollations,
+								  false, 0,
+								  refnames_tlist,
+								  &lpath_tlist,
+								  &dLeftGroups);
+	lpath = lrel->cheapest_total_path;
 	rrel = recurse_set_operations(op->rarg, root,
-					  op->colTypes, op->colCollations,
-					  false, 1,
-					  refnames_tlist,
-					  &rpath_tlist,
-					  &dRightGroups);
-	rpath = rrel->cheapest_total_path; /* 获取右子操作的最便宜总成本路径 */
+								  op->colTypes, op->colCollations,
+								  false, 1,
+								  refnames_tlist,
+								  &rpath_tlist,
+								  &dRightGroups);
+	rpath = rrel->cheapest_total_path;
 
 	/* Undo effects of forcing tuple_fraction to 0 */
-	/* 恢复原始的元组分数设置 */
 	root->tuple_fraction = save_fraction;
 
 	/*
-	 * For EXCEPT, we must put the left input first.  For INTERSECT,
-	 * either order should give the same results, and we prefer to put the
-	 * smaller input first in order to minimize the size of the hash table
-	 * in the hashing case.  "Smaller" means the one with the fewer groups.
-	 * 
-	 * 对于EXCEPT操作，必须保持左输入在前
-	 * 对于INTERSECT操作，输入顺序不影响结果，因此选择较小的输入在前
-	 * 以最小化哈希表的大小（"较小"指组数量较少）
+	 * For EXCEPT, we must put the left input first.  For INTERSECT, either
+	 * order should give the same results, and we prefer to put the smaller
+	 * input first in order to minimize the size of the hash table in the
+	 * hashing case.  "Smaller" means the one with the fewer groups.
 	 */
 	if (op->op == SETOP_EXCEPT || dLeftGroups <= dRightGroups)
 	{
-		pathlist = list_make2(lpath, rpath);      /* 左输入在前 */
+		pathlist = list_make2(lpath, rpath);
 		tlist_list = list_make2(lpath_tlist, rpath_tlist);
-		firstFlag = 0;  /* 第一个是左输入 */
+		firstFlag = 0;
 	}
 	else
 	{
-		pathlist = list_make2(rpath, lpath);      /* 右输入在前 */
+		pathlist = list_make2(rpath, lpath);
 		tlist_list = list_make2(rpath_tlist, lpath_tlist);
-		firstFlag = 1;  /* 第一个是右输入 */
+		firstFlag = 1;
 	}
 
 	/*
 	 * Generate tlist for Append plan node.
-	 * 
-	 * 为Append计划节点生成目标列表
-	 * Append计划的目标列表对Append本身不重要，但为了上层计划的正确性必须构建真实的结构
-	 * 特别是必须将标志列表示为变量而非常量，否则setrefs.c会混淆
+	 *
+	 * The tlist for an Append plan isn't important as far as the Append is
+	 * concerned, but we must make it look real anyway for the benefit of the
+	 * next plan level up.  In fact, it has to be real enough that the flag
+	 * column is shown as a variable not a constant, else setrefs.c will get
+	 * confused.
 	 */
 	tlist = generate_append_tlist(op->colTypes, op->colCollations, true,
-					  tlist_list, refnames_tlist);
+								  tlist_list, refnames_tlist);
 
-	*pTargetList = tlist;  /* 通过输出参数返回目标列表 */
+	*pTargetList = tlist;
 
 	/* Build result relation. */
-	/* 构建表示结果的关系结构 */
 	result_rel = fetch_upper_rel(root, UPPERREL_SETOP,
-					   bms_union(lrel->relids, rrel->relids));
-	result_rel->reltarget = create_pathtarget(root, tlist); /* 设置关系的目标 */
+								 bms_union(lrel->relids, rrel->relids));
+	result_rel->reltarget = create_pathtarget(root, tlist);
 
 	/*
 	 * Append the child results together.
-	 * 创建Append路径，将左右子操作的结果合并
 	 */
 	path = (Path *) create_append_path(root, result_rel, pathlist, NIL,
-				   NIL, NULL, 0, false, NIL, -1);
+									   NIL, NULL, 0, false, NIL, -1);
 
 	/* Identify the grouping semantics */
-	/* 生成用于集合操作分组/去重的排序列表 */
 	groupList = generate_setop_grouplist(op, tlist);
 
 	/*
@@ -820,14 +796,6 @@ generate_nonunion_paths(SetOperationStmt *op, PlannerInfo *root,
 	 * In non-ALL cases, we estimate each group produces one output row; in
 	 * ALL cases use the relevant relation size.  These are worst-case
 	 * estimates, of course, but we need to be conservative.
-	 * 
-	 * 估计需要哈希表条目的不同组数量：
-	 * - 对于EXCEPT操作，这等于左输入的组数量
-	 * - 对于INTERSECT操作，这等于较小输入的组数量
-	 * 同时估计最终输出的行数：
-	 * - 非ALL情况下，每个组产生一行输出
-	 * - ALL情况下，使用相关输入的大小
-	 * 这些是最坏情况的估计，但我们需要保持保守
 	 */
 	if (op->op == SETOP_EXCEPT)
 	{
@@ -842,24 +810,22 @@ generate_nonunion_paths(SetOperationStmt *op, PlannerInfo *root,
 
 	/*
 	 * Decide whether to hash or sort, and add a sort node if needed.
-	 * 决定使用哈希还是排序方法，并在需要时添加排序节点
 	 */
 	use_hash = choose_hashed_setop(root, groupList, path,
-				   dNumGroups, dNumOutputRows,
-				   (op->op == SETOP_INTERSECT) ? "INTERSECT" : "EXCEPT");
+								   dNumGroups, dNumOutputRows,
+								   (op->op == SETOP_INTERSECT) ? "INTERSECT" : "EXCEPT");
 
-	if (groupList && !use_hash)  /* 如果有分组列表且不使用哈希，则添加排序节点 */
+	if (groupList && !use_hash)
 		path = (Path *) create_sort_path(root,
-					 result_rel,
-					 path,
-					 make_pathkeys_for_sortclauses(root,
-									   groupList,
-									   tlist),
-					 -1.0);
+										 result_rel,
+										 path,
+										 make_pathkeys_for_sortclauses(root,
+																	   groupList,
+																	   tlist),
+										 -1.0);
 
 	/*
 	 * Finally, add a SetOp path node to generate the correct output.
-	 * 最后，添加SetOp路径节点以生成正确的集合操作输出
 	 */
 	switch (op->op)
 	{
@@ -871,308 +837,234 @@ generate_nonunion_paths(SetOperationStmt *op, PlannerInfo *root,
 			break;
 		default:
 			elog(ERROR, "unrecognized set op: %d", (int) op->op);
-			cmd = SETOPCMD_INTERSECT; /* 保持编译器安静 */
+			cmd = SETOPCMD_INTERSECT;	/* keep compiler quiet */
 			break;
 	}
-	/* 创建SetOp路径节点 */
 	path = (Path *) create_setop_path(root,
-				  result_rel,
-				  path,
-				  cmd,
-				  use_hash ? SETOP_HASHED : SETOP_SORTED,
-				  groupList,
-				  list_length(op->colTypes) + 1,
-				  use_hash ? firstFlag : -1,
-				  dNumGroups,
-				  dNumOutputRows);
+									  result_rel,
+									  path,
+									  cmd,
+									  use_hash ? SETOP_HASHED : SETOP_SORTED,
+									  groupList,
+									  list_length(op->colTypes) + 1,
+									  use_hash ? firstFlag : -1,
+									  dNumGroups,
+									  dNumOutputRows);
 
-	result_rel->rows = path->rows; /* 设置结果关系的行数估计 */
-	add_path(result_rel, path);    /* 将生成的路径添加到结果关系中 */
-	return result_rel;             /* 返回结果关系 */
+	result_rel->rows = path->rows;
+	add_path(result_rel, path);
+	return result_rel;
 }
 
 /*
- * 拉升具有相同属性的 UNION 节点的子节点。
+ * Pull up children of a UNION node that are identically-propertied UNIONs.
  *
- * 注意：我们也可以将 UNION ALL 拉升到 UNION 中，因为无论如何最终都会丢弃重复的输出行。
+ * NOTE: we can also pull a UNION ALL up into a UNION, since the distinct
+ * output rows will be lost anyway.
  *
- * 注意：目前在判断子节点属性是否一致时，我们忽略了排序规则（collations）。
- * 这在语义上是合理的，只要所有排序规则对等价的定义一致。
- * 从实现角度看也是有效的，因为我们不关心 UNION 子节点结果的排序：
- * UNION ALL 的结果总是无序的，而 generate_union_paths 会在顶层为 UNION 强制重新排序。
+ * NOTE: currently, we ignore collations while determining if a child has
+ * the same properties.  This is semantically sound only so long as all
+ * collations have the same notion of equality.  It is valid from an
+ * implementation standpoint because we don't care about the ordering of
+ * a UNION child's result: UNION ALL results are always unordered, and
+ * generate_union_paths will force a fresh sort if the top level is a UNION.
  */
 static List *
 plan_union_children(PlannerInfo *root,
-                   SetOperationStmt *top_union,
-                   List *refnames_tlist,
-                   List **tlist_list)
+					SetOperationStmt *top_union,
+					List *refnames_tlist,
+					List **tlist_list)
 {
-    // 创建待处理节点列表，初始包含顶层UNION节点
-    List       *pending_rels = list_make1(top_union);
-    // 初始化结果列表为空
-    List       *result = NIL;
-    // 用于存储单个子节点目标列表的临时变量
-    List       *child_tlist;
+	List	   *pending_rels = list_make1(top_union);
+	List	   *result = NIL;
+	List	   *child_tlist;
 
-    // 初始化输出参数tlist_list为空列表
-    *tlist_list = NIL;
+	*tlist_list = NIL;
 
-    // 迭代处理待处理节点列表，直到所有节点都被处理
-    while (pending_rels != NIL)
-    {
-        // 获取列表中的第一个节点
-        Node       *setOp = linitial(pending_rels);
-        
-        // 从待处理列表中移除已取出的节点
-        pending_rels = list_delete_first(pending_rels);
+	while (pending_rels != NIL)
+	{
+		Node	   *setOp = linitial(pending_rels);
 
-        // 检查当前节点是否为SetOperationStmt类型（即集合操作节点）
-        if (IsA(setOp, SetOperationStmt))
-        {
-            // 类型转换
-            SetOperationStmt *op = (SetOperationStmt *) setOp;
+		pending_rels = list_delete_first(pending_rels);
 
-            // 检查节点兼容性：操作类型相同，且(
-            // - 要么ALL标志一致，
-            // - 要么子节点是UNION ALL且父节点是UNION)
-            // 同时确保列类型也一致
-            if (op->op == top_union->op &&
-                (op->all == top_union->all || op->all) &&
-                equal(op->colTypes, top_union->colTypes))
-            {
-                /* 节点兼容，将其子节点提升到当前层级处理 */
-                // 先将右侧子节点加入待处理列表开头（LIFO顺序）
-                pending_rels = lcons(op->rarg, pending_rels);
-                // 再将左侧子节点加入待处理列表开头（确保左子节点先被处理）
-                pending_rels = lcons(op->larg, pending_rels);
-                // 跳过当前节点的后续处理
-                continue;
-            }
-        }
+		if (IsA(setOp, SetOperationStmt))
+		{
+			SetOperationStmt *op = (SetOperationStmt *) setOp;
 
-        /*
-         * 当前节点不兼容或不是集合操作节点，需要单独规划
-         *
-         * 注意：这里不允许子节点结果中包含resjunk列。这是因为实现UNION的Append节点
-         * 不会执行投影操作，如果部分输出元组包含junk列而其他不包含，上层处理会出错。
-         * 这种情况主要发生在子节点是EXCEPT或INTERSECT时，其他情况下不会有resjunk列。
-         */
-        // 递归处理当前节点，生成其执行路径
-        result = lappend(result, recurse_set_operations(setOp, root,
-                                                      top_union->colTypes,
-                                                      top_union->colCollations,
-                                                      false, -1,
-                                                      refnames_tlist,
-                                                      &child_tlist,
-                                                      NULL));
-        // 保存当前节点的目标列表到输出参数中
-        *tlist_list = lappend(*tlist_list, child_tlist);
-    }
+			if (op->op == top_union->op &&
+				(op->all == top_union->all || op->all) &&
+				equal(op->colTypes, top_union->colTypes))
+			{
+				/* Same UNION, so fold children into parent */
+				pending_rels = lcons(op->rarg, pending_rels);
+				pending_rels = lcons(op->larg, pending_rels);
+				continue;
+			}
+		}
 
-    // 返回优化后的关系节点列表
-    return result;
+		/*
+		 * Not same, so plan this child separately.
+		 *
+		 * Note we disallow any resjunk columns in child results.  This is
+		 * necessary since the Append node that implements the union won't do
+		 * any projection, and upper levels will get confused if some of our
+		 * output tuples have junk and some don't.  This case only arises when
+		 * we have an EXCEPT or INTERSECT as child, else there won't be
+		 * resjunk anyway.
+		 */
+		result = lappend(result, recurse_set_operations(setOp, root,
+														top_union->colTypes,
+														top_union->colCollations,
+														false, -1,
+														refnames_tlist,
+														&child_tlist,
+														NULL));
+		*tlist_list = lappend(*tlist_list, child_tlist);
+	}
+
+	return result;
 }
 
-
 /*
- * make_union_unique
- *   向给定的路径树中添加节点，以实现UNION操作的结果集去重
- *
- * 参数:
- *   op - 包含UNION操作信息的集合操作语句节点
- *   path - 指向要处理的路径的指针，代表UNION的初步执行计划
- *   tlist - 目标列表达式列表，定义结果集的列
- *   root - 优化器的根节点，包含查询优化所需的所有信息
- *
- * 返回值:
- *   返回一个新的路径指针，包含了实现去重逻辑的节点
+ * Add nodes to the given path tree to unique-ify the result of a UNION.
  */
 static Path *
 make_union_unique(SetOperationStmt *op, Path *path, List *tlist,
 				  PlannerInfo *root)
 {
-	RelOptInfo *result_rel; /* 结果关系的优化器信息结构 */
-	List	   *groupList;  /* 用于分组/去重的表达式列表 */
-	double		dNumGroups; /* 预估的不同分组数量 */
+	RelOptInfo *result_rel = fetch_upper_rel(root, UPPERREL_SETOP, NULL);
+	List	   *groupList;
+	double		dNumGroups;
 
-	/* 获取或创建用于SETOP操作的上层关系结构 */
-	result_rel = fetch_upper_rel(root, UPPERREL_SETOP, NULL);
-
-	/* 识别用于去重的分组语义，生成必要的分组表达式列表 */
+	/* Identify the grouping semantics */
 	groupList = generate_setop_grouplist(op, tlist);
 
 	/*
-	 * XXX 当前实现中，我们保守地将不同分组的数量估计为输入的总行数，
-	 * 即假设最坏情况下没有重复行。这种估计过于保守，但有助于避免哈希表
-	 * 占用过多内存。此外，目前尚不清楚如何准确估计实际的去重后行数。
-	 * 还需注意，初学者常倾向于使用UNION而非UNION ALL，即使他们不期望
-	 * 结果中有重复行...
+	 * XXX for the moment, take the number of distinct groups as equal to the
+	 * total input size, ie, the worst case.  This is too conservative, but we
+	 * don't want to risk having the hashtable overrun memory; also, it's not
+	 * clear how to get a decent estimate of the true size.  One should note
+	 * as well the propensity of novices to write UNION rather than UNION ALL
+	 * even when they don't expect any duplicates...
 	 */
 	dNumGroups = path->rows;
 
-	/* 决定使用哈希聚合还是排序+唯一操作来实现去重 */
+	/* Decide whether to hash or sort */
 	if (choose_hashed_setop(root, groupList, path,
 							dNumGroups, dNumGroups,
 							"UNION"))
 	{
-		/* 使用哈希聚合计划实现去重 - 不需要排序 */
+		/* Hashed aggregate plan --- no sort needed */
 		path = (Path *) create_agg_path(root,
-										result_rel,		/* 目标关系 */
-										path,			/* 输入路径 */
-										create_pathtarget(root, tlist), /* 目标列 */
-										AGG_HASHED,		/* 使用哈希聚合方式 */
-										AGGSPLIT_SIMPLE, /* 简单聚合拆分策略 */
-										groupList,		/* 分组表达式列表 */
-										NIL,			/* 聚合表达式列表(NIL表示仅去重) */
-										NULL,			/* 聚合过滤器(NULL表示无过滤) */
-										dNumGroups);	/* 预估的分组数量 */
+										result_rel,
+										path,
+										create_pathtarget(root, tlist),
+										AGG_HASHED,
+										AGGSPLIT_SIMPLE,
+										groupList,
+										NIL,
+										NULL,
+										dNumGroups);
 	}
 	else
 	{
-		/* 使用排序+唯一操作实现去重 */
-		/* 如果有分组表达式，先创建排序路径 */
+		/* Sort and Unique */
 		if (groupList)
 			path = (Path *)
 				create_sort_path(root,
-								 result_rel,	/* 目标关系 */
-								 path,			/* 输入路径 */
-								 make_pathkeys_for_sortclauses(root, /* 根据分组表达式创建排序键 */
+								 result_rel,
+								 path,
+								 make_pathkeys_for_sortclauses(root,
 															   groupList,
 															   tlist),
-								 -1.0);			/* 不指定排序成本 */
-		/* 创建唯一操作路径，实现最终去重 */
+								 -1.0);
 		path = (Path *) create_upper_unique_path(root,
-												 result_rel,	/* 目标关系 */
-												 path,			/* 输入路径(已排序) */
-												 list_length(path->pathkeys), /* 排序键数量 */
-												 dNumGroups);	/* 预估的去重后行数 */
+												 result_rel,
+												 path,
+												 list_length(path->pathkeys),
+												 dNumGroups);
 	}
 
-	/* 返回包含去重逻辑的新路径 */
 	return path;
 }
 
-
 /*
- * postprocess_setop_rel - 执行添加路径后所需的后处理步骤
- *
- * 参数:
- *    root - 查询规划器的根节点指针，包含整个查询的规划信息
- *    rel - 表示集合操作关系的RelOptInfo指针，已添加了执行路径
- *
- * 功能说明:
- *    此函数在PostgreSQL查询优化器中负责对集合操作（如UNION、INTERSECT、EXCEPT）的关系进行后处理。
- *    它在为集合操作生成所有可能的执行路径后被调用，主要执行两个关键任务：
- *    1. 允许扩展模块通过钩子函数添加额外的执行路径
- *    2. 从所有可用的执行路径中选择成本最低的路径
- *
- * 执行流程:
- *    - 检查是否设置了create_upper_paths_hook钩子函数，如果有，则调用它以允许扩展模块为集合操作关系添加自定义路径
- *    - 调用set_cheapest函数从所有添加的路径中选择总成本最低、启动成本最低和总成本最低的路径
- *
- * 注意事项:
- *    - 函数注释中明确指出当前PostgreSQL不考虑允许外部数据包装器(FDW)为此类关系贡献路径
- *    - 但通过钩子机制保留了扩展性，允许第三方扩展实现自定义功能
+ * postprocess_setop_rel - perform steps required after adding paths
  */
 static void
 postprocess_setop_rel(PlannerInfo *root, RelOptInfo *rel)
 {
-    /*
-     * 检查是否设置了create_upper_paths_hook钩子函数
-     * 当前PostgreSQL核心代码不考虑允许外部数据包装器(FDW)为此类关系贡献路径，
-     * 但通过钩子机制提供了扩展性，允许第三方扩展模块添加自定义路径
-     */
-    if (create_upper_paths_hook)
-        (*create_upper_paths_hook) (root, UPPERREL_SETOP,  /* 集合操作类型的上关系 */
-                                   NULL, rel, NULL);      /* 将集合操作关系传递给钩子函数 */
+	/*
+	 * We don't currently worry about allowing FDWs to contribute paths to
+	 * this relation, but give extensions a chance.
+	 */
+	if (create_upper_paths_hook)
+		(*create_upper_paths_hook) (root, UPPERREL_SETOP,
+									NULL, rel, NULL);
 
-    /*
-     * 从所有可用的执行路径中选择成本最低的路径
-     * set_cheapest函数会更新rel->cheapest_total_path、rel->cheapest_startup_path等字段
-     */
-    set_cheapest(rel);
+	/* Select cheapest path */
+	set_cheapest(rel);
 }
 
-
 /*
- * choose_hashed_setop
- *   决定是否应该使用哈希方法来执行集合操作(如UNION、INTERSECT、EXCEPT)
- *
- * 参数:
- *   root - 优化器的根节点，包含查询上下文和参数
- *   groupClauses - 分组子句列表，定义了用于去重或分组的表达式
- *   input_path - 输入路径，代表集合操作前的执行计划
- *   dNumGroups - 估计的不同分组数量
- *   dNumOutputRows - 估计的输出行数
- *   construct - 集合操作类型名称(如"UNION"、"INTERSECT"或"EXCEPT")
- *
- * 返回值:
- *   如果应该使用哈希方法，返回true；否则返回false
+ * choose_hashed_setop - should we use hashing for a set operation?
  */
 static bool
 choose_hashed_setop(PlannerInfo *root, List *groupClauses,
-				    Path *input_path,
-				    double dNumGroups, double dNumOutputRows,
-				    const char *construct)
+					Path *input_path,
+					double dNumGroups, double dNumOutputRows,
+					const char *construct)
 {
-	int			numGroupCols;   /* 分组列的数量 */
-	bool		can_sort;      	/* 是否可以进行排序操作 */
-	bool		can_hash;      	/* 是否可以进行哈希操作 */
-	Size		hashentrysize; 	/* 哈希表条目的大小 */
-	Path		hashed_p;      	/* 哈希方法的路径成本估算 */
-	Path		sorted_p;      	/* 排序方法的路径成本估算 */
-	double		tuple_fraction; /* 输出元组的分数比例(LIMIT相关) */
+	int			numGroupCols = list_length(groupClauses);
+	bool		can_sort;
+	bool		can_hash;
+	Size		hashentrysize;
+	Path		hashed_p;
+	Path		sorted_p;
+	double		tuple_fraction;
 
-	/* 计算分组列的数量 */
-	numGroupCols = list_length(groupClauses);
-
-	/* 检查操作符是否支持排序或哈希 */
+	/* Check whether the operators support sorting or hashing */
 	can_sort = grouping_is_sortable(groupClauses);
 	can_hash = grouping_is_hashable(groupClauses);
-	
-	/* 根据支持情况决定初步策略 */
 	if (can_hash && can_sort)
 	{
-		/* 同时支持排序和哈希，需要进一步比较成本 */
+		/* we have a meaningful choice to make, continue ... */
 	}
 	else if (can_hash)
-		/* 只支持哈希，直接返回true */
 		return true;
 	else if (can_sort)
-		/* 只支持排序，直接返回false */
 		return false;
 	else
-		/* 既不支持排序也不支持哈希，报错 */
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/* translator: %s is UNION, INTERSECT, or EXCEPT */
 				 errmsg("could not implement %s", construct),
 				 errdetail("Some of the datatypes only support hashing, while others only support sorting.")));
 
-	/* 如果哈希聚合功能被禁用，则优先选择排序 */
+	/* Prefer sorting when enable_hashagg is off */
 	if (!enable_hashagg)
 		return false;
 
 	/*
-	 * 如果哈希表大小可能超过work_mem内存限制，则不使用哈希方法
+	 * Don't do it if it doesn't look like the hashtable will fit into
+	 * work_mem.
 	 */
-	/* 计算哈希表条目的大小：对齐的元组宽度 + 对齐的最小元组头大小 */
 	hashentrysize = MAXALIGN(input_path->pathtarget->width) + MAXALIGN(SizeofMinimalTupleHeader);
 
-	/* 如果总哈希表大小超过work_mem(转换为字节)，则不使用哈希方法 */
 	if (hashentrysize * dNumGroups > work_mem * 1024L)
 		return false;
 
 	/*
-	 * 比较哈希方法和排序方法的成本估算
+	 * See if the estimated cost is no more than doing it the other way.
 	 *
-	 * 我们需要比较：input_plan + hashagg 与 input_plan + sort + group
-	 * 注意：实际执行计划可能使用SetOp或Unique节点，而不是Agg或Group，但
-	 * 对于成本估算目的，Agg和Group的成本估计足够接近
+	 * We need to consider input_plan + hashagg versus input_plan + sort +
+	 * group.  Note that the actual result plan might involve a SetOp or
+	 * Unique node, not Agg or Group, but the cost estimates for Agg and Group
+	 * should be close enough for our purposes here.
 	 *
-	 * 这些路径变量只是用于保存成本字段的占位符，我们不会为这些步骤创建实际的Path对象
+	 * These path variables are dummies that just hold cost fields; we don't
+	 * make actual Paths for these steps.
 	 */
-	/* 计算哈希聚合的成本 */
 	cost_agg(&hashed_p, root, AGG_HASHED, NULL,
 			 numGroupCols, dNumGroups,
 			 NIL,
@@ -1180,40 +1072,36 @@ choose_hashed_setop(PlannerInfo *root, List *groupClauses,
 			 input_path->rows);
 
 	/*
-	 * 计算排序方法的成本
-	 * 注意：输入总是未排序的，因为它是通过将不相关的子关系追加在一起而形成的
+	 * Now for the sorted case.  Note that the input is *always* unsorted,
+	 * since it was made by appending unrelated sub-relations together.
 	 */
-	/* 初始化排序路径的成本为输入路径的成本 */
 	sorted_p.startup_cost = input_path->startup_cost;
 	sorted_p.total_cost = input_path->total_cost;
-	/* 计算排序成本，由于cost_sort实际上不查看pathkeys，所以传递NIL */
+	/* XXX cost_sort doesn't actually look at pathkeys, so just pass NIL */
 	cost_sort(&sorted_p, root, NIL, sorted_p.total_cost,
-			 input_path->rows, input_path->pathtarget->width,
-			 0.0, work_mem, -1.0);
-	/* 计算分组成本 */
+			  input_path->rows, input_path->pathtarget->width,
+			  0.0, work_mem, -1.0);
 	cost_group(&sorted_p, root, numGroupCols, dNumGroups,
-			  NIL,
-			  sorted_p.startup_cost, sorted_p.total_cost,
-			  input_path->rows);
+			   NIL,
+			   sorted_p.startup_cost, sorted_p.total_cost,
+			   input_path->rows);
 
 	/*
-	 * 使用顶层元组分数来做最终决定。首先需要将绝对数量(LIMIT)转换为分数形式
+	 * Now make the decision using the top-level tuple fraction.  First we
+	 * have to convert an absolute count (LIMIT) into fractional form.
 	 */
 	tuple_fraction = root->tuple_fraction;
 	if (tuple_fraction >= 1.0)
 		tuple_fraction /= dNumOutputRows;
 
-	/* 比较两种方法的分数成本 */
 	if (compare_fractional_path_costs(&hashed_p, &sorted_p,
-						  tuple_fraction) < 0)
+									  tuple_fraction) < 0)
 	{
-		/* 哈希方法成本更低，使用哈希 */
+		/* Hashed is cheaper, so use it */
 		return true;
 	}
-	/* 否则使用排序方法 */
 	return false;
 }
-
 
 /*
  * Generate targetlist for a set-operation plan node
@@ -1348,21 +1236,21 @@ generate_setop_tlist(List *colTypes, List *colCollations,
 }
 
 /*
- * 为集合操作的 Append 节点生成目标列表
+ * Generate targetlist for a set-operation Append node
  *
- * 参数说明：
- * - colTypes: 集合操作结果列的数据类型 OID 列表
- * - colCollations: 集合操作结果列的排序规则 OID 列表
- * - flag: 如果为 true，则添加一个从子计划复制上来的标志列
- * - input_tlists: 所有子计划的目标列表链表
- * - refnames_tlist: 用于获取列名的目标列表
+ * colTypes: OID list of set-op's result column datatypes
+ * colCollations: OID list of set-op's result column collations
+ * flag: true to create a flag column copied up from subplans
+ * input_tlists: list of tlists for sub-plans of the Append
+ * refnames_tlist: targetlist to take column names from
  *
- * Append 节点的目标列表中的条目应始终为简单的 Var，
- * 只需确保它们具有正确的数据类型、typmod 和排序规则即可。
- * 这里生成的 Var 的 varno 总是 0。
+ * The entries in the Append's targetlist should always be simple Vars;
+ * we just have to make sure they have the right datatypes/typmods/collations.
+ * The Vars are always generated with varno 0.
  *
- * XXX：由于 varno 为 0，set_pathtarget_cost_width 无法计算出真实的宽度，
- * 但本函数本应直接生成 PathTarget，后续可优化。
+ * XXX a problem with the varno-zero approach is that set_pathtarget_cost_width
+ * cannot figure out a realistic width for the tlist we make here.  But we
+ * ought to refactor this code to produce a PathTarget directly, anyway.
  */
 static List *
 generate_append_tlist(List *colTypes, List *colCollations,
@@ -1370,8 +1258,8 @@ generate_append_tlist(List *colTypes, List *colCollations,
 					  List *input_tlists,
 					  List *refnames_tlist)
 {
-	List	   *tlist = NIL;			/* 最终目标列表 */
-	int			resno = 1;				/* 当前列序号 */
+	List	   *tlist = NIL;
+	int			resno = 1;
 	ListCell   *curColType;
 	ListCell   *curColCollation;
 	ListCell   *ref_tl_item;
@@ -1382,8 +1270,10 @@ generate_append_tlist(List *colTypes, List *colCollations,
 	int32	   *colTypmods;
 
 	/*
-	 * 首先提取每一列应使用的 typmod。
-	 * 如果所有输入子计划在某一列的类型和 typmod 都一致，则使用该 typmod，否则用 -1。
+	 * First extract typmods to use.
+	 *
+	 * If the inputs all agree on type and typmod of a particular column, use
+	 * that typmod; else use -1.
 	 */
 	colTypmods = (int32 *) palloc(list_length(colTypes) * sizeof(int32));
 
@@ -1403,7 +1293,7 @@ generate_append_tlist(List *colTypes, List *colCollations,
 			Assert(curColType != NULL);
 			if (exprType((Node *) subtle->expr) == lfirst_oid(curColType))
 			{
-				/* 如果是第一个子计划，直接记录 typmod；否则比较是否一致 */
+				/* If first subplan, copy the typmod; else compare */
 				int32		subtypmod = exprTypmod((Node *) subtle->expr);
 
 				if (tlistl == list_head(input_tlists))
@@ -1413,7 +1303,7 @@ generate_append_tlist(List *colTypes, List *colCollations,
 			}
 			else
 			{
-				/* 类型不一致，强制 typmod 为 -1 */
+				/* types disagree, so force typmod to -1 */
 				colTypmods[colindex] = -1;
 			}
 			curColType = lnext(curColType);
@@ -1423,7 +1313,7 @@ generate_append_tlist(List *colTypes, List *colCollations,
 	}
 
 	/*
-	 * 现在可以为 Append 节点构建目标列表。
+	 * Now we can build the tlist for the Append.
 	 */
 	colindex = 0;
 	forthree(curColType, colTypes, curColCollation, colCollations,
@@ -1448,8 +1338,9 @@ generate_append_tlist(List *colTypes, List *colCollations,
 							  false);
 
 		/*
-		 * 约定：集合操作树中所有非 resjunk 列的 ressortgroupref 等于其 resno。
-		 * 有些情况下不需要该属性，但统一设置更规范。
+		 * By convention, all non-resjunk columns in a setop tree have
+		 * ressortgroupref equal to their resno.  In some cases the ref isn't
+		 * needed, but this is a cleaner way than modifying the tlist later.
 		 */
 		tle->ressortgroupref = tle->resno;
 
@@ -1458,7 +1349,8 @@ generate_append_tlist(List *colTypes, List *colCollations,
 
 	if (flag)
 	{
-		/* 添加一个 resjunk 标志列，值从子计划复制上来 */
+		/* Add a resjunk flag column */
+		/* flag value is shown as copied up from subplan */
 		expr = (Node *) makeVar(0,
 								resno,
 								INT4OID,
@@ -1479,69 +1371,46 @@ generate_append_tlist(List *colTypes, List *colCollations,
 
 /*
  * generate_setop_grouplist
- *   构建一个SortGroupClause列表，定义集合操作(setop)输出列的排序/分组属性
+ *		Build a SortGroupClause list defining the sort/grouping properties
+ *		of the setop's output columns.
  *
- * 解析分析阶段已经确定了这些属性并构建了适当的列表，但由于解析器输出表示
- * 不包含每个集合操作的目标列列表(tlist)，因此这些条目没有设置sortgrouprefs。
- * 所以，我们需要复制该列表并在其中安装正确的sortgrouprefs（从目标列列表复制）。
- *
- * 参数:
- *   op - 包含集合操作信息的语句节点，其中的groupClauses保存了初步的分组/排序信息
- *   targetlist - 目标列表达式列表，包含了已设置好的sortgrouprefs信息
- *
- * 返回值:
- *   返回一个新的SortGroupClause列表，其中的每个条目都已正确设置了tleSortGroupRef
+ * Parse analysis already determined the properties and built a suitable
+ * list, except that the entries do not have sortgrouprefs set because
+ * the parser output representation doesn't include a tlist for each
+ * setop.  So what we need to do here is copy that list and install
+ * proper sortgrouprefs into it (copying those from the targetlist).
  */
 static List *
 generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
 {
-	List	   *grouplist; /* 要返回的分组/排序子句列表 */
-	ListCell   *lg;       /* grouplist的遍历指针 */
-	ListCell   *lt;       /* targetlist的遍历指针 */
+	List	   *grouplist = copyObject(op->groupClauses);
+	ListCell   *lg;
+	ListCell   *lt;
 
-	/* 深拷贝原始的groupClauses列表，避免修改原列表 */
-	grouplist = copyObject(op->groupClauses);
-	
-	/* 初始化grouplist的遍历指针，指向列表头部 */
 	lg = list_head(grouplist);
-	
-	/* 遍历目标列列表中的每个条目 */
 	foreach(lt, targetlist)
 	{
-		TargetEntry *tle;      /* 当前目标列条目 */
-		SortGroupClause *sgc;  /* 当前分组/排序子句 */
+		TargetEntry *tle = (TargetEntry *) lfirst(lt);
+		SortGroupClause *sgc;
 
-		/* 获取当前目标列条目 */
-		tle = (TargetEntry *) lfirst(lt);
-		
-		/* 如果是resjunk列（临时处理列，不输出给用户），跳过 */
 		if (tle->resjunk)
 		{
-			/* resjunk列不应该有sortgrouprefs引用 */
+			/* resjunk columns should not have sortgrouprefs */
 			Assert(tle->ressortgroupref == 0);
-			continue; /* 跳过resjunk列的处理 */
+			continue;			/* ignore resjunk columns */
 		}
 
-		/* 非resjunk列应该有sortgroupref等于其resno */
+		/* non-resjunk columns should have sortgroupref = resno */
 		Assert(tle->ressortgroupref == tle->resno);
 
-		/* 非resjunk列应该有对应的分组子句 */
+		/* non-resjunk columns should have grouping clauses */
 		Assert(lg != NULL);
-		/* 获取对应的分组/排序子句 */
 		sgc = (SortGroupClause *) lfirst(lg);
-		/* 移动到下一个分组/排序子句 */
 		lg = lnext(lg);
-		/* 确保原始的tleSortGroupRef尚未设置（应为0） */
 		Assert(sgc->tleSortGroupRef == 0);
 
-		/* 从目标列条目复制sortgroupref到分组/排序子句 */
 		sgc->tleSortGroupRef = tle->ressortgroupref;
 	}
-	
-	/* 确保所有分组子句都已处理 */
 	Assert(lg == NULL);
-	
-	/* 返回设置好的分组/排序子句列表 */
 	return grouplist;
 }
-

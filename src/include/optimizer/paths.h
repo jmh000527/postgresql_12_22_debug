@@ -178,15 +178,13 @@ extern bool is_redundant_with_indexclauses(RestrictInfo *rinfo,
 /*
  * pathkeys.c
  *	  utilities for matching and building path keys
- *
- * PathKeysComparison 枚举用于表示两个路径键（pathkeys）之间的关系。
  */
 typedef enum
 {
-	PATHKEYS_EQUAL,				/* 路径键完全相同 */
-	PATHKEYS_BETTER1,			/* 路径键1是路径键2的超集（包含路径键2的所有元素） */
-	PATHKEYS_BETTER2,			/* 路径键2是路径键1的超集（包含路径键1的所有元素） */
-	PATHKEYS_DIFFERENT			/* 两者在路径键上没有包含关系 */
+	PATHKEYS_EQUAL,				/* pathkeys are identical */
+	PATHKEYS_BETTER1,			/* pathkey 1 is a superset of pathkey 2 */
+	PATHKEYS_BETTER2,			/* vice versa */
+	PATHKEYS_DIFFERENT			/* neither pathkey includes the other */
 } PathKeysComparison;
 
 extern PathKeysComparison compare_pathkeys(List *keys1, List *keys2);

@@ -554,74 +554,44 @@ extract_grouping_cols(List *groupClause, List *tlist)
 }
 
 /*
- * grouping_is_sortable
- *   判断是否可以通过排序的方式实现分组列表
- *   
- * 这个函数的判断逻辑很简单，因为解析器(parser)在处理分组表达式时，如果该
- * 表达式支持排序操作，就会在SortGroupClause中设置对应的排序操作符(sortop)。
- * 我们只需要检查每个分组子句是否都有有效的排序操作符即可。
+ * grouping_is_sortable - is it possible to implement grouping list by sorting?
  *
- * 参数:
- *   groupClause - 需要检查的分组子句列表，每个元素是SortGroupClause类型
- *
- * 返回值:
- *   如果所有分组子句都支持排序操作，返回true；如果有任何一个不支持，返回false
+ * This is easy since the parser will have included a sortop if one exists.
  */
 bool
 grouping_is_sortable(List *groupClause)
 {
-	ListCell   *glitem; /* 用于遍历分组子句列表的指针 */
+	ListCell   *glitem;
 
-	/* 遍历分组子句列表中的每个元素 */
 	foreach(glitem, groupClause)
 	{
-		SortGroupClause *groupcl; /* 当前处理的排序/分组子句 */
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(glitem);
 
-		/* 获取当前的排序/分组子句 */
-		groupcl = (SortGroupClause *) lfirst(glitem);
-
-		/* 检查该子句是否有有效的排序操作符 */
 		if (!OidIsValid(groupcl->sortop))
-			return false; /* 只要有一个子句没有有效的排序操作符，整个列表就不能排序 */
+			return false;
 	}
-	/* 所有子句都有有效的排序操作符，可以通过排序实现分组 */
 	return true;
 }
 
 /*
- * grouping_is_hashable
- *   判断是否可以通过哈希的方式实现分组列表
- *   
- * 这个函数依赖于解析器(parser)在处理分组表达式时，正确设置每个SortGroupClause的
- * hashable标志。只有当表达式的数据类型支持哈希操作时，该标志才会被设置为true。
+ * grouping_is_hashable - is it possible to implement grouping list by hashing?
  *
- * 参数:
- *   groupClause - 需要检查的分组子句列表，每个元素是SortGroupClause类型
- *
- * 返回值:
- *   如果所有分组子句都支持哈希操作，返回true；如果有任何一个不支持，返回false
+ * We rely on the parser to have set the hashable flag correctly.
  */
 bool
 grouping_is_hashable(List *groupClause)
 {
-	ListCell   *glitem; /* 用于遍历分组子句列表的指针 */
+	ListCell   *glitem;
 
-	/* 遍历分组子句列表中的每个元素 */
 	foreach(glitem, groupClause)
 	{
-		SortGroupClause *groupcl; /* 当前处理的排序/分组子句 */
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(glitem);
 
-		/* 获取当前的排序/分组子句 */
-		groupcl = (SortGroupClause *) lfirst(glitem);
-
-		/* 检查该子句是否支持哈希操作 */
 		if (!groupcl->hashable)
-			return false; /* 只要有一个子句不支持哈希操作，整个列表就不能哈希 */
+			return false;
 	}
-	/* 所有子句都支持哈希操作，可以通过哈希实现分组 */
 	return true;
 }
-
 
 
 /*****************************************************************************

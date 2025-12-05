@@ -96,139 +96,48 @@
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
 
-/*
- * 计算以2为底的对数的宏定义
- * 使用自然对数计算：log2(x) = ln(x) / ln(2)，其中0.693147180559945是ln(2)的近似值
- * 该宏用于查询优化器中的各种计算，如估算基数时的统计信息处理
- */
+
 #define LOG2(x)  (log(x) / 0.693147180559945)
 
 /*
- * Append和MergeAppend节点的成本估算系数
- * 这些节点的处理成本低于其他使用cpu_tuple_cost的操作
- * 为避免添加单独的GUC参数，将每个元组的处理成本估算为cpu_tuple_cost乘以该系数
+ * Append and MergeAppend nodes are less expensive than some other operations
+ * which use cpu_tuple_cost; instead of adding a separate GUC, estimate the
+ * per-tuple cost as cpu_tuple_cost multiplied by this value.
  */
 #define APPEND_CPU_COST_MULTIPLIER 0.5
 
 
-/*
- * 顺序扫描一个数据页的成本估算值
- * 从配置参数seq_page_cost获取，可由用户在postgresql.conf中调整
- * 反映了数据库系统对顺序I/O操作的相对成本评估
- */
 double		seq_page_cost = DEFAULT_SEQ_PAGE_COST;
-
-/*
- * 随机扫描一个数据页的成本估算值
- * 从配置参数random_page_cost获取，通常设置为比seq_page_cost高的值
- * 反映了随机I/O与顺序I/O相比的额外开销，如磁盘寻道时间
- */
 double		random_page_cost = DEFAULT_RANDOM_PAGE_COST;
-
-/*
- * 处理一个数据元组的CPU成本估算值
- * 用于计算扫描操作中处理每个元组的CPU开销
- */
 double		cpu_tuple_cost = DEFAULT_CPU_TUPLE_COST;
-
-/*
- * 处理一个索引元组的CPU成本估算值
- * 用于计算索引扫描中处理每个索引项的CPU开销
- */
 double		cpu_index_tuple_cost = DEFAULT_CPU_INDEX_TUPLE_COST;
-
-/*
- * 执行一个操作符的CPU成本估算值
- * 用于计算查询中执行各种操作符(如比较、数学运算)的CPU开销
- */
 double		cpu_operator_cost = DEFAULT_CPU_OPERATOR_COST;
-
-/*
- * 并行查询中，将一个元组从工作进程传递到主进程的成本估算值
- * 影响并行查询计划的成本计算
- */
 double		parallel_tuple_cost = DEFAULT_PARALLEL_TUPLE_COST;
-
-/*
- * 并行查询中，启动并行工作进程的设置成本估算值
- * 用于计算并行查询的初始开销
- */
 double		parallel_setup_cost = DEFAULT_PARALLEL_SETUP_COST;
 
-/*
- * 有效的缓存大小估算值(以页为单位)
- * 由配置参数effective_cache_size设置，指示系统估计可用缓存空间
- * 影响查询优化器对索引使用效率的判断
- */
-int		effective_cache_size = DEFAULT_EFFECTIVE_CACHE_SIZE;
+int			effective_cache_size = DEFAULT_EFFECTIVE_CACHE_SIZE;
 
-/*
- * 禁用某项操作的成本值(一个非常大的值)
- * 用于在某些情况下明确禁用特定的查询路径
- */
 Cost		disable_cost = 1.0e10;
 
-/*
- * 每个Gather节点允许的最大并行工作进程数
- * 控制并行查询的并行度
- */
-int		max_parallel_workers_per_gather = 2;
+int			max_parallel_workers_per_gather = 2;
 
-/*
- * 以下布尔变量控制是否启用各种查询计划操作
- */
-
-/* 是否启用顺序扫描 */
 bool		enable_seqscan = true;
-
-/* 是否启用索引扫描 */
 bool		enable_indexscan = true;
-
-/* 是否启用仅索引扫描(不访问表数据页) */
 bool		enable_indexonlyscan = true;
-
-/* 是否启用位图扫描 */
 bool		enable_bitmapscan = true;
-
-/* 是否启用TID扫描(通过元组ID直接访问元组) */
 bool		enable_tidscan = true;
-
-/* 是否启用排序操作 */
 bool		enable_sort = true;
-
-/* 是否启用哈希聚合 */
 bool		enable_hashagg = true;
-
-/* 是否启用嵌套循环连接 */
 bool		enable_nestloop = true;
-
-/* 是否启用物化操作(缓存中间结果) */
 bool		enable_material = true;
-
-/* 是否启用归并连接 */
 bool		enable_mergejoin = true;
-
-/* 是否启用哈希连接 */
 bool		enable_hashjoin = true;
-
-/* 是否启用GatherMerge操作(用于并行查询中的排序合并) */
 bool		enable_gathermerge = true;
-
-/* 是否启用分区表间的分区级连接 */
 bool		enable_partitionwise_join = false;
-
-/* 是否启用分区表间的分区级聚合 */
 bool		enable_partitionwise_aggregate = false;
-
-/* 是否启用并行Append操作 */
 bool		enable_parallel_append = true;
-
-/* 是否启用并行哈希连接 */
 bool		enable_parallel_hash = true;
-
-/* 是否启用分区裁剪(排除不需要扫描的分区) */
 bool		enable_partition_pruning = true;
-
 
 typedef struct
 {
@@ -293,10 +202,10 @@ clamp_row_est(double nrows)
 
 /*
  * cost_seqscan
- *	  计算并返回顺序扫描关系的成本。
+ *	  Determines and returns the cost of scanning a relation sequentially.
  *
- * 'baserel' 是要扫描的关系
- * 'param_info' 如果这是参数化路径则为 ParamPathInfo，否则为 NULL
+ * 'baserel' is the relation to be scanned
+ * 'param_info' is the ParamPathInfo if this is a parameterized path, else NULL
  */
 void
 cost_seqscan(Path *path, PlannerInfo *root,
@@ -309,56 +218,57 @@ cost_seqscan(Path *path, PlannerInfo *root,
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
 
-	/* 只应用于基本关系 */
+	/* Should only be applied to base relations */
 	Assert(baserel->relid > 0);
 	Assert(baserel->rtekind == RTE_RELATION);
 
-	/* 设置正确的行数估算值 */
+	/* Mark the path with the correct row estimate */
 	if (param_info)
-		/* 如果是参数化路径，使用参数化路径的行数估算值 */
 		path->rows = param_info->ppi_rows;
 	else
 		path->rows = baserel->rows;
 
-	/* 如果顺序扫描被禁用，增加一个高成本惩罚 */
 	if (!enable_seqscan)
 		startup_cost += disable_cost;
 
-	/* 获取表空间的顺序页成本估算值 spc_seq_page_cost */
+	/* fetch estimated page cost for tablespace containing table */
 	get_tablespace_page_costs(baserel->reltablespace,
 							  NULL,
 							  &spc_seq_page_cost);
 
 	/*
-	 * 磁盘成本
+	 * disk costs
 	 */
 	disk_run_cost = spc_seq_page_cost * baserel->pages;
 
-	/* CPU 成本 */
+	/* CPU costs */
 	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
 
 	startup_cost += qpqual_cost.startup;
 	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
 	cpu_run_cost = cpu_per_tuple * baserel->tuples;
-	/* tlist 评估成本按输出行支付，而不是扫描的元组 */
+	/* tlist eval costs are paid per output row, not per tuple scanned */
 	startup_cost += path->pathtarget->cost.startup;
 	cpu_run_cost += path->pathtarget->cost.per_tuple * path->rows;
 
-	/* 如果使用并行，调整成本 */
+	/* Adjust costing for parallelism, if used. */
 	if (path->parallel_workers > 0)
 	{
 		double		parallel_divisor = get_parallel_divisor(path);
 
-		/* CPU 成本在所有工作进程间分摊 */
+		/* The CPU cost is divided among all the workers. */
 		cpu_run_cost /= parallel_divisor;
 
 		/*
-		 * 磁盘成本可能可以摊销一部分，但通常不多，因为大多数操作系统已经做了积极的预取。
-		 * 目前假设磁盘运行成本无法摊销。
+		 * It may be possible to amortize some of the I/O cost, but probably
+		 * not very much, because most operating systems already do aggressive
+		 * prefetching.  For now, we assume that the disk run cost can't be
+		 * amortized at all.
 		 */
 
 		/*
-		 * 对于并行计划，行数需要表示每个工作进程处理的元组数。
+		 * In the case of a parallel plan, the row count needs to represent
+		 * the number of tuples processed per worker.
 		 */
 		path->rows = clamp_row_est(path->rows / parallel_divisor);
 	}
@@ -1735,34 +1645,49 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
 }
 
 /*
- * cost_sort - 计算排序一个关系的成本，包括读取输入数据的成本
+ * cost_sort
+ *	  Determines and returns the cost of sorting a relation, including
+ *	  the cost of reading the input data.
  *
- * 参数说明:
- * - path: 路径节点，用于存储成本估算结果
- * - root: 查询规划器信息
- * - pathkeys: 排序键列表
- * - input_cost: 读取输入数据的总成本
- * - tuples: 关系中的元组数量
- * - width: 平均元组宽度（字节）
- * - comparison_cost: 每次比较的额外成本（可为0）
- * - sort_mem: 分配给排序的内存大小（KB）
- * - limit_tuples: 输出元组的数量限制（-1表示无限制）
+ * If the total volume of data to sort is less than sort_mem, we will do
+ * an in-memory sort, which requires no I/O and about t*log2(t) tuple
+ * comparisons for t tuples.
  *
- * 算法说明:
- * 1. 如果待排序数据总量小于sort_mem，将执行内存排序，不需要I/O操作，
- *    大约需要 t*log2(t) 次元组比较（t为元组数）。
+ * If the total volume exceeds sort_mem, we switch to a tape-style merge
+ * algorithm.  There will still be about t*log2(t) tuple comparisons in
+ * total, but we will also need to write and read each tuple once per
+ * merge pass.  We expect about ceil(logM(r)) merge passes where r is the
+ * number of initial runs formed and M is the merge order used by tuplesort.c.
+ * Since the average initial run should be about sort_mem, we have
+ *		disk traffic = 2 * relsize * ceil(logM(p / sort_mem))
+ *		cpu = comparison_cost * t * log2(t)
  *
- * 2. 如果数据量超过sort_mem，切换到磁带式归并算法。仍然需要大约 t*log2(t) 
- *    次元组比较，但每个元组在每次归并过程中都需要写入和读取一次。
- *    预期归并趟数约为 ceil(logM(r))，其中r是初始有序段数量，M是归并度。
+ * If the sort is bounded (i.e., only the first k result tuples are needed)
+ * and k tuples can fit into sort_mem, we use a heap method that keeps only
+ * k tuples in the heap; this will require about t*log2(k) tuple comparisons.
  *
- * 3. 如果排序是有界的（只需要前k个结果元组）且k个元组可以放入sort_mem，
- *    使用堆排序方法，仅在内存中维护k个元组，需要约 t*log2(k) 次比较。
+ * The disk traffic is assumed to be 3/4ths sequential and 1/4th random
+ * accesses (XXX can't we refine that guess?)
  *
- * 4. 磁盘访问假设为3/4顺序访问和1/4随机访问。
+ * By default, we charge two operator evals per tuple comparison, which should
+ * be in the right ballpark in most cases.  The caller can tweak this by
+ * specifying nonzero comparison_cost; typically that's used for any extra
+ * work that has to be done to prepare the inputs to the comparison operators.
  *
- * 5. 默认情况下，每次元组比较计为两次操作符求值，在大多数情况下这个估计合理。
- *    调用者可以通过指定非零comparison_cost来调整这个值。
+ * 'pathkeys' is a list of sort keys
+ * 'input_cost' is the total cost for reading the input data
+ * 'tuples' is the number of tuples in the relation
+ * 'width' is the average tuple width in bytes
+ * 'comparison_cost' is the extra cost per comparison, if any
+ * 'sort_mem' is the number of kilobytes of work memory allowed for the sort
+ * 'limit_tuples' is the bound on the number of output tuples; -1 if no bound
+ *
+ * NOTE: some callers currently pass NIL for pathkeys because they
+ * can't conveniently supply the sort keys.  Since this routine doesn't
+ * currently do anything with pathkeys anyway, that doesn't matter...
+ * but if it ever does, it should react gracefully to lack of key data.
+ * (Actually, the thing we'd most likely be interested in is just the number
+ * of sort keys, which all callers *could* supply.)
  */
 void
 cost_sort(Path *path, PlannerInfo *root,
@@ -1770,113 +1695,99 @@ cost_sort(Path *path, PlannerInfo *root,
 		  Cost comparison_cost, int sort_mem,
 		  double limit_tuples)
 {
-	/* 初始化成本变量 */
-	Cost		startup_cost = input_cost;  /* 启动成本初始化为输入成本 */
-	Cost		run_cost = 0;               /* 运行成本 */
-	
-	/* 计算输入数据的字节数 */
+	Cost		startup_cost = input_cost;
+	Cost		run_cost = 0;
 	double		input_bytes = relation_byte_size(tuples, width);
-	double		output_bytes;               /* 输出数据字节数 */
-	double		output_tuples;              /* 输出元组数 */
-	
-	/* 将sort_mem从KB转换为字节 */
+	double		output_bytes;
+	double		output_tuples;
 	long		sort_mem_bytes = sort_mem * 1024L;
 
-	/* 如果排序被禁用，增加禁用成本 */
 	if (!enable_sort)
 		startup_cost += disable_cost;
 
-	/* 设置路径的行数 */
 	path->rows = tuples;
 
 	/*
-	 * 确保排序成本永远不会估计为零，即使是传入的元组数为零。
-	 * 此外，不能计算log(0)...
+	 * We want to be sure the cost of a sort is never estimated as zero, even
+	 * if passed-in tuple count is zero.  Besides, mustn't do log(0)...
 	 */
 	if (tuples < 2.0)
 		tuples = 2.0;
 
-	/* 包含默认的每次比较成本（2倍操作符成本） */
+	/* Include the default cost-per-comparison */
 	comparison_cost += 2.0 * cpu_operator_cost;
 
-	/* 检查是否有有用的LIMIT限制 */
+	/* Do we have a useful LIMIT? */
 	if (limit_tuples > 0 && limit_tuples < tuples)
 	{
-		/* 有限制的情况下，输出元组数等于限制数 */
 		output_tuples = limit_tuples;
-		/* 计算输出数据的字节数 */
 		output_bytes = relation_byte_size(output_tuples, width);
 	}
 	else
 	{
-		/* 无限制或限制大于总元组数，输出等于输入 */
 		output_tuples = tuples;
 		output_bytes = input_bytes;
 	}
 
-	/* 根据数据量和内存大小选择不同的排序策略 */
 	if (output_bytes > sort_mem_bytes)
 	{
 		/*
-		 * 数据量超过内存限制，必须使用基于磁盘的排序
+		 * We'll have to use a disk-based sort of all the tuples
 		 */
-		double		npages = ceil(input_bytes / BLCKSZ);      /* 输入数据占用的页面数 */
-		double		nruns = input_bytes / sort_mem_bytes;     /* 初始有序段数量 */
-		double		mergeorder = tuplesort_merge_order(sort_mem_bytes);  /* 归并度 */
-		double		log_runs;                                 /* 归并趟数 */
-		double		npageaccesses;                            /* 页面访问次数 */
+		double		npages = ceil(input_bytes / BLCKSZ);
+		double		nruns = input_bytes / sort_mem_bytes;
+		double		mergeorder = tuplesort_merge_order(sort_mem_bytes);
+		double		log_runs;
+		double		npageaccesses;
 
 		/*
-		 * CPU成本计算
+		 * CPU costs
 		 *
-		 * 假设大约需要 N log2 N 次比较
+		 * Assume about N log2 N comparisons
 		 */
 		startup_cost += comparison_cost * tuples * LOG2(tuples);
 
-		/* 磁盘成本计算 */
+		/* Disk costs */
 
-		/* 计算logM(r) = log(r) / log(M) */
+		/* Compute logM(r) as log(r) / log(M) */
 		if (nruns > mergeorder)
 			log_runs = ceil(log(nruns) / log(mergeorder));
 		else
 			log_runs = 1.0;
-		
-		/* 计算总的页面访问次数：每趟归并需要2次读写 */
 		npageaccesses = 2.0 * npages * log_runs;
-		
-		/* 假设3/4的访问是顺序的，1/4是随机的 */
+		/* Assume 3/4ths of accesses are sequential, 1/4th are not */
 		startup_cost += npageaccesses *
 			(seq_page_cost * 0.75 + random_page_cost * 0.25);
 	}
 	else if (tuples > 2 * output_tuples || input_bytes > sort_mem_bytes)
 	{
 		/*
-		 * 使用有界堆排序，仅在内存中保持K个元组，
-		 * 总比较次数为 N log2 K；但常数因子比快速排序稍高。
-		 * 调整使其在交叉点处成本曲线连续。
+		 * We'll use a bounded heap-sort keeping just K tuples in memory, for
+		 * a total number of tuple comparisons of N log2 K; but the constant
+		 * factor is a bit higher than for quicksort.  Tweak it so that the
+		 * cost curve is continuous at the crossover point.
 		 */
 		startup_cost += comparison_cost * tuples * LOG2(2.0 * output_tuples);
 	}
 	else
 	{
-		/* 使用普通的快速排序处理所有输入元组 */
+		/* We'll use plain quicksort on all the input tuples */
 		startup_cost += comparison_cost * tuples * LOG2(tuples);
 	}
 
 	/*
-	 * 为每个提取的元组收取少量费用（任意设置为等于操作符成本）。
-	 * 我们不收取cpu_tuple_cost，因为Sort节点不进行条件检查或投影操作，
-	 * 所以它的开销比大多数计划节点要小。
-	 * 注意这里正确地使用tuples而不是output_tuples ---
-	 * 上层的LIMIT会对运行成本进行比例分配，否则我们会重复计算LIMIT。
+	 * Also charge a small amount (arbitrarily set equal to operator cost) per
+	 * extracted tuple.  We don't charge cpu_tuple_cost because a Sort node
+	 * doesn't do qual-checking or projection, so it has less overhead than
+	 * most plan nodes.  Note it's correct to use tuples not output_tuples
+	 * here --- the upper LIMIT will pro-rate the run cost so we'd be double
+	 * counting the LIMIT otherwise.
 	 */
 	run_cost += cpu_operator_cost * tuples;
 
-	/* 设置路径的启动成本和总成本 */
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
-
 
 /*
  * append_nonpartial_cost
@@ -2226,23 +2137,15 @@ cost_material(Path *path,
 }
 
 /*
- * cost_agg - 计算执行Agg计划节点的成本，包括其输入的成本
+ * cost_agg
+ *		Determines and returns the cost of performing an Agg plan node,
+ *		including the cost of its input.
  *
- * 参数说明:
- * - path: 路径节点，用于存储成本估算结果
- * - root: 查询规划器信息
- * - aggstrategy: 聚合策略（AGG_PLAIN, AGG_SORTED, AGG_HASHED, AGG_MIXED）
- * - aggcosts: 聚合子句成本信息（如果没有实际聚合函数可以为NULL）
- * - numGroupCols: 分组列的数量
- * - numGroups: 分组的数量
- * - quals: HAVING子句条件
- * - input_startup_cost: 输入的启动成本
- * - input_total_cost: 输入的总成本
- * - input_tuples: 输入元组数量
+ * aggcosts can be NULL when there are no actual aggregate functions (i.e.,
+ * we are using a hashed Agg node just to do grouping).
  *
- * 特殊说明:
- * - 当没有实际聚合函数时（仅使用哈希聚合节点进行分组），aggcosts可以为NULL
- * - 当aggstrategy == AGG_SORTED时，调用者必须确保输入成本是针对适当排序的输入
+ * Note: when aggstrategy == AGG_SORTED, caller must ensure that input costs
+ * are for appropriately-sorted input.
  */
 void
 cost_agg(Path *path, PlannerInfo *root,
@@ -2252,108 +2155,99 @@ cost_agg(Path *path, PlannerInfo *root,
 		 Cost input_startup_cost, Cost input_total_cost,
 		 double input_tuples)
 {
-	double		output_tuples;     /* 输出元组数 */
-	Cost		startup_cost;      /* 启动成本 */
-	Cost		total_cost;        /* 总成本 */
-	AggClauseCosts dummy_aggcosts; /* 空的聚合成本结构 */
+	double		output_tuples;
+	Cost		startup_cost;
+	Cost		total_cost;
+	AggClauseCosts dummy_aggcosts;
 
-	/* 如果传入的aggcosts为NULL，使用全零的聚合成本 */
+	/* Use all-zero per-aggregate costs if NULL is passed */
 	if (aggcosts == NULL)
 	{
-		Assert(aggstrategy == AGG_HASHED);  /* 断言只能是哈希聚合 */
-		MemSet(&dummy_aggcosts, 0, sizeof(AggClauseCosts));  /* 清零结构体 */
-		aggcosts = &dummy_aggcosts;  /* 指向空结构体 */
+		Assert(aggstrategy == AGG_HASHED);
+		MemSet(&dummy_aggcosts, 0, sizeof(AggClauseCosts));
+		aggcosts = &dummy_aggcosts;
 	}
 
 	/*
-	 * 成本计算模型说明:
-	 * 1. aggcosts中的transCost.per_tuple组件应该按每个输入元组收费一次，
-	 *    对应于计算聚合转换函数及其输入表达式的成本。
-	 * 2. finalCost.per_tuple组件按每个输出元组收费一次，
-	 *    对应于计算最终函数的成本。
-	 * 3. 启动成本当然只收取一次。
-	 * 4. 如果进行分组，我们为每个分组列按每个输入元组额外收取cpu_operator_cost，
-	 *    用于分组比较。
-	 * 5. 如果不分组，我们将产生单个输出元组；否则每个分组产生一个元组。
-	 *    我们为每个输出元组收取cpu_tuple_cost。
+	 * The transCost.per_tuple component of aggcosts should be charged once
+	 * per input tuple, corresponding to the costs of evaluating the aggregate
+	 * transfns and their input expressions. The finalCost.per_tuple component
+	 * is charged once per output tuple, corresponding to the costs of
+	 * evaluating the finalfns.  Startup costs are of course charged but once.
 	 *
-	 * 注意：在此成本模型中，AGG_SORTED和AGG_HASHED具有完全相同的总CPU成本，
-	 * 但AGG_SORTED的启动成本更低。如果输入路径已经适当排序，应优先选择AGG_SORTED
-	 * （因为它没有内存溢出的风险）。只要计算的总成本确实完全相等就会发生这种情况 ---
-	 * 但如果存在舍入误差，我们可能会做出错误的选择。因此要确保下面的计算以相同的顺序
-	 * 形成相同的中间值。
+	 * If we are grouping, we charge an additional cpu_operator_cost per
+	 * grouping column per input tuple for grouping comparisons.
+	 *
+	 * We will produce a single output tuple if not grouping, and a tuple per
+	 * group otherwise.  We charge cpu_tuple_cost for each output tuple.
+	 *
+	 * Note: in this cost model, AGG_SORTED and AGG_HASHED have exactly the
+	 * same total CPU cost, but AGG_SORTED has lower startup cost.  If the
+	 * input path is already sorted appropriately, AGG_SORTED should be
+	 * preferred (since it has no risk of memory overflow).  This will happen
+	 * as long as the computed total costs are indeed exactly equal --- but if
+	 * there's roundoff error we might do the wrong thing.  So be sure that
+	 * the computations below form the same intermediate values in the same
+	 * order.
 	 */
-	 
-	/* 处理普通聚合（无分组） */
 	if (aggstrategy == AGG_PLAIN)
 	{
-		/* 启动成本等于输入总成本加上各种聚合成本 */
 		startup_cost = input_total_cost;
-		startup_cost += aggcosts->transCost.startup;                 /* 转换函数启动成本 */
-		startup_cost += aggcosts->transCost.per_tuple * input_tuples; /* 转换函数每元组成本 */
-		startup_cost += aggcosts->finalCost.startup;                 /* 最终函数启动成本 */
-		startup_cost += aggcosts->finalCost.per_tuple;               /* 最终函数每元组成本 */
-		/* 不进行分组，只产生一个输出元组 */
-		total_cost = startup_cost + cpu_tuple_cost;  /* 加上输出元组成本 */
-		output_tuples = 1;  /* 输出元组数为1 */
+		startup_cost += aggcosts->transCost.startup;
+		startup_cost += aggcosts->transCost.per_tuple * input_tuples;
+		startup_cost += aggcosts->finalCost.startup;
+		startup_cost += aggcosts->finalCost.per_tuple;
+		/* we aren't grouping */
+		total_cost = startup_cost + cpu_tuple_cost;
+		output_tuples = 1;
 	}
-	/* 处理排序聚合或混合聚合 */
 	else if (aggstrategy == AGG_SORTED || aggstrategy == AGG_MIXED)
 	{
-		/* 这里我们可以即时交付输出 */
-		startup_cost = input_startup_cost;  /* 启动成本为输入启动成本 */
-		total_cost = input_total_cost;      /* 总成本为输入总成本 */
-		
-		/* 如果是混合聚合且哈希聚合被禁用，增加禁用成本 */
+		/* Here we are able to deliver output on-the-fly */
+		startup_cost = input_startup_cost;
+		total_cost = input_total_cost;
 		if (aggstrategy == AGG_MIXED && !enable_hashagg)
 		{
 			startup_cost += disable_cost;
 			total_cost += disable_cost;
 		}
-		
-		/* 计算方式这样表述是为了与哈希聚合情况匹配，参见上面的注释 */
-		total_cost += aggcosts->transCost.startup;                   /* 转换函数启动成本 */
-		total_cost += aggcosts->transCost.per_tuple * input_tuples;  /* 转换函数每元组成本 */
-		total_cost += (cpu_operator_cost * numGroupCols) * input_tuples; /* 分组比较成本 */
-		total_cost += aggcosts->finalCost.startup;                   /* 最终函数启动成本 */
-		total_cost += aggcosts->finalCost.per_tuple * numGroups;     /* 最终函数每组成本 */
-		total_cost += cpu_tuple_cost * numGroups;                    /* 输出元组成本 */
-		output_tuples = numGroups;  /* 输出元组数等于分组数 */
+		/* calcs phrased this way to match HASHED case, see note above */
+		total_cost += aggcosts->transCost.startup;
+		total_cost += aggcosts->transCost.per_tuple * input_tuples;
+		total_cost += (cpu_operator_cost * numGroupCols) * input_tuples;
+		total_cost += aggcosts->finalCost.startup;
+		total_cost += aggcosts->finalCost.per_tuple * numGroups;
+		total_cost += cpu_tuple_cost * numGroups;
+		output_tuples = numGroups;
 	}
-	/* 处理哈希聚合 */
 	else
 	{
-		/* 必须是AGG_HASHED */
-		startup_cost = input_total_cost;  /* 启动成本为输入总成本 */
-		
-		/* 如果哈希聚合被禁用，增加禁用成本 */
+		/* must be AGG_HASHED */
+		startup_cost = input_total_cost;
 		if (!enable_hashagg)
 			startup_cost += disable_cost;
-			
-		startup_cost += aggcosts->transCost.startup;                  /* 转换函数启动成本 */
-		startup_cost += aggcosts->transCost.per_tuple * input_tuples; /* 转换函数每元组成本 */
-		startup_cost += (cpu_operator_cost * numGroupCols) * input_tuples; /* 分组比较成本 */
-		startup_cost += aggcosts->finalCost.startup;                  /* 最终函数启动成本 */
-		
-		total_cost = startup_cost;                                    /* 总成本初始为启动成本 */
-		total_cost += aggcosts->finalCost.per_tuple * numGroups;      /* 最终函数每组成本 */
-		total_cost += cpu_tuple_cost * numGroups;                     /* 输出元组成本 */
-		output_tuples = numGroups;  /* 输出元组数等于分组数 */
+		startup_cost += aggcosts->transCost.startup;
+		startup_cost += aggcosts->transCost.per_tuple * input_tuples;
+		startup_cost += (cpu_operator_cost * numGroupCols) * input_tuples;
+		startup_cost += aggcosts->finalCost.startup;
+		total_cost = startup_cost;
+		total_cost += aggcosts->finalCost.per_tuple * numGroups;
+		total_cost += cpu_tuple_cost * numGroups;
+		output_tuples = numGroups;
 	}
 
 	/*
-	 * 如果存在条件（HAVING子句），计算其成本和选择性
+	 * If there are quals (HAVING quals), account for their cost and
+	 * selectivity.
 	 */
 	if (quals)
 	{
-		QualCost	qual_cost;  /* 条件成本结构 */
+		QualCost	qual_cost;
 
-		/* 计算HAVING条件的成本 */
 		cost_qual_eval(&qual_cost, quals, root);
-		startup_cost += qual_cost.startup;  /* 增加条件启动成本 */
-		total_cost += qual_cost.startup + output_tuples * qual_cost.per_tuple;  /* 增加条件总成本 */
+		startup_cost += qual_cost.startup;
+		total_cost += qual_cost.startup + output_tuples * qual_cost.per_tuple;
 
-		/* 根据条件选择性调整输出元组数 */
 		output_tuples = clamp_row_est(output_tuples *
 									  clauselist_selectivity(root,
 															 quals,
@@ -2362,12 +2256,10 @@ cost_agg(Path *path, PlannerInfo *root,
 															 NULL));
 	}
 
-	/* 设置路径的各项成本和行数 */
-	path->rows = output_tuples;        /* 设置输出行数 */
-	path->startup_cost = startup_cost; /* 设置启动成本 */
-	path->total_cost = total_cost;     /* 设置总成本 */
+	path->rows = output_tuples;
+	path->startup_cost = startup_cost;
+	path->total_cost = total_cost;
 }
-
 
 /*
  * cost_windowagg
@@ -2495,22 +2387,30 @@ cost_group(Path *path, PlannerInfo *root,
 	path->startup_cost = startup_cost;
 	path->total_cost = total_cost;
 }
+
 /*
  * initial_cost_nestloop
- *	  初步估算嵌套循环连接路径的成本。
+ *	  Preliminary estimate of the cost of a nestloop join path.
  *
- * 该函数需要快速给出路径的启动和总成本的下界估算。如果无法通过下界排除该路径，
- * 则会调用 final_cost_nestloop 进行最终估算。
+ * This must quickly produce lower-bound estimates of the path's startup and
+ * total costs.  If we are unable to eliminate the proposed path from
+ * consideration using the lower bounds, final_cost_nestloop will be called
+ * to obtain the final estimates.
  *
- * 该函数与 final_cost_nestloop 的具体分工是私有的，权衡了初步估算的速度和下界的紧密程度。
- * 这里选择不分析连接条件（join quals），因为这是计算中最耗时的部分。因此，CPU成本的考虑
- * 留到第二阶段；对于 SEMI/ANTI 连接，也推迟了内层路径运行成本的计算。
+ * The exact division of labor between this function and final_cost_nestloop
+ * is private to them, and represents a tradeoff between speed of the initial
+ * estimate and getting a tight lower bound.  We choose to not examine the
+ * join quals here, since that's by far the most expensive part of the
+ * calculations.  The end result is that CPU-cost considerations must be
+ * left for the second phase; and for SEMI/ANTI joins, we must also postpone
+ * incorporation of the inner path's run cost.
  *
- * 'workspace' 用于填充启动成本、总成本，以及可能用于 final_cost_nestloop 的其他数据
- * 'jointype' 是连接类型
- * 'outer_path' 是外层输入路径
- * 'inner_path' 是内层输入路径
- * 'extra' 包含连接的其他信息
+ * 'workspace' is to be filled with startup_cost, total_cost, and perhaps
+ *		other data to be used by final_cost_nestloop
+ * 'jointype' is the type of join to be performed
+ * 'outer_path' is the outer input to the join
+ * 'inner_path' is the inner input to the join
+ * 'extra' contains miscellaneous information about the join
  */
 void
 initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
@@ -2526,16 +2426,18 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 	Cost		inner_run_cost;
 	Cost		inner_rescan_run_cost;
 
-	/* 估算重新扫描内层关系的成本 */
+	/* estimate costs to rescan the inner relation */
 	cost_rescan(root, inner_path,
 				&inner_rescan_start_cost,
 				&inner_rescan_total_cost);
 
-	/* 源数据成本 */
+	/* cost of source data */
 
 	/*
-	 * 注意：显然，在开始返回元组之前，必须支付外层和内层路径的 startup_cost，
-	 * 所以连接的启动成本是它们的和。内层路径的重新扫描启动成本会多次支付。
+	 * NOTE: clearly, we must pay both outer and inner paths' startup_cost
+	 * before we can start returning tuples, so the join's startup cost is
+	 * their sum.  We'll also pay the inner path's rescan startup cost
+	 * multiple times.
 	 */
 	startup_cost += outer_path->startup_cost + inner_path->startup_cost;
 	run_cost += outer_path->total_cost - outer_path->startup_cost;
@@ -2549,224 +2451,218 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 		extra->inner_unique)
 	{
 		/*
-		 * 对于 SEMI 或 ANTI 连接，或者内层关系唯一时，执行器在找到第一个匹配后会停止。
+		 * With a SEMI or ANTI join, or if the innerrel is known unique, the
+		 * executor will stop after the first match.
 		 *
-		 * 要获得合理的估算需要检查连接条件，这里选择推迟到 final_cost_nestloop 处理。
+		 * Getting decent estimates requires inspection of the join quals,
+		 * which we choose to postpone to final_cost_nestloop.
 		 */
 
-		/* 保存供 final_cost_nestloop 使用的私有数据 */
+		/* Save private data for final_cost_nestloop */
 		workspace->inner_run_cost = inner_run_cost;
 		workspace->inner_rescan_run_cost = inner_rescan_run_cost;
 	}
 	else
 	{
-		/* 普通情况：每个外层行都扫描整个内层关系 */
+		/* Normal case; we'll scan whole input rel for each outer row */
 		run_cost += inner_run_cost;
 		if (outer_path_rows > 1)
 			run_cost += (outer_path_rows - 1) * inner_rescan_run_cost;
 	}
 
-	/* CPU 成本留到后续处理 */
+	/* CPU costs left for later */
 
-	/* 公共结果字段 */
+	/* Public result fields */
 	workspace->startup_cost = startup_cost;
 	workspace->total_cost = startup_cost + run_cost;
-	/* 保存供 final_cost_nestloop 使用的私有数据 */
+	/* Save private data for final_cost_nestloop */
 	workspace->run_cost = run_cost;
 }
 
-
 /*
  * final_cost_nestloop
- *    对嵌套循环连接路径的成本和结果大小进行最终估算
+ *	  Final estimate of the cost and result size of a nestloop join path.
  *
- * 'path' 已经填充完成，但缺少rows和cost字段的值
- * 'workspace' 是initial_cost_nestloop函数的计算结果
- * 'extra' 包含关于连接的杂项信息
- *
- * 此函数完成嵌套循环连接路径的成本计算，主要考虑以下因素：
- * 1. 行数估计（包括并行执行情况下的缩放）
- * 2. 内关系扫描成本（尤其是早期终止情况下）
- * 3. 连接限定条件评估成本
- * 4. 目标列表评估成本
- *
- * 对于SEMI/ANTI连接和内关系唯一的情况有特殊处理，因为执行器会在找到第一个匹配项后停止
+ * 'path' is already filled in except for the rows and cost fields
+ * 'workspace' is the result from initial_cost_nestloop
+ * 'extra' contains miscellaneous information about the join
  */
 void
 final_cost_nestloop(PlannerInfo *root, NestPath *path,
-                    JoinCostWorkspace *workspace,
-                    JoinPathExtraData *extra)
+					JoinCostWorkspace *workspace,
+					JoinPathExtraData *extra)
 {
-    // 获取外层和内层路径信息
-    Path   *outer_path = path->outerjoinpath;
-    Path   *inner_path = path->innerjoinpath;
-    
-    // 提取外层和内层路径的行数估计
-    double  outer_path_rows = outer_path->rows;
-    double  inner_path_rows = inner_path->rows;
-    
-    // 从workspace获取初步计算的启动成本和运行成本
-    Cost    startup_cost = workspace->startup_cost;
-    Cost    run_cost = workspace->run_cost;
-    
-    // 局部变量声明
-    Cost    cpu_per_tuple;       // 处理每个元组的CPU成本
-    QualCost restrict_qual_cost; // 连接限定条件的评估成本
-    double  ntuples;            // 处理的元组总数（非输出行数）
+	Path	   *outer_path = path->outerjoinpath;
+	Path	   *inner_path = path->innerjoinpath;
+	double		outer_path_rows = outer_path->rows;
+	double		inner_path_rows = inner_path->rows;
+	Cost		startup_cost = workspace->startup_cost;
+	Cost		run_cost = workspace->run_cost;
+	Cost		cpu_per_tuple;
+	QualCost	restrict_qual_cost;
+	double		ntuples;
 
-    /* 确保下面的计算中不会出现零或NaN行计数 */
-    if (outer_path_rows <= 0 || isnan(outer_path_rows))
-        outer_path_rows = 1;
-    if (inner_path_rows <= 0 || isnan(inner_path_rows))
-        inner_path_rows = 1;
+	/* Protect some assumptions below that rowcounts aren't zero or NaN */
+	if (outer_path_rows <= 0 || isnan(outer_path_rows))
+		outer_path_rows = 1;
+	if (inner_path_rows <= 0 || isnan(inner_path_rows))
+		inner_path_rows = 1;
 
-    /* 为路径设置正确的行数估计 */
-    // 如果路径是参数化的，使用参数信息中的行数
-    if (path->path.param_info)
-        path->path.rows = path->path.param_info->ppi_rows;
-    else
-        // 否则使用父关系中的行数估计
-        path->path.rows = path->path.parent->rows;
+	/* Mark the path with the correct row estimate */
+	if (path->path.param_info)
+		path->path.rows = path->path.param_info->ppi_rows;
+	else
+		path->path.rows = path->path.parent->rows;
 
-    /* 对于部分并行路径，根据并行度调整行数估计 */
-    if (path->path.parallel_workers > 0)
-    {
-        // 获取并行除数
-        double  parallel_divisor = get_parallel_divisor(&path->path);
-        
-        // 调整行数估计，确保不会低于最小估计值
-        path->path.rows = clamp_row_est(path->path.rows / parallel_divisor);
-    }
+	/* For partial paths, scale row estimate. */
+	if (path->path.parallel_workers > 0)
+	{
+		double		parallel_divisor = get_parallel_divisor(&path->path);
 
-    /*
-     * 如果禁用嵌套循环连接，则增加禁用成本
-     * 注意：不在初步估计中包含disable_cost，因为优化不应该针对禁用的情况
-     */
-    if (!enable_nestloop)
-        startup_cost += disable_cost;
+		path->path.rows =
+			clamp_row_est(path->path.rows / parallel_divisor);
+	}
 
-    /* 计算内关系源数据的成本（外层关系的成本已在初步估计中处理） */
-    
-    // 特殊处理：SEMI连接、ANTI连接或内关系唯一的情况
-    // 这些情况下，执行器在找到第一个匹配项后就会停止内关系扫描
-    if (path->jointype == JOIN_SEMI || path->jointype == JOIN_ANTI ||
-        extra->inner_unique)
-    {
-        /*
-         * SEMI或ANTI连接，或内关系已知唯一时，执行器会在找到第一个匹配项后停止
-         */
-        Cost    inner_run_cost = workspace->inner_run_cost;        // 内关系首次扫描成本
-        Cost    inner_rescan_run_cost = workspace->inner_rescan_run_cost; // 内关系重复扫描成本
-        double  outer_matched_rows;     // 在外层关系中有匹配的行数
-        double  outer_unmatched_rows;   // 在外层关系中无匹配的行数
-        Selectivity inner_scan_frac;    // 内关系扫描比例（早期终止时）
+	/*
+	 * We could include disable_cost in the preliminary estimate, but that
+	 * would amount to optimizing for the case where the join method is
+	 * disabled, which doesn't seem like the way to bet.
+	 */
+	if (!enable_nestloop)
+		startup_cost += disable_cost;
 
-        /*
-         * 对于有至少一个匹配项的外层行，如果匹配均匀分布，内扫描将在检查1/(match_count+1)比例
-         * 的内关系行后停止。由于实际匹配可能不均匀，我们使用2.0的模糊因子调整这个比例。
-         * 由于match_count至少为1，所以这里不需要将inner_scan_frac限制在1.0以内
-         */
-        // 计算匹配和未匹配的外层行数
-        outer_matched_rows = rint(outer_path_rows * extra->semifactors.outer_match_frac);
-        outer_unmatched_rows = outer_path_rows - outer_matched_rows;
-        // 计算内关系扫描比例
-        inner_scan_frac = 2.0 / (extra->semifactors.match_count + 1.0);
+	/* cost of inner-relation source data (we already dealt with outer rel) */
 
-        /*
-         * 计算处理的元组数量（非输出行数）。首先，计算成功匹配的外层行处理的元组数。
-         */
-        ntuples = outer_matched_rows * inner_path_rows * inner_scan_frac;
+	if (path->jointype == JOIN_SEMI || path->jointype == JOIN_ANTI ||
+		extra->inner_unique)
+	{
+		/*
+		 * With a SEMI or ANTI join, or if the innerrel is known unique, the
+		 * executor will stop after the first match.
+		 */
+		Cost		inner_run_cost = workspace->inner_run_cost;
+		Cost		inner_rescan_run_cost = workspace->inner_rescan_run_cost;
+		double		outer_matched_rows;
+		double		outer_unmatched_rows;
+		Selectivity inner_scan_frac;
 
-        /*
-         * 现在需要估算扫描内关系的实际成本，由于早期停止，实际成本可能远低于N倍的inner_run_cost
-         * 我们考虑两种情况：
-         * 1. 如果内路径是索引扫描，且所有连接条件都用作索引条件，那么未匹配的外层行将导致
-         *    一个返回零行的索引扫描，这可能非常便宜
-         * 2. 否则，执行器将不得不扫描整个内关系以确定无匹配，成本较高
-         */
-        if (has_indexed_join_quals(path))
-        {
-            /*
-             * 有索引支持的连接条件情况：
-             * 成功匹配的外层行只需要扫描inner_scan_frac比例的内关系
-             * 在此情况下，即使inner_run_cost大于inner_rescan_run_cost，我们也不需要
-             * 收取完整的inner_run_cost，因为可以假设没有内扫描会扫描整个内关系
-             */
-            // 首次匹配项的内扫描成本
-            run_cost += inner_run_cost * inner_scan_frac;
-            // 额外匹配项的内扫描成本（使用重新扫描成本）
-            if (outer_matched_rows > 1)
-                run_cost += (outer_matched_rows - 1) * inner_rescan_run_cost * inner_scan_frac;
+		/*
+		 * For an outer-rel row that has at least one match, we can expect the
+		 * inner scan to stop after a fraction 1/(match_count+1) of the inner
+		 * rows, if the matches are evenly distributed.  Since they probably
+		 * aren't quite evenly distributed, we apply a fuzz factor of 2.0 to
+		 * that fraction.  (If we used a larger fuzz factor, we'd have to
+		 * clamp inner_scan_frac to at most 1.0; but since match_count is at
+		 * least 1, no such clamp is needed now.)
+		 */
+		outer_matched_rows = rint(outer_path_rows * extra->semifactors.outer_match_frac);
+		outer_unmatched_rows = outer_path_rows - outer_matched_rows;
+		inner_scan_frac = 2.0 / (extra->semifactors.match_count + 1.0);
 
-            /*
-             * 添加未匹配外层行的内扫描执行成本
-             * 估算为返回非空扫描第一个元组的成本
-             * 由于已经使用了一次inner_run_cost，所以这些都被视为重新扫描
-             */
-            run_cost += outer_unmatched_rows *
-                inner_rescan_run_cost / inner_path_rows;
+		/*
+		 * Compute number of tuples processed (not number emitted!).  First,
+		 * account for successfully-matched outer rows.
+		 */
+		ntuples = outer_matched_rows * inner_path_rows * inner_scan_frac;
 
-            /*
-             * 对于未匹配的行，我们不会评估任何限定条件，因此不将它们添加到ntuples中
-             */
-        }
-        else
-        {
-            /*
-             * 无索引支持的连接条件情况：
-             * 这里的复杂因素是重新扫描可能比首次扫描便宜
-             * 如果我们从不扫描到内关系的末尾，可能不需要支付完整的首次扫描运行成本
-             * 但很难估计是否会发生这种情况（如果有任何未匹配的外层行，就必然会有完整扫描！）
-             * 因此采取保守态度，始终收取一次完整的首次扫描成本
-             * 我们认为这个收费对应于第一个未匹配的外层行，如果估计中没有，则对应第一个匹配的行
-             */
+		/*
+		 * Now we need to estimate the actual costs of scanning the inner
+		 * relation, which may be quite a bit less than N times inner_run_cost
+		 * due to early scan stops.  We consider two cases.  If the inner path
+		 * is an indexscan using all the joinquals as indexquals, then an
+		 * unmatched outer row results in an indexscan returning no rows,
+		 * which is probably quite cheap.  Otherwise, the executor will have
+		 * to scan the whole inner rel for an unmatched row; not so cheap.
+		 */
+		if (has_indexed_join_quals(path))
+		{
+			/*
+			 * Successfully-matched outer rows will only require scanning
+			 * inner_scan_frac of the inner relation.  In this case, we don't
+			 * need to charge the full inner_run_cost even when that's more
+			 * than inner_rescan_run_cost, because we can assume that none of
+			 * the inner scans ever scan the whole inner relation.  So it's
+			 * okay to assume that all the inner scan executions can be
+			 * fractions of the full cost, even if materialization is reducing
+			 * the rescan cost.  At this writing, it's impossible to get here
+			 * for a materialized inner scan, so inner_run_cost and
+			 * inner_rescan_run_cost will be the same anyway; but just in
+			 * case, use inner_run_cost for the first matched tuple and
+			 * inner_rescan_run_cost for additional ones.
+			 */
+			run_cost += inner_run_cost * inner_scan_frac;
+			if (outer_matched_rows > 1)
+				run_cost += (outer_matched_rows - 1) * inner_rescan_run_cost * inner_scan_frac;
 
-            /* 首先，计算所有未匹配连接元组被处理的数量 */
-            ntuples += outer_unmatched_rows * inner_path_rows;
+			/*
+			 * Add the cost of inner-scan executions for unmatched outer rows.
+			 * We estimate this as the same cost as returning the first tuple
+			 * of a nonempty scan.  We consider that these are all rescans,
+			 * since we used inner_run_cost once already.
+			 */
+			run_cost += outer_unmatched_rows *
+				inner_rescan_run_cost / inner_path_rows;
 
-            /* 添加强制完整扫描的成本，并减少相应计数 */
-            run_cost += inner_run_cost;
-            if (outer_unmatched_rows >= 1)
-                outer_unmatched_rows -= 1;  // 归因于未匹配行
-            else
-                outer_matched_rows -= 1;    // 归因于匹配行
+			/*
+			 * We won't be evaluating any quals at all for unmatched rows, so
+			 * don't add them to ntuples.
+			 */
+		}
+		else
+		{
+			/*
+			 * Here, a complicating factor is that rescans may be cheaper than
+			 * first scans.  If we never scan all the way to the end of the
+			 * inner rel, it might be (depending on the plan type) that we'd
+			 * never pay the whole inner first-scan run cost.  However it is
+			 * difficult to estimate whether that will happen (and it could
+			 * not happen if there are any unmatched outer rows!), so be
+			 * conservative and always charge the whole first-scan cost once.
+			 * We consider this charge to correspond to the first unmatched
+			 * outer row, unless there isn't one in our estimate, in which
+			 * case blame it on the first matched row.
+			 */
 
-            /* 添加有匹配的额外外层元组的内扫描运行成本 */
-            if (outer_matched_rows > 0)
-                run_cost += outer_matched_rows * inner_rescan_run_cost * inner_scan_frac;
+			/* First, count all unmatched join tuples as being processed */
+			ntuples += outer_unmatched_rows * inner_path_rows;
 
-            /* 添加无匹配的额外外层元组的内扫描运行成本 */
-            if (outer_unmatched_rows > 0)
-                run_cost += outer_unmatched_rows * inner_rescan_run_cost;
-        }
-    }
-    else
-    {
-        /* 普通情况：源成本已包含在初步估计中 */
+			/* Now add the forced full scan, and decrement appropriate count */
+			run_cost += inner_run_cost;
+			if (outer_unmatched_rows >= 1)
+				outer_unmatched_rows -= 1;
+			else
+				outer_matched_rows -= 1;
 
-        /* 计算处理的元组数量（非输出行数） */
-        ntuples = outer_path_rows * inner_path_rows;
-    }
+			/* Add inner run cost for additional outer tuples having matches */
+			if (outer_matched_rows > 0)
+				run_cost += outer_matched_rows * inner_rescan_run_cost * inner_scan_frac;
 
-    /* 计算CPU成本 */
-    // 估算连接限定条件的评估成本
-    cost_qual_eval(&restrict_qual_cost, path->joinrestrictinfo, root);
-    // 添加限定条件的启动成本
-    startup_cost += restrict_qual_cost.startup;
-    // 计算每个元组的CPU处理成本
-    cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple;
-    // 添加所有处理元组的CPU运行成本
-    run_cost += cpu_per_tuple * ntuples;
+			/* Add inner run cost for additional unmatched outer tuples */
+			if (outer_unmatched_rows > 0)
+				run_cost += outer_unmatched_rows * inner_rescan_run_cost;
+		}
+	}
+	else
+	{
+		/* Normal-case source costs were included in preliminary estimate */
 
-    /* 目标列表评估成本按输出行数计算，而非扫描的元组数 */
-    startup_cost += path->path.pathtarget->cost.startup;
-    run_cost += path->path.pathtarget->cost.per_tuple * path->path.rows;
+		/* Compute number of tuples processed (not number emitted!) */
+		ntuples = outer_path_rows * inner_path_rows;
+	}
 
-    // 设置路径的最终成本信息
-    path->path.startup_cost = startup_cost;      // 启动成本
-    path->path.total_cost = startup_cost + run_cost;  // 总成本
+	/* CPU costs */
+	cost_qual_eval(&restrict_qual_cost, path->joinrestrictinfo, root);
+	startup_cost += restrict_qual_cost.startup;
+	cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple;
+	run_cost += cpu_per_tuple * ntuples;
+
+	/* tlist eval costs are paid per output row, not per tuple scanned */
+	startup_cost += path->path.pathtarget->cost.startup;
+	run_cost += path->path.pathtarget->cost.per_tuple * path->path.rows;
+
+	path->path.startup_cost = startup_cost;
+	path->path.total_cost = startup_cost + run_cost;
 }
-
 
 /*
  * initial_cost_mergejoin
@@ -3005,251 +2901,276 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 
 /*
  * final_cost_mergejoin
- *    MergeJoin 路径的最终成本和结果大小估算
+ *	  Final estimate of the cost and result size of a mergejoin path.
  *
- * 函数功能:
- * 与其他成本计算函数不同，该函数会做出两个重要决策：
- * 1. 执行器是否需要执行标记/恢复(mark/restore)操作
- * 2. 是否应该物化(materialize)内路径
+ * Unlike other costsize functions, this routine makes two actual decisions:
+ * whether the executor will need to do mark/restore, and whether we should
+ * materialize the inner path.  It would be logically cleaner to build
+ * separate paths testing these alternatives, but that would require repeating
+ * most of the cost calculations, which are not all that cheap.  Since the
+ * choice will not affect output pathkeys or startup cost, only total cost,
+ * there is no possibility of wanting to keep more than one path.  So it seems
+ * best to make the decisions here and record them in the path's
+ * skip_mark_restore and materialize_inner fields.
  *
- * 设计考虑:
- * 虽然在逻辑上更清晰的做法是构建测试这些替代方案的独立路径，但这需要重复大部分成本计算，
- * 而这些计算并不便宜。由于选择不会影响输出路径键或启动成本，只影响总成本，且不可能需要保留多个路径，
- * 因此在此处做决策并将结果记录在路径的skip_mark_restore和materialize_inner字段中是最佳选择。
+ * Mark/restore overhead is usually required, but can be skipped if we know
+ * that the executor need find only one match per outer tuple, and that the
+ * mergeclauses are sufficient to identify a match.
  *
- * 标记/恢复优化:
- * 通常需要标记/恢复开销，但如果知道执行器只需要为每个外元组找到一个匹配项，且合并子句足以标识匹配项，
- * 则可以跳过标记/恢复开销。
+ * We materialize the inner path if we need mark/restore and either the inner
+ * path can't support mark/restore, or it's cheaper to use an interposed
+ * Material node to handle mark/restore.
  *
- * 内路径物化:
- * 如果需要标记/恢复且内路径不支持标记/恢复，或者使用中间物化节点处理标记/恢复更便宜时，会物化内路径。
- *
- * 参数说明:
- * - root: 查询规划器信息结构
- * - path: 合并连接路径结构(已填充除行数和成本字段以及skip_mark_restore和materialize_inner外的所有信息)
- * - workspace: 来自initial_cost_mergejoin的结果
- * - extra: 关于连接的杂项信息
- *
- * 返回值:
- * 无返回值，通过修改path参数中的字段来返回结果
+ * 'path' is already filled in except for the rows and cost fields and
+ *		skip_mark_restore and materialize_inner
+ * 'workspace' is the result from initial_cost_mergejoin
+ * 'extra' contains miscellaneous information about the join
  */
 void
 final_cost_mergejoin(PlannerInfo *root, MergePath *path,
-                     JoinCostWorkspace *workspace,
-                     JoinPathExtraData *extra)
+					 JoinCostWorkspace *workspace,
+					 JoinPathExtraData *extra)
 {
-    /* 提取路径相关信息 */
-    Path       *outer_path = path->jpath.outerjoinpath;     /* 外连接路径 */
-    Path       *inner_path = path->jpath.innerjoinpath;     /* 内连接路径 */
-    double      inner_path_rows = inner_path->rows;         /* 内路径行数 */
-    List       *mergeclauses = path->path_mergeclauses;     /* 合并连接子句 */
-    List       *innersortkeys = path->innersortkeys;        /* 内路径排序键 */
-    
-    /* 从工作空间提取成本和行数估计 */
-    Cost        startup_cost = workspace->startup_cost;     /* 启动成本 */
-    Cost        run_cost = workspace->run_cost;             /* 运行成本 */
-    Cost        inner_run_cost = workspace->inner_run_cost; /* 内路径运行成本 */
-    double      outer_rows = workspace->outer_rows;         /* 外路径行数 */
-    double      inner_rows = workspace->inner_rows;         /* 内路径行数 */
-    double      outer_skip_rows = workspace->outer_skip_rows;   /* 外路径跳过行数 */
-    double      inner_skip_rows = workspace->inner_skip_rows;   /* 内路径跳过行数 */
-    
-    /* 成本计算相关变量 */
-    Cost        cpu_per_tuple,              /* 每元组CPU成本 */
-                bare_inner_cost,            /* 无物化的内路径成本 */
-                mat_inner_cost;             /* 物化的内路径成本 */
-    QualCost    merge_qual_cost;            /* 合并条件成本 */
-    QualCost    qp_qual_cost;               /* 其他限制条件成本 */
-    double      mergejointuples,            /* 通过合并条件的元组数 */
-                rescannedtuples;            /* 重新扫描的元组数 */
-    double      rescanratio;                /* 重新扫描比率 */
+	Path	   *outer_path = path->jpath.outerjoinpath;
+	Path	   *inner_path = path->jpath.innerjoinpath;
+	double		inner_path_rows = inner_path->rows;
+	List	   *mergeclauses = path->path_mergeclauses;
+	List	   *innersortkeys = path->innersortkeys;
+	Cost		startup_cost = workspace->startup_cost;
+	Cost		run_cost = workspace->run_cost;
+	Cost		inner_run_cost = workspace->inner_run_cost;
+	double		outer_rows = workspace->outer_rows;
+	double		inner_rows = workspace->inner_rows;
+	double		outer_skip_rows = workspace->outer_skip_rows;
+	double		inner_skip_rows = workspace->inner_skip_rows;
+	Cost		cpu_per_tuple,
+				bare_inner_cost,
+				mat_inner_cost;
+	QualCost	merge_qual_cost;
+	QualCost	qp_qual_cost;
+	double		mergejointuples,
+				rescannedtuples;
+	double		rescanratio;
 
-    /* 保护下面关于行数不为零或NaN的假设 */
-    if (inner_path_rows <= 0 || isnan(inner_path_rows))
-        inner_path_rows = 1;
+	/* Protect some assumptions below that rowcounts aren't zero or NaN */
+	if (inner_path_rows <= 0 || isnan(inner_path_rows))
+		inner_path_rows = 1;
 
-    /* 标记路径的正确行数估计 */
-    if (path->jpath.path.param_info)
-        path->jpath.path.rows = path->jpath.path.param_info->ppi_rows;
-    else
-        path->jpath.path.rows = path->jpath.path.parent->rows;
+	/* Mark the path with the correct row estimate */
+	if (path->jpath.path.param_info)
+		path->jpath.path.rows = path->jpath.path.param_info->ppi_rows;
+	else
+		path->jpath.path.rows = path->jpath.path.parent->rows;
 
-    /* 对于并行路径，缩放行数估计 */
-    if (path->jpath.path.parallel_workers > 0)
-    {
-        double      parallel_divisor = get_parallel_divisor(&path->jpath.path);
+	/* For partial paths, scale row estimate. */
+	if (path->jpath.path.parallel_workers > 0)
+	{
+		double		parallel_divisor = get_parallel_divisor(&path->jpath.path);
 
-        path->jpath.path.rows =
-            clamp_row_est(path->jpath.path.rows / parallel_divisor);
-    }
+		path->jpath.path.rows =
+			clamp_row_est(path->jpath.path.rows / parallel_divisor);
+	}
 
-    /*
-     * 我们可以在初步估计中包含disable_cost，但这相当于针对连接方法被禁用的情况进行优化，
-     * 这似乎不是正确的做法。
-     */
-    if (!enable_mergejoin)
-        startup_cost += disable_cost;
+	/*
+	 * We could include disable_cost in the preliminary estimate, but that
+	 * would amount to optimizing for the case where the join method is
+	 * disabled, which doesn't seem like the way to bet.
+	 */
+	if (!enable_mergejoin)
+		startup_cost += disable_cost;
 
-    /*
-     * 分别计算合并条件(mergequals)和其他限制条件(qpquals)的成本
-     */
-    cost_qual_eval(&merge_qual_cost, mergeclauses, root);
-    cost_qual_eval(&qp_qual_cost, path->jpath.joinrestrictinfo, root);
-    /* 调整qp_qual_cost，减去已在merge_qual_cost中计算的部分 */
-    qp_qual_cost.startup -= merge_qual_cost.startup;
-    qp_qual_cost.per_tuple -= merge_qual_cost.per_tuple;
+	/*
+	 * Compute cost of the mergequals and qpquals (other restriction clauses)
+	 * separately.
+	 */
+	cost_qual_eval(&merge_qual_cost, mergeclauses, root);
+	cost_qual_eval(&qp_qual_cost, path->jpath.joinrestrictinfo, root);
+	qp_qual_cost.startup -= merge_qual_cost.startup;
+	qp_qual_cost.per_tuple -= merge_qual_cost.per_tuple;
 
-    /*
-     * 对于SEMI或ANTI连接，或者如果内关系已知唯一，执行器在找到第一个匹配后就会停止扫描。
-     * 当所有连接子句都是合并子句时，这意味着我们永远不需要回退合并，因此可以跳过标记/恢复开销。
-     */
-    if ((path->jpath.jointype == JOIN_SEMI ||
-         path->jpath.jointype == JOIN_ANTI ||
-         extra->inner_unique) &&
-        (list_length(path->jpath.joinrestrictinfo) ==
-         list_length(path->path_mergeclauses)))
-        path->skip_mark_restore = true;  /* 跳过标记/恢复 */
-    else
-        path->skip_mark_restore = false; /* 需要标记/恢复 */
+	/*
+	 * With a SEMI or ANTI join, or if the innerrel is known unique, the
+	 * executor will stop scanning for matches after the first match.  When
+	 * all the joinclauses are merge clauses, this means we don't ever need to
+	 * back up the merge, and so we can skip mark/restore overhead.
+	 */
+	if ((path->jpath.jointype == JOIN_SEMI ||
+		 path->jpath.jointype == JOIN_ANTI ||
+		 extra->inner_unique) &&
+		(list_length(path->jpath.joinrestrictinfo) ==
+		 list_length(path->path_mergeclauses)))
+		path->skip_mark_restore = true;
+	else
+		path->skip_mark_restore = false;
 
-    /*
-     * 获取通过合并条件的大致元组数。这里使用approx_tuple_count是因为我们需要用JOIN_INNER语义完成的估计。
-     */
-    mergejointuples = approx_tuple_count(root, &path->jpath, mergeclauses);
+	/*
+	 * Get approx # tuples passing the mergequals.  We use approx_tuple_count
+	 * here because we need an estimate done with JOIN_INNER semantics.
+	 */
+	mergejointuples = approx_tuple_count(root, &path->jpath, mergeclauses);
 
-    /*
-     * 当外关系中有相等的合并键时，合并连接必须重新扫描内关系中的任何匹配元组。
-     * 这意味着重新获取内元组；我们必须估计这种情况发生的频率。
-     *
-     * 对于常规的内连接和外连接，重新获取次数可以大致估计为合并连接输出大小减去内关系大小。
-     * 假设不同的键值为1, 2, ...，并将在外关系中每个键的值的数量表示为m1, m2, ...；
-     * 在内关系中表示为n1, n2, ...。那么我们有：
-     *
-     * 连接大小 = m1 * n1 + m2 * n2 + ...
-     *
-     * 重新扫描的元组数 = (m1 - 1) * n1 + (m2 - 1) * n2 + ... = m1 * n1 + m2 * n2 + ... - (n1 + n2 + ...)
-     *                  = 连接大小 - 内关系大小
-     *
-     * 这个公式对外元组没有内匹配(nk = 0)的情况是正确的，但对内元组没有外匹配(mk = 0)的情况不正确；
-     * 我们实际上是从重新扫描的元组数中减去了这些，但我们不应该这样做。
-     * 在不进行昂贵的选择性计算的情况下，我们能做得更好吗？
-     *
-     * 如果我们使用的是唯一化的外输入，或者我们知道根本不需要标记/恢复，那么整个问题就不存在了。
-     */
-    if (IsA(outer_path, UniquePath) || path->skip_mark_restore)
-        rescannedtuples = 0;  /* 无需重新扫描 */
-    else
-    {
-        rescannedtuples = mergejointuples - inner_path_rows;
-        /* 必须限制，因为可能存在低估 */
-        if (rescannedtuples < 0)
-            rescannedtuples = 0;
-    }
+	/*
+	 * When there are equal merge keys in the outer relation, the mergejoin
+	 * must rescan any matching tuples in the inner relation. This means
+	 * re-fetching inner tuples; we have to estimate how often that happens.
+	 *
+	 * For regular inner and outer joins, the number of re-fetches can be
+	 * estimated approximately as size of merge join output minus size of
+	 * inner relation. Assume that the distinct key values are 1, 2, ..., and
+	 * denote the number of values of each key in the outer relation as m1,
+	 * m2, ...; in the inner relation, n1, n2, ...  Then we have
+	 *
+	 * size of join = m1 * n1 + m2 * n2 + ...
+	 *
+	 * number of rescanned tuples = (m1 - 1) * n1 + (m2 - 1) * n2 + ... = m1 *
+	 * n1 + m2 * n2 + ... - (n1 + n2 + ...) = size of join - size of inner
+	 * relation
+	 *
+	 * This equation works correctly for outer tuples having no inner match
+	 * (nk = 0), but not for inner tuples having no outer match (mk = 0); we
+	 * are effectively subtracting those from the number of rescanned tuples,
+	 * when we should not.  Can we do better without expensive selectivity
+	 * computations?
+	 *
+	 * The whole issue is moot if we are working from a unique-ified outer
+	 * input, or if we know we don't need to mark/restore at all.
+	 */
+	if (IsA(outer_path, UniquePath) ||path->skip_mark_restore)
+		rescannedtuples = 0;
+	else
+	{
+		rescannedtuples = mergejointuples - inner_path_rows;
+		/* Must clamp because of possible underestimate */
+		if (rescannedtuples < 0)
+			rescannedtuples = 0;
+	}
 
-    /*
-     * 我们将按此比例增加各种成本以考虑重新扫描。注意，这需要乘以内行数或与我们将扫描的内关系部分相关的其他数字。
-     */
-    rescanratio = 1.0 + (rescannedtuples / inner_rows);
+	/*
+	 * We'll inflate various costs this much to account for rescanning.  Note
+	 * that this is to be multiplied by something involving inner_rows, or
+	 * another number related to the portion of the inner rel we'll scan.
+	 */
+	rescanratio = 1.0 + (rescannedtuples / inner_rows);
 
-    /*
-     * 决定是否要物化内输入以保护其免受标记/恢复和执行重新获取的影响。
-     * 我们对常规重新获取的成本模型是，重新获取的成本与原始获取相同，这可能是一个高估；
-     * 但另一方面我们忽略了标记/恢复的簿记成本。不清楚是否值得开发更精细的模型。
-     * 因此我们只需要按rescanratio增加内运行成本。
-     */
-    bare_inner_cost = inner_run_cost * rescanratio;
+	/*
+	 * Decide whether we want to materialize the inner input to shield it from
+	 * mark/restore and performing re-fetches.  Our cost model for regular
+	 * re-fetches is that a re-fetch costs the same as an original fetch,
+	 * which is probably an overestimate; but on the other hand we ignore the
+	 * bookkeeping costs of mark/restore.  Not clear if it's worth developing
+	 * a more refined model.  So we just need to inflate the inner run cost by
+	 * rescanratio.
+	 */
+	bare_inner_cost = inner_run_cost * rescanratio;
 
-    /*
-     * 当我们在中间插入Material节点时，假定重新获取成本仅为每个元组cpu_operator_cost，
-     * 与底层计划的成本无关；我们还会对每次原始获取额外收取cpu_operator_cost。
-     * 注意，我们假设物化节点永远不会溢出到磁盘，因为它只需要记住回到最后一个标记的元组。
-     * （如果有大量重复项，我们的其他成本因素会使路径变得非常昂贵，以至于可能根本不会被选择。）
-     * 因此我们在这里不使用cost_rescan。
-     *
-     * 注意：保持此估计与create_mergejoin_plan对标记生成的Material节点的标签同步。
-     */
-    mat_inner_cost = inner_run_cost +
-        cpu_operator_cost * inner_rows * rescanratio;
+	/*
+	 * When we interpose a Material node the re-fetch cost is assumed to be
+	 * just cpu_operator_cost per tuple, independently of the underlying
+	 * plan's cost; and we charge an extra cpu_operator_cost per original
+	 * fetch as well.  Note that we're assuming the materialize node will
+	 * never spill to disk, since it only has to remember tuples back to the
+	 * last mark.  (If there are a huge number of duplicates, our other cost
+	 * factors will make the path so expensive that it probably won't get
+	 * chosen anyway.)	So we don't use cost_rescan here.
+	 *
+	 * Note: keep this estimate in sync with create_mergejoin_plan's labeling
+	 * of the generated Material node.
+	 */
+	mat_inner_cost = inner_run_cost +
+		cpu_operator_cost * inner_rows * rescanratio;
 
-    /*
-     * 如果我们根本不需要标记/恢复，我们就不需要物化。
-     */
-    if (path->skip_mark_restore)
-        path->materialize_inner = false;  /* 不需要物化 */
+	/*
+	 * If we don't need mark/restore at all, we don't need materialization.
+	 */
+	if (path->skip_mark_restore)
+		path->materialize_inner = false;
 
-    /*
-     * 如果物化看起来更便宜，则优先选择物化，除非用户要求禁止物化。
-     */
-    else if (enable_material && mat_inner_cost < bare_inner_cost)
-        path->materialize_inner = true;   /* 选择物化 */
+	/*
+	 * Prefer materializing if it looks cheaper, unless the user has asked to
+	 * suppress materialization.
+	 */
+	else if (enable_material && mat_inner_cost < bare_inner_cost)
+		path->materialize_inner = true;
 
-    /*
-     * 即使物化看起来不便宜，如果我们直接使用内路径（不排序）且它不支持标记/恢复，我们也必须这样做。
-     *
-     * 由于内侧必须有序，而只有排序和索引扫描才能首先创建顺序，而且它们都支持标记/恢复，
-     * 你可能会认为没有问题——但你就错了。嵌套循环和合并连接可以保留其输入的顺序，
-     * 因此它们可以被选为合并连接的输入，而它们目前不支持标记/恢复。
-     *
-     * 我们在这里不测试enable_material的值，因为在这种情况下物化对于正确性是必需的，
-     * 关闭物化并不能让我们提供无效的计划。
-     */
-    else if (innersortkeys == NIL &&
-             !ExecSupportsMarkRestore(inner_path))
-        path->materialize_inner = true;   /* 必须物化 */
+	/*
+	 * Even if materializing doesn't look cheaper, we *must* do it if the
+	 * inner path is to be used directly (without sorting) and it doesn't
+	 * support mark/restore.
+	 *
+	 * Since the inner side must be ordered, and only Sorts and IndexScans can
+	 * create order to begin with, and they both support mark/restore, you
+	 * might think there's no problem --- but you'd be wrong.  Nestloop and
+	 * merge joins can *preserve* the order of their inputs, so they can be
+	 * selected as the input of a mergejoin, and they don't support
+	 * mark/restore at present.
+	 *
+	 * We don't test the value of enable_material here, because
+	 * materialization is required for correctness in this case, and turning
+	 * it off does not entitle us to deliver an invalid plan.
+	 */
+	else if (innersortkeys == NIL &&
+			 !ExecSupportsMarkRestore(inner_path))
+		path->materialize_inner = true;
 
-    /*
-     * 此外，如果内路径需要排序且预计排序会溢出到磁盘，则强制物化。
-     * 这是因为如果不支持标记/恢复，最终的合并过程可以在线完成。
-     * 不过，我们不会尝试为此考虑调整成本估计。
-     *
-     * 由于在这种情况下物化是一种性能优化而不是正确性所必需的，如果enable_material关闭则跳过它。
-     */
-    else if (enable_material && innersortkeys != NIL &&
-             relation_byte_size(inner_path_rows,
-                                inner_path->pathtarget->width) >
-             (work_mem * 1024L))
-        path->materialize_inner = true;   /* 强制物化 */
-    else
-        path->materialize_inner = false;  /* 不物化 */
+	/*
+	 * Also, force materializing if the inner path is to be sorted and the
+	 * sort is expected to spill to disk.  This is because the final merge
+	 * pass can be done on-the-fly if it doesn't have to support mark/restore.
+	 * We don't try to adjust the cost estimates for this consideration,
+	 * though.
+	 *
+	 * Since materialization is a performance optimization in this case,
+	 * rather than necessary for correctness, we skip it if enable_material is
+	 * off.
+	 */
+	else if (enable_material && innersortkeys != NIL &&
+			 relation_byte_size(inner_path_rows,
+								inner_path->pathtarget->width) >
+			 (work_mem * 1024L))
+		path->materialize_inner = true;
+	else
+		path->materialize_inner = false;
 
-    /* 根据选择的情况收取相应的增量成本 */
-    if (path->materialize_inner)
-        run_cost += mat_inner_cost;       /* 加上物化成本 */
-    else
-        run_cost += bare_inner_cost;      /* 加上无物化成本 */
+	/* Charge the right incremental cost for the chosen case */
+	if (path->materialize_inner)
+		run_cost += mat_inner_cost;
+	else
+		run_cost += bare_inner_cost;
 
-    /* CPU成本计算 */
+	/* CPU costs */
 
-    /*
-     * 所需的元组比较数量大约是外行数加上内行数再加上重新扫描的元组数（我们可以改进这个估计吗？）。
-     * 在每一个比较中，我们需要评估合并连接条件。
-     */
-    startup_cost += merge_qual_cost.startup;
-    startup_cost += merge_qual_cost.per_tuple *
-        (outer_skip_rows + inner_skip_rows * rescanratio);
-    run_cost += merge_qual_cost.per_tuple *
-        ((outer_rows - outer_skip_rows) +
-         (inner_rows - inner_skip_rows) * rescanratio);
+	/*
+	 * The number of tuple comparisons needed is approximately number of outer
+	 * rows plus number of inner rows plus number of rescanned tuples (can we
+	 * refine this?).  At each one, we need to evaluate the mergejoin quals.
+	 */
+	startup_cost += merge_qual_cost.startup;
+	startup_cost += merge_qual_cost.per_tuple *
+		(outer_skip_rows + inner_skip_rows * rescanratio);
+	run_cost += merge_qual_cost.per_tuple *
+		((outer_rows - outer_skip_rows) +
+		 (inner_rows - inner_skip_rows) * rescanratio);
 
-    /*
-     * 对于通过合并连接本身的每个元组，我们收取cpu_tuple_cost加上在连接处应用的附加限制子句的评估成本。
-     * （这是悲观的，因为并非所有的条件都可能在每个元组上都被评估。）
-     *
-     * 注意：我们可以在此处调整SEMI/ANTI连接跳过某些条件评估的情况，但这可能不值得麻烦。
-     */
-    startup_cost += qp_qual_cost.startup;
-    cpu_per_tuple = cpu_tuple_cost + qp_qual_cost.per_tuple;
-    run_cost += cpu_per_tuple * mergejointuples;
+	/*
+	 * For each tuple that gets through the mergejoin proper, we charge
+	 * cpu_tuple_cost plus the cost of evaluating additional restriction
+	 * clauses that are to be applied at the join.  (This is pessimistic since
+	 * not all of the quals may get evaluated at each tuple.)
+	 *
+	 * Note: we could adjust for SEMI/ANTI joins skipping some qual
+	 * evaluations here, but it's probably not worth the trouble.
+	 */
+	startup_cost += qp_qual_cost.startup;
+	cpu_per_tuple = cpu_tuple_cost + qp_qual_cost.per_tuple;
+	run_cost += cpu_per_tuple * mergejointuples;
 
-    /* 目标列表评估成本按输出行支付，而不是按扫描的元组数支付 */
-    startup_cost += path->jpath.path.pathtarget->cost.startup;
-    run_cost += path->jpath.path.pathtarget->cost.per_tuple * path->jpath.path.rows;
+	/* tlist eval costs are paid per output row, not per tuple scanned */
+	startup_cost += path->jpath.path.pathtarget->cost.startup;
+	run_cost += path->jpath.path.pathtarget->cost.per_tuple * path->jpath.path.rows;
 
-    /* 设置最终的启动成本和总成本 */
-    path->jpath.path.startup_cost = startup_cost;
-    path->jpath.path.total_cost = startup_cost + run_cost;
+	path->jpath.path.startup_cost = startup_cost;
+	path->jpath.path.total_cost = startup_cost + run_cost;
 }
-
 
 /*
  * run mergejoinscansel() with caching
@@ -3309,116 +3230,126 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 
 /*
  * initial_cost_hashjoin
- *    对哈希连接路径进行初步成本估算。
- * 
- * 此函数必须快速生成路径的启动成本和总成本的下界估计。如果我们无法使用这些下界
- * 排除提议的路径，那么final_cost_hashjoin将被调用来获取最终估计值。
- * 
- * 此函数与final_cost_hashjoin之间的具体分工是它们私有的，代表了初始估计速度
- * 和获得紧密下界之间的权衡。我们选择在这里不检查连接条件（除了计算哈希子句的数量），
- * 因此在CPU成本方面不能做太多工作。我们假设ExecChooseHashTableSize在这里使用
- * 是足够便宜的。
- * 
- * 参数说明：
- *    root - 规划器的全局信息结构指针
- *    workspace - 将被填充启动成本、总成本和可能的其他数据，供final_cost_hashjoin使用
- *    jointype - 要执行的连接类型
- *    hashclauses - 用作哈希子句的连接条件列表
- *    outer_path - 连接的外层输入路径
- *    inner_path - 连接的内层输入路径
- *    extra - 包含有关连接的杂项信息
- *    parallel_hash - 指示inner_path是部分路径，并且将并行构建共享哈希表
+ *	  Preliminary estimate of the cost of a hashjoin path.
+ *
+ * This must quickly produce lower-bound estimates of the path's startup and
+ * total costs.  If we are unable to eliminate the proposed path from
+ * consideration using the lower bounds, final_cost_hashjoin will be called
+ * to obtain the final estimates.
+ *
+ * The exact division of labor between this function and final_cost_hashjoin
+ * is private to them, and represents a tradeoff between speed of the initial
+ * estimate and getting a tight lower bound.  We choose to not examine the
+ * join quals here (other than by counting the number of hash clauses),
+ * so we can't do much with CPU costs.  We do assume that
+ * ExecChooseHashTableSize is cheap enough to use here.
+ *
+ * 'workspace' is to be filled with startup_cost, total_cost, and perhaps
+ *		other data to be used by final_cost_hashjoin
+ * 'jointype' is the type of join to be performed
+ * 'hashclauses' is the list of joinclauses to be used as hash clauses
+ * 'outer_path' is the outer input to the join
+ * 'inner_path' is the inner input to the join
+ * 'extra' contains miscellaneous information about the join
+ * 'parallel_hash' indicates that inner_path is partial and that a shared
+ *		hash table will be built in parallel
  */
 void
 initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
-                     JoinType jointype,
-                     List *hashclauses,
-                     Path *outer_path, Path *inner_path,
-                     JoinPathExtraData *extra,
-                     bool parallel_hash)
+					  JoinType jointype,
+					  List *hashclauses,
+					  Path *outer_path, Path *inner_path,
+					  JoinPathExtraData *extra,
+					  bool parallel_hash)
 {
-    Cost        startup_cost = 0;            /* 启动成本初始化 */
-    Cost        run_cost = 0;                /* 运行成本初始化 */
-    double      outer_path_rows = outer_path->rows;  /* 外层路径返回的行数 */
-    double      inner_path_rows = inner_path->rows;  /* 内层路径返回的行数 */
-    double      inner_path_rows_total = inner_path_rows; /* 内层路径总行数（考虑并行情况） */
-    int         num_hashclauses = list_length(hashclauses); /* 哈希子句数量 */
-    int         numbuckets;                  /* 哈希表桶数量 */
-    int         numbatches;                  /* 批处理数量 */
-    int         num_skew_mcvs;               /* 倾斜优化MCV(最常见值)数量 */
-    size_t      space_allowed;               /* 允许的空间（未使用） */
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	double		outer_path_rows = outer_path->rows;
+	double		inner_path_rows = inner_path->rows;
+	double		inner_path_rows_total = inner_path_rows;
+	int			num_hashclauses = list_length(hashclauses);
+	int			numbuckets;
+	int			numbatches;
+	int			num_skew_mcvs;
+	size_t		space_allowed;	/* unused */
 
-    /* 源数据的成本计算 */
-    startup_cost += outer_path->startup_cost;  /* 外层路径启动成本 */
-    run_cost += outer_path->total_cost - outer_path->startup_cost; /* 外层路径运行成本 */
-    startup_cost += inner_path->total_cost;  /* 内层路径总成本（作为哈希表构建成本，属于启动成本） */
+	/* cost of source data */
+	startup_cost += outer_path->startup_cost;
+	run_cost += outer_path->total_cost - outer_path->startup_cost;
+	startup_cost += inner_path->total_cost;
 
-    /*
-     * 计算哈希函数的成本：必须为每个输入元组执行一次。
-     * 我们为每个列的哈希函数收取一个cpu_operator_cost。
-     * 此外，为每个内关系行增加一个cpu_tuple_cost，以模拟将行插入哈希表的成本。
-     * 
-     * 注意：当哈希子句比单个操作符更复杂时，我们应该为左侧或右侧的额外评估
-     * 成本收费，但目前认为这不值得为此付出额外的工作。
-     */
-    startup_cost += (cpu_operator_cost * num_hashclauses + cpu_tuple_cost)
-        * inner_path_rows;  /* 内关系哈希计算和插入哈希表的成本 */
-    run_cost += cpu_operator_cost * num_hashclauses * outer_path_rows; /* 外关系哈希计算成本 */
+	/*
+	 * Cost of computing hash function: must do it once per input tuple. We
+	 * charge one cpu_operator_cost for each column's hash function.  Also,
+	 * tack on one cpu_tuple_cost per inner row, to model the costs of
+	 * inserting the row into the hashtable.
+	 *
+	 * XXX when a hashclause is more complex than a single operator, we really
+	 * should charge the extra eval costs of the left or right side, as
+	 * appropriate, here.  This seems more work than it's worth at the moment.
+	 */
+	startup_cost += (cpu_operator_cost * num_hashclauses + cpu_tuple_cost)
+		* inner_path_rows;
+	run_cost += cpu_operator_cost * num_hashclauses * outer_path_rows;
 
-    /*
-     * 如果这是并行哈希构建，则我们当前的inner_rows_total值仅指每个参与者返回的行数。
-     * 对于共享哈希表大小估计，我们需要总数，因此需要撤销除法操作。
-     */
-    if (parallel_hash)
-        inner_path_rows_total *= get_parallel_divisor(inner_path);
+	/*
+	 * If this is a parallel hash build, then the value we have for
+	 * inner_rows_total currently refers only to the rows returned by each
+	 * participant.  For shared hash table size estimation, we need the total
+	 * number, so we need to undo the division.
+	 */
+	if (parallel_hash)
+		inner_path_rows_total *= get_parallel_divisor(inner_path);
 
-    /*
-     * 获取执行器将为内关系使用的哈希表大小。
-     * 
-     * 注意：目前，我们总是假设将执行倾斜优化。只要SKEW_WORK_MEM_PERCENT很小，
-     * 就不值得确定这一点。
-     * 
-     * 注意：将来可能有兴趣尝试在成本估计中考虑倾斜优化，但目前我们没有这样做。
-     */
-    ExecChooseHashTableSize(inner_path_rows_total,
-                           inner_path->pathtarget->width,  /* 内关系元组宽度 */
-                           true,    /* useskew - 使用倾斜优化 */
-                           parallel_hash, /* try_combined_work_mem - 尝试组合工作内存 */
-                           outer_path->parallel_workers,  /* 并行工作线程数 */
-                           &space_allowed,
-                           &numbuckets,  /* 输出参数：哈希表桶数量 */
-                           &numbatches,  /* 输出参数：批处理数量 */
-                           &num_skew_mcvs);  /* 输出参数：倾斜优化MCV数量 */
+	/*
+	 * Get hash table size that executor would use for inner relation.
+	 *
+	 * XXX for the moment, always assume that skew optimization will be
+	 * performed.  As long as SKEW_WORK_MEM_PERCENT is small, it's not worth
+	 * trying to determine that for sure.
+	 *
+	 * XXX at some point it might be interesting to try to account for skew
+	 * optimization in the cost estimate, but for now, we don't.
+	 */
+	ExecChooseHashTableSize(inner_path_rows_total,
+							inner_path->pathtarget->width,
+							true,	/* useskew */
+							parallel_hash,	/* try_combined_work_mem */
+							outer_path->parallel_workers,
+							&space_allowed,
+							&numbuckets,
+							&numbatches,
+							&num_skew_mcvs);
 
-    /*
-     * 如果内关系太大，那么我们需要对连接进行"批处理"，这意味着需要额外的
-     * 将大部分元组写入磁盘并重新读取一次。
-     * 每页收取seq_page_cost，因为I/O应该是良好且顺序的。
-     * 写入内关系计为启动成本，其余的计为运行成本。
-     */
-    if (numbatches > 1)
-    {
-        double      outerpages = page_size(outer_path_rows,  /* 计算外关系页数 */
-                                          outer_path->pathtarget->width);
-        double      innerpages = page_size(inner_path_rows,  /* 计算内关系页数 */
-                                          inner_path->pathtarget->width);
+	/*
+	 * If inner relation is too big then we will need to "batch" the join,
+	 * which implies writing and reading most of the tuples to disk an extra
+	 * time.  Charge seq_page_cost per page, since the I/O should be nice and
+	 * sequential.  Writing the inner rel counts as startup cost, all the rest
+	 * as run cost.
+	 */
+	if (numbatches > 1)
+	{
+		double		outerpages = page_size(outer_path_rows,
+										   outer_path->pathtarget->width);
+		double		innerpages = page_size(inner_path_rows,
+										   inner_path->pathtarget->width);
 
-        startup_cost += seq_page_cost * innerpages;  /* 内关系批处理写入成本 */
-        run_cost += seq_page_cost * (innerpages + 2 * outerpages);  /* 内关系读取和外关系读写成本 */
-    }
+		startup_cost += seq_page_cost * innerpages;
+		run_cost += seq_page_cost * (innerpages + 2 * outerpages);
+	}
 
-    /* 剩余的CPU成本留待后面处理 */
+	/* CPU costs left for later */
 
-    /* 公共结果字段设置 */
-    workspace->startup_cost = startup_cost;  /* 设置启动成本 */
-    workspace->total_cost = startup_cost + run_cost;  /* 设置总成本 */
-    /* 保存私有数据供final_cost_hashjoin使用 */
-    workspace->run_cost = run_cost;  /* 保存运行成本 */
-    workspace->numbuckets = numbuckets;  /* 保存哈希表桶数量 */
-    workspace->numbatches = numbatches;  /* 保存批处理数量 */
-    workspace->inner_rows_total = inner_path_rows_total;  /* 保存内层总行数 */
+	/* Public result fields */
+	workspace->startup_cost = startup_cost;
+	workspace->total_cost = startup_cost + run_cost;
+	/* Save private data for final_cost_hashjoin */
+	workspace->run_cost = run_cost;
+	workspace->numbuckets = numbuckets;
+	workspace->numbatches = numbatches;
+	workspace->inner_rows_total = inner_path_rows_total;
 }
-
 
 /*
  * final_cost_hashjoin
@@ -4198,22 +4129,27 @@ get_restriction_qual_cost(PlannerInfo *root, RelOptInfo *baserel,
 
 /*
  * compute_semi_anti_join_factors
- *	  估算 SEMI、ANTI 或 inner_unique 连接中内层输入被扫描的比例。
+ *	  Estimate how much of the inner input a SEMI, ANTI, or inner_unique join
+ *	  can be expected to scan.
  *
- * 在 hash 或 nestloop 的 SEMI/ANTI 连接中，执行器在找到当前外层行的第一个匹配后会停止扫描内层行。
- * 如果检测到内层关系唯一，也会有同样的行为。
- * 因此需要调整部分成本组件以反映这一效果。本函数计算这些调整所需的估算值。
- * 这些估算值与具体的外层和内层路径无关，只需计算一次并传递给所有连接成本估算函数。
+ * In a hash or nestloop SEMI/ANTI join, the executor will stop scanning
+ * inner rows as soon as it finds a match to the current outer row.
+ * The same happens if we have detected the inner rel is unique.
+ * We should therefore adjust some of the cost components for this effect.
+ * This function computes some estimates needed for these adjustments.
+ * These estimates will be the same regardless of the particular paths used
+ * for the outer and inner relation, so we compute these once and then pass
+ * them to all the join cost estimation functions.
  *
- * 输入参数:
- *	joinrel: 当前考虑的连接关系
- *	outerrel: 外层关系
- *	innerrel: 内层关系
- *	jointype: 如果不是 JOIN_SEMI 或 JOIN_ANTI，则假定为 inner_unique
- *	sjinfo: 连接相关的 SpecialJoinInfo
- *	restrictlist: 连接条件
- * 输出参数:
- *	*semifactors 被填充（字段定义见 pathnodes.h）
+ * Input parameters:
+ *	joinrel: join relation under consideration
+ *	outerrel: outer relation under consideration
+ *	innerrel: inner relation under consideration
+ *	jointype: if not JOIN_SEMI or JOIN_ANTI, we assume it's inner_unique
+ *	sjinfo: SpecialJoinInfo relevant to this join
+ *	restrictlist: join quals
+ * Output parameters:
+ *	*semifactors is filled in (see pathnodes.h for field definitions)
  */
 void
 compute_semi_anti_join_factors(PlannerInfo *root,
@@ -4233,9 +4169,11 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 	ListCell   *l;
 
 	/*
-	 * 对于 ANTI 连接，必须忽略 "pushed down" 的条件，因为这些不会影响匹配逻辑。
-	 * 对于 SEMI 连接，不区分 joinquals 和 "pushed down" 条件，直接使用整个 restrictinfo 列表。
-	 * 对于其他外连接类型，只考虑非 "pushed down" 条件。
+	 * In an ANTI join, we must ignore clauses that are "pushed down", since
+	 * those won't affect the match logic.  In a SEMI join, we do not
+	 * distinguish joinquals from "pushed down" quals, so just use the whole
+	 * restrictinfo list.  For other outer join types, we should consider only
+	 * non-pushed-down quals, so that this devolves to an IS_OUTER_JOIN check.
 	 */
 	if (IS_OUTER_JOIN(jointype))
 	{
@@ -4252,7 +4190,7 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 		joinquals = restrictlist;
 
 	/*
-	 * 获取连接条件在 JOIN_SEMI 或 JOIN_ANTI 下的选择率。
+	 * Get the JOIN_SEMI or JOIN_ANTI selectivity of the join clauses.
 	 */
 	jselec = clauselist_selectivity(root,
 									joinquals,
@@ -4261,7 +4199,7 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 									sjinfo);
 
 	/*
-	 * 同时获取连接条件在普通内连接下的选择率。
+	 * Also get the normal inner-join selectivity of the join clauses.
 	 */
 	norm_sjinfo.type = T_SpecialJoinInfo;
 	norm_sjinfo.min_lefthand = outerrel->relids;
@@ -4269,7 +4207,7 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 	norm_sjinfo.syn_lefthand = outerrel->relids;
 	norm_sjinfo.syn_righthand = innerrel->relids;
 	norm_sjinfo.jointype = JOIN_INNER;
-	/* 其它字段无需设置 */
+	/* we don't bother trying to make the remaining fields valid */
 	norm_sjinfo.lhs_strict = false;
 	norm_sjinfo.delay_upper_joins = false;
 	norm_sjinfo.semi_can_btree = false;
@@ -4283,22 +4221,26 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 									JOIN_INNER,
 									&norm_sjinfo);
 
-	/* 释放 joinquals 列表 */
+	/* Avoid leaking a lot of ListCells */
 	if (IS_OUTER_JOIN(jointype))
 		list_free(joinquals);
 
 	/*
-	 * jselec 可理解为有匹配的外层行比例（SEMI/ANTI 都如此）。
-	 * nselec 是笛卡尔积中匹配的比例。
-	 * 所以每个有匹配的外层行平均匹配的内层行数为 nselec * inner_rows / jselec。
+	 * jselec can be interpreted as the fraction of outer-rel rows that have
+	 * any matches (this is true for both SEMI and ANTI cases).  And nselec is
+	 * the fraction of the Cartesian product that matches.  So, the average
+	 * number of matches for each outer-rel row that has at least one match is
+	 * nselec * inner_rows / jselec.
 	 *
-	 * 注意：这里用的是内层关系的 "rows" 数，即使后续考虑的是参数化路径也没问题，
-	 * 因为选择率估算已包含所有连接条件。
+	 * Note: it is correct to use the inner rel's "rows" count here, even
+	 * though we might later be considering a parameterized inner path with
+	 * fewer rows.  This is because we have included all the join clauses in
+	 * the selectivity estimate.
 	 */
-	if (jselec > 0)				/* 防止除零 */
+	if (jselec > 0)				/* protect against zero divide */
 	{
 		avgmatch = nselec * innerrel->rows / jselec;
-		/* 限定在合理范围 */
+		/* Clamp to sane range */
 		avgmatch = Max(1.0, avgmatch);
 	}
 	else
@@ -4453,67 +4395,40 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 }
 
 
-/*-------------------------------------------------------------------------*
+/*
  * set_baserel_size_estimates
- *		设置给定基本关系的大小估计值
+ *		Set the size estimates for the given base relation.
  *
- * 前置条件：
- *	- 关系的targetlist（目标列列表）和restrictinfo列表（限制条件信息列表）必须已构建完成
- *	- rel->tuples（表中元组总数估计）必须已设置
+ * The rel's targetlist and restrictinfo list must have been constructed
+ * already, and rel->tuples must be set.
  *
- * 此函数会设置关系节点的以下字段：
- *	rows: 应用限制条件后的预计输出元组数量
- *	width: 预计的平均输出元组宽度（以字节为单位）
- *	baserestrictcost: 评估baserestrictinfo子句的估计成本
- *
- * 该函数是PostgreSQL查询优化器中成本估算阶段的核心组件，为后续的执行计划生成
- * 提供必要的统计信息基础。
- *-------------------------------------------------------------------------*/
+ * We set the following fields of the rel node:
+ *	rows: the estimated number of output tuples (after applying
+ *		  restriction clauses).
+ *	width: the estimated average output tuple width in bytes.
+ *	baserestrictcost: estimated cost of evaluating baserestrictinfo clauses.
+ */
 void
 set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 {
-	double		nrows;  /* 用于临时存储计算后的行数估计值 */
+	double		nrows;
 
-	/* 断言：此函数只应应用于基本关系（基表），而非连接关系或其他类型 */
-	Assert(rel->relid > 0);  /* 基本关系的relid大于0，连接关系为负数 */
+	/* Should only be applied to base relations */
+	Assert(rel->relid > 0);
 
-	/*
-	 * 计算过滤后的行数：原始行数乘以限制条件的选择性
-	 *
-	 * clauselist_selectivity函数计算一组限制条件对元组的过滤比例
-	 * 参数说明：
-	 * - root: 规划器全局信息
-	 * - rel->baserestrictinfo: 该关系的所有限制条件信息列表
-	 * - 0: 通常为0，表示不考虑特定变量的相关性
-	 * - JOIN_INNER: 表示内连接语义，适用于基本关系的过滤
-	 * - NULL: 不需要传递特定的附加数据
-	 */
 	nrows = rel->tuples *
 		clauselist_selectivity(root,
-					   rel->baserestrictinfo,
-					   0,
-					   JOIN_INNER,
-					   NULL);
+							   rel->baserestrictinfo,
+							   0,
+							   JOIN_INNER,
+							   NULL);
 
-	/*
-	 * 将计算得到的行数限制在合理范围内，防止出现极小或极大的估计值
-	 * clamp_row_est函数确保估计值在合理的边界内，避免优化器做出极端决策
-	 */
 	rel->rows = clamp_row_est(nrows);
 
-	/*
-	 * 计算评估所有限制条件的成本
-	 * cost_qual_eval函数分析限制条件的复杂度和执行代价，更新baserestrictcost结构体
-	 */
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
-	/*
-	 * 设置关系的平均行宽
-	 * set_rel_width函数根据关系的目标列计算出平均元组宽度，这对I/O成本估算至关重要
-	 */
 	set_rel_width(root, rel);
 }
-
 
 /*
  * get_parameterized_baserel_size
@@ -5558,27 +5473,13 @@ relation_byte_size(double tuples, int width)
 
 /*
  * page_size
- *    计算给定数量和宽度的元组所占用的数据页面数量的估计值。
- * 
- * 此函数是PostgreSQL查询优化器中用于成本估算的辅助函数，主要用于计算
- * 关系数据在磁盘上的物理存储需求，这对于估算I/O成本非常重要。
- * 
- * 参数说明：
- *    tuples - 元组的数量（行数）
- *    width - 每个元组的宽度（以字节为单位）
- * 
- * 返回值：
- *    double - 返回向上取整后的页面数量
- * 
- * 实现说明：
- *    1. 首先调用relation_byte_size计算所有元组的总字节大小
- *    2. 然后将总字节数除以BLCKSZ（PostgreSQL块大小，通常为8KB）
- *    3. 使用ceil函数向上取整，确保即使有部分填充的页面也被计入
+ *	  Returns an estimate of the number of pages covered by a given
+ *	  number of tuples of a given width (size in bytes).
  */
 static double
 page_size(double tuples, int width)
 {
-    return ceil(relation_byte_size(tuples, width) / BLCKSZ);
+	return ceil(relation_byte_size(tuples, width) / BLCKSZ);
 }
 
 /*

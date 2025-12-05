@@ -2995,7 +2995,7 @@ _equalValue(const Value *a, const Value *b)
 
 /*
  * equal
- *	  深度比较两个节点树是否完全相同
+ *	  returns whether two nodes are equal
  */
 bool
 equal(const void *a, const void *b)

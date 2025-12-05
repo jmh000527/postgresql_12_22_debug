@@ -733,117 +733,97 @@ rel_is_distinct_for(PlannerInfo *root, RelOptInfo *rel, List *clause_list)
 
 
 /*
- * query_supports_distinctness
- *	  判断查询是否可能在某些输出列上被证明具有唯一性
+ * query_supports_distinctness - could the query possibly be proven distinct
+ *		on some set of output columns?
  *
- * 参数：
- *   query - 要检查的查询树结构
- *
- * 返回值：
- *   如果查询可能在某些列上具有唯一性，则返回true；否则返回false
- *
- * 功能说明：
- *   此函数是query_is_distinct_for()的预检查函数。它必须在query_is_distinct_for()
- *   可能返回true时返回true，但不应消耗大量计算资源。设计思路是让调用者可以避免
- *   执行可能昂贵的处理来计算query_is_distinct_for()的参数列表，如果调用不可能成功的话。
- *
- * 应用场景：
- *   在查询优化过程中，特别是在处理半连接（semi-joins）和子查询优化时，
- *   需要确定查询结果是否具有某些列上的唯一性，以应用更高效的执行策略。
+ * This is effectively a pre-checking function for query_is_distinct_for().
+ * It must return true if query_is_distinct_for() could possibly return true
+ * with this query, but it should not expend a lot of cycles.  The idea is
+ * that callers can avoid doing possibly-expensive processing to compute
+ * query_is_distinct_for()'s argument lists if the call could not possibly
+ * succeed.
  */
 bool
 query_supports_distinctness(Query *query)
 {
-	/*
-	 * 集合返回函数(SRFs)会破坏唯一性，除非使用了DISTINCT子句
-	 * 原因：SRF可能为每行输入生成多行输出，导致即使在主键列上也可能出现重复
-	 */
+	/* SRFs break distinctness except with DISTINCT, see below */
 	if (query->hasTargetSRFs && query->distinctClause == NIL)
 		return false;
 
-	/*
-	 * 检查查询是否包含可以证明唯一性的特性：
-	 *   1. DISTINCT子句 - 显式去重
-	 *   2. GROUP BY子句 - 按分组列聚合，每组只返回一行
-	 *   3. GROUPING SETS - 多维度分组，结果具有分组键的唯一性
-	 *   4. 聚合函数 - 通常返回汇总结果，具有分组键的唯一性
-	 *   5. HAVING子句 - 与GROUP BY配合使用，结果具有分组键的唯一性
-	 *   6. 集合操作(UNION/INTERSECT等) - 某些集合操作结果具有自然唯一性
-	 */
-	if (query->distinctClause != NIL ||       	/* 存在DISTINCT子句 */
-		query->groupClause != NIL ||         	/* 存在GROUP BY子句 */
-		query->groupingSets != NIL ||        	/* 存在GROUPING SETS */
-		query->hasAggs ||                    	/* 包含聚合函数 */
-		query->havingQual ||                 	/* 存在HAVING条件 */
-		query->setOperations)                	/* 存在集合操作 */
+	/* check for features we can prove distinctness with */
+	if (query->distinctClause != NIL ||
+		query->groupClause != NIL ||
+		query->groupingSets != NIL ||
+		query->hasAggs ||
+		query->havingQual ||
+		query->setOperations)
 		return true;
 
-	/* 如果没有上述特性，则查询结果默认不保证任何列的唯一性 */
 	return false;
 }
 
 /*
- * query_is_distinct_for - 判断查询在指定的列上是否保证不会返回重复行
+ * query_is_distinct_for - does query never return duplicates of the
+ *		specified columns?
  *
- * 参数:
- * - query: 尚未进行规划的子查询（当前用法中，它总是来自子查询RTE，规划器不会修改它）
- * - colnos: 输出列编号(resno)的整数列表
- * - opids: 对应的上层相等运算符OID列表，用于定义"唯一性"判断标准
+ * query is a not-yet-planned subquery (in current usage, it's always from
+ * a subquery RTE, which the planner avoids scribbling on).
  *
- * 返回值:
- * - bool: 如果指定列集保证唯一返回true，否则返回false
- *
- * 注："唯一性"根据opids中列出的上层相等运算符来定义。这些运算符可能是跨类型的，
- * 与子查询自身使用的相等运算符可能不完全相同。函数使用equality_ops_are_compatible()
- * 来检查兼容性，该函数会检查btree或hash操作符族的成员资格，因此对于此处需要处理的
- * 所有运算符都能给出可信的答案。
+ * colnos is an integer list of output column numbers (resno's).  We are
+ * interested in whether rows consisting of just these columns are certain
+ * to be distinct.  "Distinctness" is defined according to whether the
+ * corresponding upper-level equality operators listed in opids would think
+ * the values are distinct.  (Note: the opids entries could be cross-type
+ * operators, and thus not exactly the equality operators that the subquery
+ * would use itself.  We use equality_ops_are_compatible() to check
+ * compatibility.  That looks at btree or hash opfamily membership, and so
+ * should give trustworthy answers for all operators that we might need
+ * to deal with here.)
  */
 bool
 query_is_distinct_for(Query *query, List *colnos, List *opids)
 {
 	ListCell   *l;
-	Oid		opid;
+	Oid			opid;
 
-	/* 验证colnos和opids列表长度必须相同 */
 	Assert(list_length(colnos) == list_length(opids));
 
 	/*
-	 * 检查DISTINCT（包括DISTINCT ON）情况：
-	 * 如果DISTINCT子句中的所有列都包含在colnos中，且运算符语义匹配，
-	 * 则保证唯一性。即使DISTINCT列或目标列表中存在集合返回函数(SRF)也成立。
+	 * DISTINCT (including DISTINCT ON) guarantees uniqueness if all the
+	 * columns in the DISTINCT clause appear in colnos and operator semantics
+	 * match.  This is true even if there are SRFs in the DISTINCT columns or
+	 * elsewhere in the tlist.
 	 */
 	if (query->distinctClause)
 	{
 		foreach(l, query->distinctClause)
 		{
-			/* 获取排序分组子句对应的目标列表项 */
 			SortGroupClause *sgc = (SortGroupClause *) lfirst(l);
 			TargetEntry *tle = get_sortgroupclause_tle(sgc,
-									   query->targetList);
+													   query->targetList);
 
-			/* 搜索对应列并验证运算符兼容性 */
 			opid = distinct_col_search(tle->resno, colnos, opids);
 			if (!OidIsValid(opid) ||
 				!equality_ops_are_compatible(opid, sgc->eqop))
-				break;            /* 无匹配则提前退出 */
+				break;			/* exit early if no match */
 		}
-		if (l == NULL)           /* 所有DISTINCT列都匹配成功？ */
+		if (l == NULL)			/* had matches for all? */
 			return true;
 	}
 
 	/*
-	 * 检查目标列表中的集合返回函数(SRF)：
-	 * 即使在tlist计算前进行了分组，SRF也可能导致返回重复行。
-	 * （注意：如果所有tlist SRF都在GROUP BY列中，实际上也是安全的，因为它们会在分组前展开，
-	 * 但目前认为不值得为此进行专门检查。）
+	 * Otherwise, a set-returning function in the query's targetlist can
+	 * result in returning duplicate rows, despite any grouping that might
+	 * occur before tlist evaluation.  (If all tlist SRFs are within GROUP BY
+	 * columns, it would be safe because they'd be expanded before grouping.
+	 * But it doesn't currently seem worth the effort to check for that.)
 	 */
 	if (query->hasTargetSRFs)
 		return false;
 
 	/*
-	 * 检查GROUP BY（无GROUPING SETS）情况：
-	 * 类似DISTINCT，如果GROUP BY子句中的所有列都包含在colnos中且运算符语义匹配，
-	 * 则保证唯一性。
+	 * Similarly, GROUP BY without GROUPING SETS guarantees uniqueness if all
+	 * the grouped columns appear in colnos and operator semantics match.
 	 */
 	if (query->groupClause && !query->groupingSets)
 	{
@@ -851,29 +831,30 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 		{
 			SortGroupClause *sgc = (SortGroupClause *) lfirst(l);
 			TargetEntry *tle = get_sortgroupclause_tle(sgc,
-									   query->targetList);
+													   query->targetList);
 
 			opid = distinct_col_search(tle->resno, colnos, opids);
 			if (!OidIsValid(opid) ||
 				!equality_ops_are_compatible(opid, sgc->eqop))
-				break;            /* 无匹配则提前退出 */
+				break;			/* exit early if no match */
 		}
-		if (l == NULL)           /* 所有GROUP BY列都匹配成功？ */
+		if (l == NULL)			/* had matches for all? */
 			return true;
 	}
-	/* 检查GROUPING SETS情况 */
 	else if (query->groupingSets)
 	{
 		/*
-		 * 如果有带表达式的分组集，我们可能不具有唯一性，且分析起来很困难，
-		 * 因此直接返回false
+		 * If we have grouping sets with expressions, we probably don't have
+		 * uniqueness and analysis would be hard. Punt.
 		 */
 		if (query->groupClause)
 			return false;
 
 		/*
-		 * 如果没有groupClause（即没有分组表达式），我们可能有一个或多个空分组集。
-		 * 如果只有一个空分组集，则只返回一行，肯定是唯一的。否则肯定不唯一。
+		 * If we have no groupClause (therefore no grouping expressions), we
+		 * might have one or many empty grouping sets. If there's just one,
+		 * then we're returning only one row and are certainly unique. But
+		 * otherwise, we know we're certainly not unique.
 		 */
 		if (list_length(query->groupingSets) == 1 &&
 			((GroupingSet *) linitial(query->groupingSets))->kind == GROUPING_SET_EMPTY)
@@ -884,16 +865,16 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 	else
 	{
 		/*
-		 * 如果没有GROUP BY，但有聚合函数或HAVING子句，
-		 * 那么结果最多只有一行，对任何运算符来说都是唯一的
+		 * If we have no GROUP BY, but do have aggregates or HAVING, then the
+		 * result is at most one row so it's surely unique, for any operators.
 		 */
 		if (query->hasAggs || query->havingQual)
 			return true;
 	}
 
 	/*
-	 * 检查集合操作（UNION、INTERSECT、EXCEPT）情况：
-	 * 这些操作保证整个输出行的唯一性，除非使用了ALL关键字
+	 * UNION, INTERSECT, EXCEPT guarantee uniqueness of the whole output row,
+	 * except with ALL.
 	 */
 	if (query->setOperations)
 	{
@@ -901,11 +882,11 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 
 		Assert(topop->op != SETOP_NONE);
 
-		if (!topop->all)  /* 不是UNION ALL、INTERSECT ALL或EXCEPT ALL */
+		if (!topop->all)
 		{
 			ListCell   *lg;
 
-			/* 我们需要检查所有非junk输出列是否都在colnos中 */
+			/* We're good if all the nonjunk output columns are in colnos */
 			lg = list_head(topop->groupClauses);
 			foreach(l, query->targetList)
 			{
@@ -913,9 +894,9 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 				SortGroupClause *sgc;
 
 				if (tle->resjunk)
-					continue;    /* 忽略resjunk列 */
+					continue;	/* ignore resjunk columns */
 
-				/* 非resjunk列应该有对应的分组子句 */
+				/* non-resjunk columns should have grouping clauses */
 				Assert(lg != NULL);
 				sgc = (SortGroupClause *) lfirst(lg);
 				lg = lnext(lg);
@@ -923,24 +904,23 @@ query_is_distinct_for(Query *query, List *colnos, List *opids)
 				opid = distinct_col_search(tle->resno, colnos, opids);
 				if (!OidIsValid(opid) ||
 					!equality_ops_are_compatible(opid, sgc->eqop))
-					break;    /* 无匹配则提前退出 */
+					break;		/* exit early if no match */
 			}
-			if (l == NULL)    /* 所有非junk列都匹配成功？ */
+			if (l == NULL)		/* had matches for all? */
 				return true;
 		}
 	}
 
 	/*
-	 * XXX 还有其他容易判断结果必须唯一的情况吗？
+	 * XXX Are there any other cases in which we can easily see the result
+	 * must be distinct?
 	 *
-	 * 如果要为这个函数添加更多智能判断，请确保同时更新query_supports_distinctness()函数
-	 * 以保持一致性。
+	 * If you do add more smarts to this function, be sure to update
+	 * query_supports_distinctness() to match.
 	 */
 
-	/* 所有唯一性检查都失败，返回false */
 	return false;
 }
-
 
 /*
  * distinct_col_search - subroutine for query_is_distinct_for
@@ -965,36 +945,29 @@ distinct_col_search(int colno, List *colnos, List *opids)
 
 
 /*
- * innerrel_is_unique - 检查内关系是否对于外关系具有唯一性
+ * innerrel_is_unique
+ *	  Check if the innerrel provably contains at most one tuple matching any
+ *	  tuple from the outerrel, based on join clauses in the 'restrictlist'.
  *
- * 该函数用于判断在给定连接条件下，内关系(innerrel)对于外关系(outerrel)中的任意元组，
- * 最多只会有一个匹配的元组。这是查询优化中半连接优化和去重优化的关键判断函数。
+ * We need an actual RelOptInfo for the innerrel, but it's sufficient to
+ * identify the outerrel by its Relids.  This asymmetry supports use of this
+ * function before joinrels have been built.  (The caller is expected to
+ * also supply the joinrelids, just to save recalculating that.)
  *
- * 参数说明:
- * - root: 查询优化器的全局信息结构
- * - joinrelids: 连接关系的ID集合（用于缓存优化）
- * - outerrelids: 外关系的ID集合
- * - innerrel: 内关系的优化信息结构
- * - jointype: 连接类型（如INNER JOIN, LEFT JOIN等）
- * - restrictlist: 连接限制条件列表
- * - force_cache: 是否强制缓存结果（用于非标准调用场景）
+ * The proof must be made based only on clauses that will be "joinquals"
+ * rather than "otherquals" at execution.  For an inner join there's no
+ * difference; but if the join is outer, we must ignore pushed-down quals,
+ * as those will become "otherquals".  Note that this means the answer might
+ * vary depending on whether IS_OUTER_JOIN(jointype); since we cache the
+ * answer without regard to that, callers must take care not to call this
+ * with jointypes that would be classified differently by IS_OUTER_JOIN().
  *
- * 返回值:
- * - bool: 如果能证明内关系对于外关系具有唯一性则返回true，否则返回false
- *
- * 工作原理:
- * 1. 首先进行快速否定检查：如果没有连接条件或内关系不支持唯一性，则直接返回false
- * 2. 查询缓存：检查是否已有相关的结果缓存，避免重复计算
- * 3. 实际证明：调用is_innerrel_unique_for函数进行具体的唯一性证明
- * 4. 结果缓存：将证明结果缓存起来供后续查询使用
- *
- * 缓存机制:
- * - unique_for_rels: 存储已证明具有唯一性的外关系集合
- * - non_unique_for_rels: 存储已证明不具有唯一性的外关系集合
- *
- * 注意事项:
- * - 对于外连接，只考虑真正的连接条件(joinquals)，忽略下推的其他条件(otherquals)
- * - 缓存机制在GEQO模式和连接搜索插件中有重要作用
+ * The actual proof is undertaken by is_innerrel_unique_for(); this function
+ * is a frontend that is mainly concerned with caching the answers.
+ * In particular, the force_cache argument allows overriding the internal
+ * heuristic about whether to cache negative answers; it should be "true"
+ * if making an inquiry that is not part of the normal bottom-up join search
+ * sequence.
  */
 bool
 innerrel_is_unique(PlannerInfo *root,
@@ -1005,79 +978,86 @@ innerrel_is_unique(PlannerInfo *root,
 				   List *restrictlist,
 				   bool force_cache)
 {
-	MemoryContext old_context;  /* 用于内存上下文切换 */
-	ListCell   *lc;             /* 列表遍历指针 */
+	MemoryContext old_context;
+	ListCell   *lc;
 
-	/* 当没有连接条件时，肯定无法证明唯一性 */
+	/* Certainly can't prove uniqueness when there are no joinclauses */
 	if (restrictlist == NIL)
 		return false;
 
 	/*
-	 * 快速检查：排除明显无法证明内关系唯一性的情况。
-	 * 如果内关系本身不支持唯一性（例如包含集合返回函数），则直接返回false。
+	 * Make a quick check to eliminate cases in which we will surely be unable
+	 * to prove uniqueness of the innerrel.
 	 */
 	if (!rel_supports_distinctness(root, innerrel))
 		return false;
 
 	/*
-	 * 查询缓存：检查是否已证明内关系对于当前外关系的某个子集具有唯一性。
-	 * 由于额外的外关系不会降低内关系的唯一性，所以只需要检查是否有子集已满足条件。
+	 * Query the cache to see if we've managed to prove that innerrel is
+	 * unique for any subset of this outerrel.  We don't need an exact match,
+	 * as extra outerrels can't make the innerrel any less unique (or more
+	 * formally, the restrictlist for a join to a superset outerrel must be a
+	 * superset of the conditions we successfully used before).
 	 */
 	foreach(lc, innerrel->unique_for_rels)
 	{
 		Relids		unique_for_rels = (Relids) lfirst(lc);
 
-		/* 如果缓存中的关系集合是当前外关系的子集，则说明已满足唯一性条件 */
 		if (bms_is_subset(unique_for_rels, outerrelids))
-			return true;		/* 成功证明唯一性！ */
+			return true;		/* Success! */
 	}
 
 	/*
-	 * 反向检查：检查是否已确定当前外关系或其超集无法证明内关系的唯一性。
-	 * 如果外关系是某个已知无法证明唯一性的关系的子集，则当前也无法证明。
+	 * Conversely, we may have already determined that this outerrel, or some
+	 * superset thereof, cannot prove this innerrel to be unique.
 	 */
 	foreach(lc, innerrel->non_unique_for_rels)
 	{
 		Relids		unique_for_rels = (Relids) lfirst(lc);
 
-		/* 如果当前外关系是缓存中关系的子集，则说明无法证明唯一性 */
 		if (bms_is_subset(outerrelids, unique_for_rels))
 			return false;
 	}
 
-	/* 没有缓存信息，需要实际进行唯一性证明 */
+	/* No cached information, so try to make the proof. */
 	if (is_innerrel_unique_for(root, joinrelids, outerrelids, innerrel,
 							   jointype, restrictlist))
 	{
 		/*
-		 * 缓存正面结果供未来查询使用，确保将其保存在planner_cxt中，
-		 * 即使当前在GEQO环境中工作也是如此。
+		 * Cache the positive result for future probes, being sure to keep it
+		 * in the planner_cxt even if we are working in GEQO.
 		 *
-		 * 注意：理论上可以尝试找出证明内关系唯一的最小外关系子集，
-		 * 但这不值得额外开销，因为规划器是增量构建连接关系的，
-		 * 所以会在任何超集之前先看到最小充分的外关系。
+		 * Note: one might consider trying to isolate the minimal subset of
+		 * the outerrels that proved the innerrel unique.  But it's not worth
+		 * the trouble, because the planner builds up joinrels incrementally
+		 * and so we'll see the minimally sufficient outerrels before any
+		 * supersets of them anyway.
 		 */
 		old_context = MemoryContextSwitchTo(root->planner_cxt);
 		innerrel->unique_for_rels = lappend(innerrel->unique_for_rels,
 											bms_copy(outerrelids));
 		MemoryContextSwitchTo(old_context);
 
-		return true;			/* 成功证明唯一性！ */
+		return true;			/* Success! */
 	}
 	else
 	{
 		/*
-		 * 外关系的连接条件都无法证明内关系的唯一性，
-		 * 因此可以在未来的检查中安全地拒绝此外关系或其任何子集。
+		 * None of the join conditions for outerrel proved innerrel unique, so
+		 * we can safely reject this outerrel or any subset of it in future
+		 * checks.
 		 *
-		 * 然而，在正常规划模式下，缓存这些知识完全没有意义；
-		 * 因为我们会从小到大逐步构建连接关系，不会再查询相同的内容。
-		 * 但在GEQO模式下有用，因为这些知识可以在连续的规划尝试间传递；
-		 * 在使用连接搜索插件时也可能有用。因此当join_search_private非空时进行缓存。
-		 * （是的，这是个hack，但看起来合理。）
+		 * However, in normal planning mode, caching this knowledge is totally
+		 * pointless; it won't be queried again, because we build up joinrels
+		 * from smaller to larger.  It is useful in GEQO mode, where the
+		 * knowledge can be carried across successive planning attempts; and
+		 * it's likely to be useful when using join-search plugins, too. Hence
+		 * cache when join_search_private is non-NULL.  (Yeah, that's a hack,
+		 * but it seems reasonable.)
 		 *
-		 * 此外，允许调用者覆盖该启发式规则并强制缓存；
-		 * 这对reduce_unique_semijoins很有用，它在正常的连接搜索开始前就调用此函数。
+		 * Also, allow callers to override that heuristic and force caching;
+		 * that's useful for reduce_unique_semijoins, which calls here before
+		 * the normal join search starts.
 		 */
 		if (force_cache || root->join_search_private)
 		{
@@ -1091,7 +1071,6 @@ innerrel_is_unique(PlannerInfo *root,
 		return false;
 	}
 }
-
 
 /*
  * is_innerrel_unique_for

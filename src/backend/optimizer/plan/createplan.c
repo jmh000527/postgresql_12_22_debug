@@ -45,23 +45,31 @@
 
 
 /*
- * create_plan_recurse() 的 flags 参数可用的标志位，可以按位或组合使用。
+ * Flag bits that can appear in the flags argument of create_plan_recurse().
+ * These can be OR-ed together.
  *
- * CP_EXACT_TLIST 表示生成的计划节点必须返回与路径的 pathtarget 完全一致的目标列列表（tlist），
- * 该标志优先级高于 CP_SMALL_TLIST 和 CP_LABEL_TLIST。
- * 否则，计划节点只需返回用于计算 pathtarget 的 Vars 和 PlaceHolderVars。
+ * CP_EXACT_TLIST specifies that the generated plan node must return exactly
+ * the tlist specified by the path's pathtarget (this overrides both
+ * CP_SMALL_TLIST and CP_LABEL_TLIST, if those are set).  Otherwise, the
+ * plan node is allowed to return just the Vars and PlaceHolderVars needed
+ * to evaluate the pathtarget.
  *
- * CP_SMALL_TLIST 表示优先生成更窄的目标列列表。父节点如 Sort 和 Hash 需要存储返回的元组时会传递此标志。
+ * CP_SMALL_TLIST specifies that a narrower tlist is preferred.  This is
+ * passed down by parent nodes such as Sort and Hash, which will have to
+ * store the returned tuples.
  *
- * CP_LABEL_TLIST 表示计划节点必须返回与 pathtarget 中指定的 sortgrouprefs 匹配的列，并正确设置 ressortgroupref 标签。
- * 父节点如 Sort 和 Group 需要输入中包含这些值时会传递此标志。
+ * CP_LABEL_TLIST specifies that the plan node must return columns matching
+ * any sortgrouprefs specified in its pathtarget, with appropriate
+ * ressortgroupref labels.  This is passed down by parent nodes such as Sort
+ * and Group, which need these values to be available in their inputs.
  *
- * CP_IGNORE_TLIST 表示调用者会替换目标列列表，因此生成的 tlist 无需关心。
+ * CP_IGNORE_TLIST specifies that the caller plans to replace the targetlist,
+ * and therefore it doesn't matter a bit what target list gets generated.
  */
-#define CP_EXACT_TLIST		0x0001	/* 计划必须返回指定的目标列列表 */
-#define CP_SMALL_TLIST		0x0002	/* 优先生成更窄的目标列列表 */
-#define CP_LABEL_TLIST		0x0004	/* tlist 必须包含 sortgrouprefs 标签 */
-#define CP_IGNORE_TLIST		0x0008	/* 调用者会替换 tlist，无需关心内容 */
+#define CP_EXACT_TLIST		0x0001	/* Plan must return specified tlist */
+#define CP_SMALL_TLIST		0x0002	/* Prefer narrower tlists */
+#define CP_LABEL_TLIST		0x0004	/* tlist must contain sortgrouprefs */
+#define CP_IGNORE_TLIST		0x0008	/* caller will replace tlist */
 
 
 static Plan *create_plan_recurse(PlannerInfo *root, Path *best_path,
@@ -290,52 +298,60 @@ static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 
 /*
  * create_plan
- *	  创建查询的访问计划，通过递归处理以 'best_path' 为根的路径节点树。
- *	  对于每个路径节点，创建一个对应的计划节点，包含适当的 id、目标列列表和条件信息。
+ *	  Creates the access plan for a query by recursively processing the
+ *	  desired tree of pathnodes, starting at the node 'best_path'.  For
+ *	  every pathnode found, we create a corresponding plan node containing
+ *	  appropriate id, target list, and qualification information.
  *
- *	  计划树中的 tlist 和 quals 仍然是规划器格式，即 Vars 仍然对应解析器的编号。
- *	  这些将在 setrefs.c 中修正。
+ *	  The tlists and quals in the plan tree are still in planner format,
+ *	  ie, Vars still correspond to the parser's numbering.  This will be
+ *	  fixed later by setrefs.c.
  *
- *	  best_path 是最佳访问路径
+ *	  best_path is the best access path
  *
- *	  返回一个 Plan 计划树。
+ *	  Returns a Plan tree.
  */
 Plan *
 create_plan(PlannerInfo *root, Path *best_path)
 {
 	Plan	   *plan;
 
-	/* 当前查询级别不应使用 plan_params */
+	/* plan_params should not be in use in current query level */
 	Assert(root->plan_params == NIL);
 
-	/* 初始化 PlannerInfo 的工作区 */
+	/* Initialize this module's workspace in PlannerInfo */
 	root->curOuterRels = NULL;
 	root->curOuterParams = NIL;
 
-	/* 递归处理路径树，要求返回正确的目标列列表 */
+	/* Recursively process the path tree, demanding the correct tlist result */
 	plan = create_plan_recurse(root, best_path, CP_EXACT_TLIST);
 
 	/*
-	 * 确保最顶层计划节点的目标列列表包含原始列名和其他修饰信息。
-	 * 规划器内部生成的目标列列表不会包含这些信息，但在执行时顶层 tlist 必须有。
-	 * 但是，ModifyTable 计划节点的 tlist 不匹配查询树的目标列列表。
+	 * Make sure the topmost plan node's targetlist exposes the original
+	 * column names and other decorative info.  Targetlists generated within
+	 * the planner don't bother with that stuff, but we must have it on the
+	 * top-level tlist seen at execution time.  However, ModifyTable plan
+	 * nodes don't have a tlist matching the querytree targetlist.
 	 */
 	if (!IsA(plan, ModifyTable))
 		apply_tlist_labeling(plan->targetlist, root->processed_tlist);
 
 	/*
-	 * 将本查询级别创建的所有 initPlans 附加到最顶层计划节点。
-	 * （原则上 initplans 可以附加到任何引用它们的计划节点或更高节点，
-	 * 但没有理由放得比顶层更低。参见 SS_finalize_plan 的注释。）
+	 * Attach any initPlans created in this query level to the topmost plan
+	 * node.  (In principle the initplans could go in any plan node at or
+	 * above where they're referenced, but there seems no reason to put them
+	 * any lower than the topmost node for the query level.  Also, see
+	 * comments for SS_finalize_plan before you try to change this.)
 	 */
 	SS_attach_initplans(root, plan);
 
-	/* 检查所有 NestLoopParams 是否都成功分配到计划节点 */
+	/* Check we successfully assigned all NestLoopParams to plan nodes */
 	if (root->curOuterParams != NIL)
 		elog(ERROR, "failed to assign all NestLoopParams to plan nodes");
 
 	/*
-	 * 重置 plan_params，确保 nestloop params 使用的 param ID 不会被后续复用
+	 * Reset plan_params to ensure param IDs used for nestloop params are not
+	 * re-used later
 	 */
 	root->plan_params = NIL;
 
@@ -344,20 +360,18 @@ create_plan(PlannerInfo *root, Path *best_path)
 
 /*
  * create_plan_recurse
- *	  create_plan() 的递归核心实现。
- *	  根据 best_path 的 pathtype，递归生成对应的 Plan 节点。
+ *	  Recursive guts of create_plan().
  */
 static Plan *
 create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 {
 	Plan	   *plan;
 
-	/* 防止因计划过于复杂导致栈溢出 */
+	/* Guard against stack overflow due to overly complex plans */
 	check_stack_depth();
 
 	switch (best_path->pathtype)
 	{
-		/* 基础扫描节点 */
 		case T_SeqScan:
 		case T_SampleScan:
 		case T_IndexScan:
@@ -375,14 +389,12 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 		case T_CustomScan:
 			plan = create_scan_plan(root, best_path, flags);
 			break;
-		/* 连接节点 */
 		case T_HashJoin:
 		case T_MergeJoin:
 		case T_NestLoop:
 			plan = create_join_plan(root,
 									(JoinPath *) best_path);
 			break;
-		/* Append 相关节点 */
 		case T_Append:
 			plan = create_append_plan(root,
 									  (AppendPath *) best_path,
@@ -393,7 +405,6 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 											(MergeAppendPath *) best_path,
 											flags);
 			break;
-		/* Result 相关节点 */
 		case T_Result:
 			if (IsA(best_path, ProjectionPath))
 			{
@@ -413,23 +424,20 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			}
 			else
 			{
-				/* 简单的 RTE_RESULT 基础关系 */
+				/* Simple RTE_RESULT base relation */
 				Assert(IsA(best_path, Path));
 				plan = create_scan_plan(root, best_path, flags);
 			}
 			break;
-		/* SRF 投影节点 */
 		case T_ProjectSet:
 			plan = (Plan *) create_project_set_plan(root,
 													(ProjectSetPath *) best_path);
 			break;
-		/* 物化节点 */
 		case T_Material:
 			plan = (Plan *) create_material_plan(root,
 												 (MaterialPath *) best_path,
 												 flags);
 			break;
-		/* 唯一化节点 */
 		case T_Unique:
 			if (IsA(best_path, UpperUniquePath))
 			{
@@ -445,23 +453,19 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 										  flags);
 			}
 			break;
-		/* 并行收集节点 */
 		case T_Gather:
 			plan = (Plan *) create_gather_plan(root,
 											   (GatherPath *) best_path);
 			break;
-		/* 排序节点 */
 		case T_Sort:
 			plan = (Plan *) create_sort_plan(root,
 											 (SortPath *) best_path,
 											 flags);
 			break;
-		/* 分组节点 */
 		case T_Group:
 			plan = (Plan *) create_group_plan(root,
 											  (GroupPath *) best_path);
 			break;
-		/* 聚合节点 */
 		case T_Agg:
 			if (IsA(best_path, GroupingSetsPath))
 				plan = create_groupingsets_plan(root,
@@ -473,40 +477,33 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 												(AggPath *) best_path);
 			}
 			break;
-		/* 窗口聚合节点 */
 		case T_WindowAgg:
 			plan = (Plan *) create_windowagg_plan(root,
 												  (WindowAggPath *) best_path);
 			break;
-		/* 集合操作节点 */
 		case T_SetOp:
 			plan = (Plan *) create_setop_plan(root,
 											  (SetOpPath *) best_path,
 											  flags);
 			break;
-		/* 递归 UNION 节点 */
 		case T_RecursiveUnion:
 			plan = (Plan *) create_recursiveunion_plan(root,
 													   (RecursiveUnionPath *) best_path);
 			break;
-		/* 行锁节点 */
 		case T_LockRows:
 			plan = (Plan *) create_lockrows_plan(root,
 												 (LockRowsPath *) best_path,
 												 flags);
 			break;
-		/* DML 节点 */
 		case T_ModifyTable:
 			plan = (Plan *) create_modifytable_plan(root,
 													(ModifyTablePath *) best_path);
 			break;
-		/* Limit 节点 */
 		case T_Limit:
 			plan = (Plan *) create_limit_plan(root,
 											  (LimitPath *) best_path,
 											  flags);
 			break;
-		/* 并行归并收集节点 */
 		case T_GatherMerge:
 			plan = (Plan *) create_gather_merge_plan(root,
 													 (GatherMergePath *) best_path);
@@ -514,7 +511,7 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) best_path->pathtype);
-			plan = NULL;		/* 防止编译器警告 */
+			plan = NULL;		/* keep compiler quiet */
 			break;
 	}
 
@@ -523,7 +520,7 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 
 /*
  * create_scan_plan
- *	  为 'best_path' 的父关系创建一个扫描计划节点。
+ *	 Create a scan plan for the parent relation of 'best_path'.
  */
 static Plan *
 create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
@@ -535,12 +532,16 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 	Plan	   *plan;
 
 	/*
-	 * 提取父关系的限制条件（baserestrictinfo）。执行器必须在扫描期间应用所有这些限制，
-	 * 除了伪常量（pseudoconstant）条件，后面会单独处理。
+	 * Extract the relevant restriction clauses from the parent relation. The
+	 * executor must apply all these restrictions during the scan, except for
+	 * pseudoconstants which we'll take care of below.
 	 *
-	 * 如果是普通的索引扫描或索引仅扫描，则只考虑索引谓词未隐含的限制条件（indrestrictinfo），
-	 * 而不是 baserestrictinfo。对于位图索引扫描则不能这样做，但 create_bitmap_scan_plan
-	 * 会自动处理这些条件。
+	 * If this is a plain indexscan or index-only scan, we need not consider
+	 * restriction clauses that are implied by the index's predicate, so use
+	 * indrestrictinfo not baserestrictinfo.  Note that we can't do that for
+	 * bitmap indexscans, since there's not necessarily a single index
+	 * involved; but it doesn't matter since create_bitmap_scan_plan() will be
+	 * able to get rid of such clauses anyway via predicate proof.
 	 */
 	switch (best_path->pathtype)
 	{
@@ -554,24 +555,33 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 	}
 
 	/*
-	 * 如果是参数化扫描，还需要添加外部关系的连接条件（ppi_clauses）。
-	 * 为安全起见，不要修改原始 baserestrictinfo 列表。
+	 * If this is a parameterized scan, we also need to enforce all the join
+	 * clauses available from the outer relation(s).
+	 *
+	 * For paranoia's sake, don't modify the stored baserestrictinfo list.
 	 */
 	if (best_path->param_info)
 		scan_clauses = list_concat(list_copy(scan_clauses),
 								   best_path->param_info->ppi_clauses);
 
 	/*
-	 * 检查是否有伪常量条件需要处理。如果需要插入 gating Result 节点，则该节点可以做投影，
-	 * 所以对子计划的 tlist 没有特殊要求。
+	 * Detect whether we have any pseudoconstant quals to deal with.  Then, if
+	 * we'll need a gating Result node, it will be able to project, so there
+	 * are no requirements on the child's tlist.
 	 */
 	gating_clauses = get_gating_quals(root, scan_clauses);
 	if (gating_clauses)
 		flags = 0;
 
 	/*
-	 * 对于表扫描，优先生成包含所有物理列的 tlist（物理顺序），这样执行器可以优化投影过程。
-	 * 如果调用者会忽略 tlist，则直接设为 NULL。只有当 flags 仅为 CP_IGNORE_TLIST 时才这样做。
+	 * For table scans, rather than using the relation targetlist (which is
+	 * only those Vars actually needed by the query), we prefer to generate a
+	 * tlist containing all Vars in order.  This will allow the executor to
+	 * optimize away projection of the table tuples, if possible.
+	 *
+	 * But if the caller is going to ignore our tlist anyway, then don't
+	 * bother generating one at all.  We use an exact equality test here, so
+	 * that this only applies when CP_IGNORE_TLIST is the only flag set.
 	 */
 	if (flags == CP_IGNORE_TLIST)
 	{
@@ -581,10 +591,13 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 	{
 		if (best_path->pathtype == T_IndexOnlyScan)
 		{
-			/* 对于索引仅扫描，优先使用索引的 indextlist */
+			/* For index-only scan, the preferred tlist is the index's */
 			tlist = copyObject(((IndexPath *) best_path)->indexinfo->indextlist);
 
-			/* 如果需要，转移 sortgroupref 信息到新 tlist（use_physical_tlist 已检查可行性） */
+			/*
+			 * Transfer sortgroupref data to the replacement tlist, if
+			 * requested (use_physical_tlist checked that this will work).
+			 */
 			if (flags & CP_LABEL_TLIST)
 				apply_pathtarget_labeling_to_tlist(tlist, best_path->pathtarget);
 		}
@@ -593,12 +606,12 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 			tlist = build_physical_tlist(root, rel);
 			if (tlist == NIL)
 			{
-				/* 如果物理 tlist 构建失败（如有被删除的列），则用常规方法 */
+				/* Failed because of dropped cols, so use regular method */
 				tlist = build_path_tlist(root, best_path);
 			}
 			else
 			{
-				/* 同样转移 sortgroupref 信息 */
+				/* As above, transfer sortgroupref data to replacement tlist */
 				if (flags & CP_LABEL_TLIST)
 					apply_pathtarget_labeling_to_tlist(tlist, best_path->pathtarget);
 			}
@@ -609,9 +622,6 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 		tlist = build_path_tlist(root, best_path);
 	}
 
-	/*
-	 * 根据 best_path 的类型，调用对应的扫描计划构建函数。
-	 */
 	switch (best_path->pathtype)
 	{
 		case T_SeqScan:
@@ -731,23 +741,26 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) best_path->pathtype);
-			plan = NULL;		/* 防止编译器警告 */
+			plan = NULL;		/* keep compiler quiet */
 			break;
 	}
 
 	/*
-	 * 如果有伪常量条件，则在计划节点上方插入 gating Result 节点，
-	 * 用于一次性评估这些条件。
+	 * If there are any pseudoconstant clauses attached to this node, insert a
+	 * gating Result node that evaluates the pseudoconstants as one-time
+	 * quals.
 	 */
 	if (gating_clauses)
 		plan = create_gating_plan(root, best_path, plan, gating_clauses);
 
 	return plan;
 }
+
 /*
- * 构建路径节点的目标列列表（TargetEntry 列表）。
+ * Build a target list (ie, a list of TargetEntry) for the Path's output.
  *
- * 基本等价于 make_tlist_from_pathtarget()，但需要处理 nestloop 参数替换。
+ * This is almost just make_tlist_from_pathtarget(), but we also have to
+ * deal with replacing nestloop params.
  */
 static List *
 build_path_tlist(PlannerInfo *root, Path *path)
@@ -763,8 +776,10 @@ build_path_tlist(PlannerInfo *root, Path *path)
 		TargetEntry *tle;
 
 		/*
-		 * 如果是参数化路径，tlist 可能包含外部引用，需要替换为 nestloop 参数。
-		 * 无需重新构造 TargetEntry，只需对每个表达式单独处理即可。
+		 * If it's a parameterized path, there might be lateral references in
+		 * the tlist, which need to be replaced with Params.  There's no need
+		 * to remake the TargetEntry nodes, so apply this to each list item
+		 * separately.
 		 */
 		if (path->param_info)
 			node = replace_nestloop_params(root, node);
@@ -784,10 +799,8 @@ build_path_tlist(PlannerInfo *root, Path *path)
 
 /*
  * use_physical_tlist
- *		判断是否可以使用与物理表结构一致的目标列列表（tlist），
- *		而不是仅包含实际引用的 Vars。
- *
- *		返回 true 表示可以直接使用物理 tlist，无需额外投影。
+ *		Decide whether to use a tlist matching relation structure,
+ *		rather than only those Vars actually referenced.
  */
 static bool
 use_physical_tlist(PlannerInfo *root, Path *path, int flags)
@@ -797,14 +810,14 @@ use_physical_tlist(PlannerInfo *root, Path *path, int flags)
 	ListCell   *lc;
 
 	/*
-	 * 如果要求精确 tlist 或更窄 tlist，则不能使用物理 tlist。
+	 * Forget it if either exact tlist or small tlist is demanded.
 	 */
 	if (flags & (CP_EXACT_TLIST | CP_SMALL_TLIST))
 		return false;
 
 	/*
-	 * 仅对基础关系扫描、子查询扫描、函数扫描、TableFunc 扫描、Values 扫描和 CTE 扫描有效，
-	 * 连接等其他类型不能直接用物理 tlist。
+	 * We can do this for real relation scans, subquery scans, function scans,
+	 * tablefunc scans, values scans, and CTE scans (but not for, eg, joins).
 	 */
 	if (rel->rtekind != RTE_RELATION &&
 		rel->rtekind != RTE_SUBQUERY &&
@@ -815,26 +828,35 @@ use_physical_tlist(PlannerInfo *root, Path *path, int flags)
 		return false;
 
 	/*
-	 * 继承场景下不能用物理 tlist（主要因为 Append 节点不做投影）。
+	 * Can't do it with inheritance cases either (mainly because Append
+	 * doesn't project; this test may be unnecessary now that
+	 * create_append_plan instructs its children to return an exact tlist).
 	 */
 	if (rel->reloptkind != RELOPT_BASEREL)
 		return false;
 
 	/*
-	 * 对于自定义路径（CustomPath），不使用物理 tlist。
+	 * Also, don't do it to a CustomPath; the premise that we're extracting
+	 * columns from a simple physical tuple is unlikely to hold for those.
+	 * (When it does make sense, the custom path creator can set up the path's
+	 * pathtarget that way.)
 	 */
 	if (IsA(path, CustomPath))
 		return false;
 
 	/*
-	 * 如果 BitmapHeapPath 的 tlist 为空，则保持原样，不用物理 tlist。
+	 * If a bitmap scan's tlist is empty, keep it as-is.  This may allow the
+	 * executor to skip heap page fetches, and in any case, the benefit of
+	 * using a physical tlist instead would be minimal.
 	 */
 	if (IsA(path, BitmapHeapPath) &&
 		path->pathtarget->exprs == NIL)
 		return false;
 
 	/*
-	 * 如果请求了系统列或 whole-row Vars，则不能用物理 tlist。
+	 * Can't do it if any system columns or whole-row Vars are requested.
+	 * (This could possibly be fixed but would take some fragile assumptions
+	 * in setrefs.c, I think.)
 	 */
 	for (i = rel->min_attr; i <= 0; i++)
 	{
@@ -843,7 +865,8 @@ use_physical_tlist(PlannerInfo *root, Path *path, int flags)
 	}
 
 	/*
-	 * 如果需要输出任何 placeholder 表达式，也不能用物理 tlist。
+	 * Can't do it if the rel is required to emit any placeholder expressions,
+	 * either.
 	 */
 	foreach(lc, root->placeholder_list)
 	{
@@ -855,7 +878,9 @@ use_physical_tlist(PlannerInfo *root, Path *path, int flags)
 	}
 
 	/*
-	 * 对于索引仅扫描，只有所有索引列都可返回时才能用 indextlist 作为物理 tlist。
+	 * For an index-only scan, the "physical tlist" is the index's indextlist.
+	 * We can only return that without a projection if all the index's columns
+	 * are returnable.
 	 */
 	if (path->pathtype == T_IndexOnlyScan)
 	{
@@ -869,7 +894,13 @@ use_physical_tlist(PlannerInfo *root, Path *path, int flags)
 	}
 
 	/*
-	 * 如果要求 CP_LABEL_TLIST，且 sort/group 列不是简单 Var，或有重复 Var，则不能用物理 tlist。
+	 * Also, can't do it if CP_LABEL_TLIST is specified and path is requested
+	 * to emit any sort/group columns that are not simple Vars.  (If they are
+	 * simple Vars, they should appear in the physical tlist, and
+	 * apply_pathtarget_labeling_to_tlist will take care of getting them
+	 * labeled again.)	We also have to check that no two sort/group columns
+	 * are the same Var, else that element of the physical tlist would need
+	 * conflicting ressortgroupref labels.
 	 */
 	if ((flags & CP_LABEL_TLIST) && path->pathtarget->sortgrouprefs)
 	{
@@ -981,9 +1012,11 @@ create_gating_plan(PlannerInfo *root, Path *path, Plan *plan,
 
 	return gplan;
 }
+
 /*
  * create_join_plan
- *	  为 'best_path' 创建一个连接计划节点，并递归处理其内外路径。
+ *	  Create a join plan for 'best_path' and (recursively) plans for its
+ *	  inner and outer paths.
  */
 static Plan *
 create_join_plan(PlannerInfo *root, JoinPath *best_path)
@@ -1008,13 +1041,14 @@ create_join_plan(PlannerInfo *root, JoinPath *best_path)
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) best_path->path.pathtype);
-			plan = NULL;		/* 防止编译器警告 */
+			plan = NULL;		/* keep compiler quiet */
 			break;
 	}
 
 	/*
-	 * 如果该节点有伪常量条件，则在计划节点上方插入 gating Result 节点，
-	 * 用于一次性评估这些条件。
+	 * If there are any pseudoconstant clauses attached to this node, insert a
+	 * gating Result node that evaluates the pseudoconstants as one-time
+	 * quals.
 	 */
 	gating_clauses = get_gating_quals(root, best_path->joinrestrictinfo);
 	if (gating_clauses)
@@ -1022,10 +1056,11 @@ create_join_plan(PlannerInfo *root, JoinPath *best_path)
 								  gating_clauses);
 
 #ifdef NOT_USED
+
 	/*
-	 * 代价高的函数上拉可能会将本地谓词拉到该路径节点，
-	 * 需要将其放入计划节点的 qpqual 中。
-	 * JMH, 6/15/92
+	 * * Expensive function pullups may have pulled local predicates * into
+	 * this path node.  Put them in the qpqual of the plan node. * JMH,
+	 * 6/15/92
 	 */
 	if (get_loc_restrictinfo(best_path) != NIL)
 		set_qpqual((Plan) plan,
@@ -1457,53 +1492,39 @@ create_project_set_plan(PlannerInfo *root, ProjectSetPath *best_path)
 }
 
 /*
- * create_material_plan - 创建物化(Material)计划节点
+ * create_material_plan
+ *	  Create a Material plan for 'best_path' and (recursively) plans
+ *	  for its subpaths.
  *
- * 该函数负责为给定的MaterialPath创建对应的Material计划节点，
- * 并递归地为其子路径创建计划节点。物化操作用于缓存中间结果集，
- * 避免重复计算或多次扫描同一数据源，特别是在需要多次访问同一结果集的场景中
- * (如子查询、窗口函数或连接操作中)。
- *
- * 参数说明：
- *   root: 查询规划器的根节点，包含整个查询的规划信息
- *   best_path: 要转换为计划节点的MaterialPath路径
- *   flags: 控制计划创建行为的标志位
- *
- * 返回值：
- *   创建好的Material计划节点
+ *	  Returns a Plan node.
  */
 static Material *
 create_material_plan(PlannerInfo *root, MaterialPath *best_path, int flags)
 {
-	Material   *plan;      /* 最终创建的物化计划节点 */
-	Plan	   *subplan;   /* 子路径对应的计划节点 */
+	Material   *plan;
+	Plan	   *subplan;
 
 	/*
-	 * 性能优化：由于物化操作会将整个结果集缓存到内存或磁盘中，
-	 * 我们希望尽可能减少物化元组中的列数，以节省存储空间和IO开销。
-	 * 因此，通过设置CP_SMALL_TLIST标志，请求子路径生成最小化的目标列表，禁止添加额外的列。
-	 * 
-	 * 注意：Material节点本身不执行投影操作(不能修改目标列表)，
-	 * 所以目标列表的要求会直接传递给子路径。
+	 * We don't want any excess columns in the materialized tuples, so request
+	 * a smaller tlist.  Otherwise, since Material doesn't project, tlist
+	 * requirements pass through.
 	 */
 	subplan = create_plan_recurse(root, best_path->subpath,
-					  flags | CP_SMALL_TLIST);
+								  flags | CP_SMALL_TLIST);
 
-	/* 创建物化计划节点，将子计划作为其输入 */
 	plan = make_material(subplan);
 
-	/* 从路径节点复制通用的路径信息到计划节点，包括成本、行数估计等 */
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
 	return plan;
 }
 
-
 /*
  * create_unique_plan
- *	  为 'best_path' 创建一个 Unique 计划节点，并递归处理其子路径。
+ *	  Create a Unique plan for 'best_path' and (recursively) plans
+ *	  for its subpaths.
  *
- *	  返回一个 Plan 节点。
+ *	  Returns a Plan node.
  */
 static Plan *
 create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
@@ -1521,31 +1542,37 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 	int			groupColPos;
 	ListCell   *l;
 
-	/* Unique 节点不做投影，tlist 要求直接传递 */
+	/* Unique doesn't project, so tlist requirements pass through */
 	subplan = create_plan_recurse(root, best_path->subpath, flags);
 
-	/* 如果不需要实际去重，直接返回子计划 */
+	/* Done if we don't need to do any actual unique-ifying */
 	if (best_path->umethod == UNIQUE_PATH_NOOP)
 		return subplan;
 
 	/*
-	 * 子计划的 tlist 只包含本层和上层需要的 Vars。我们需要对这些变量做唯一化处理，
-	 * 但唯一化的表达式可能是这些变量的组合表达式，因此需要将这些表达式加入到 tlist。
+	 * As constructed, the subplan has a "flat" tlist containing just the Vars
+	 * needed here and at upper levels.  The values we are supposed to
+	 * unique-ify may be expressions in these variables.  We have to add any
+	 * such expressions to the subplan's tlist.
 	 *
-	 * 如果子计划是简单扫描，可能有 "物理" tlist。如果需要排序，则应缩减为常规 tlist，
-	 * 以避免排序多余数据。对于哈希去重，如果需要添加表达式，则运行时也需要投影，
-	 * 所以也可以去掉不需要的项。因此 newtlist 从 build_path_tlist() 开始，
-	 * 只有排序或需要添加表达式时才安装到 subplan。
+	 * The subplan may have a "physical" tlist if it is a simple scan plan. If
+	 * we're going to sort, this should be reduced to the regular tlist, so
+	 * that we don't sort more data than we need to.  For hashing, the tlist
+	 * should be left as-is if we don't need to add any expressions; but if we
+	 * do have to add expressions, then a projection step will be needed at
+	 * runtime anyway, so we may as well remove unneeded items. Therefore
+	 * newtlist starts from build_path_tlist() not just a copy of the
+	 * subplan's tlist; and we don't install it into the subplan unless we are
+	 * sorting or stuff has to be added.
 	 */
 	in_operators = best_path->in_operators;
 	uniq_exprs = best_path->uniq_exprs;
 
-	/* 初始化新的 tlist，仅包含“必须”的变量 */
+	/* initialize modified subplan tlist as just the "required" vars */
 	newtlist = build_path_tlist(root, &best_path->path);
 	nextresno = list_length(newtlist) + 1;
 	newitems = false;
 
-	/* 将唯一化表达式加入 tlist */
 	foreach(l, uniq_exprs)
 	{
 		Expr	   *uniqexpr = lfirst(l);
@@ -1564,14 +1591,16 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 		}
 	}
 
-	/* 如果需要插入 Result 节点，则用 change_plan_targetlist 包装 */
+	/* Use change_plan_targetlist in case we need to insert a Result node */
 	if (newitems || best_path->umethod == UNIQUE_PATH_SORT)
 		subplan = change_plan_targetlist(subplan, newtlist,
 										 best_path->path.parallel_safe);
 
 	/*
-	 * 构建分组控制信息，指示哪些输出列需要分组。不能和上面循环合并，
-	 * 因为此时才确定最终使用的 tlist。
+	 * Build control information showing which subplan output columns are to
+	 * be examined by the grouping step.  Unfortunately we can't merge this
+	 * with the previous loop, since we didn't then know which version of the
+	 * subplan tlist we'd end up using.
 	 */
 	newtlist = subplan->targetlist;
 	numGroupCols = list_length(uniq_exprs);
@@ -1585,7 +1614,7 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 		TargetEntry *tle;
 
 		tle = tlist_member(uniqexpr, newtlist);
-		if (!tle)				/* 不应该发生 */
+		if (!tle)				/* shouldn't happen */
 			elog(ERROR, "failed to find unique expression in subplan tlist");
 		groupColIdx[groupColPos] = tle->resno;
 		groupCollations[groupColPos] = exprCollation((Node *) tle->expr);
@@ -1597,8 +1626,10 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 		Oid		   *groupOperators;
 
 		/*
-		 * 获取 Agg 节点需要的哈希等值操作符。通常与 IN 操作符一致，
-		 * 但如果是跨类型操作符，则等值操作符为 IN 操作符右侧类型的等值操作符。
+		 * Get the hashable equality operators for the Agg node to use.
+		 * Normally these are the same as the IN clause operators, but if
+		 * those are cross-type operators then the equality operators are the
+		 * ones for the IN clause operators' RHS datatype.
 		 */
 		groupOperators = (Oid *) palloc(numGroupCols * sizeof(Oid));
 		groupColPos = 0;
@@ -1614,7 +1645,9 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 		}
 
 		/*
-		 * Agg 节点会做投影，因此可以给它最小输出 tlist，不需要加到 subplan tlist 的额外项。
+		 * Since the Agg node is going to project anyway, we can give it the
+		 * minimum output tlist, without any stuff we might have added to the
+		 * subplan tlist.
 		 */
 		plan = (Plan *) make_agg(build_path_tlist(root, &best_path->path),
 								 NIL,
@@ -1634,7 +1667,7 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 		List	   *sortList = NIL;
 		Sort	   *sort;
 
-		/* 构建 ORDER BY 列表，使输入排序兼容 */
+		/* Create an ORDER BY list to sort the input compatibly */
 		groupColPos = 0;
 		foreach(l, in_operators)
 		{
@@ -1645,16 +1678,18 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 			SortGroupClause *sortcl;
 
 			sortop = get_ordering_op_for_equality_op(in_oper, false);
-			if (!OidIsValid(sortop))	/* 不应该发生 */
+			if (!OidIsValid(sortop))	/* shouldn't happen */
 				elog(ERROR, "could not find ordering operator for equality operator %u",
 					 in_oper);
 
 			/*
-			 * Unique 节点需要等值操作符。通常与 IN 操作符一致，
-			 * 但如果是跨类型操作符，则等值操作符为排序操作符的等值操作符。
+			 * The Unique node will need equality operators.  Normally these
+			 * are the same as the IN clause operators, but if those are
+			 * cross-type operators then the equality operators are the ones
+			 * for the IN clause operators' RHS datatype.
 			 */
 			eqop = get_equality_op_for_ordering_op(sortop, NULL);
-			if (!OidIsValid(eqop))	/* 不应该发生 */
+			if (!OidIsValid(eqop))	/* shouldn't happen */
 				elog(ERROR, "could not find equality operator for ordering operator %u",
 					 sortop);
 
@@ -1668,7 +1703,7 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 			sortcl->eqop = eqop;
 			sortcl->sortop = sortop;
 			sortcl->nulls_first = false;
-			sortcl->hashable = false;	/* 无需准确 */
+			sortcl->hashable = false;	/* no need to make this accurate */
 			sortList = lappend(sortList, sortcl);
 			groupColPos++;
 		}
@@ -1677,7 +1712,7 @@ create_unique_plan(PlannerInfo *root, UniquePath *best_path, int flags)
 		plan = (Plan *) make_unique_from_sortclauses((Plan *) sort, sortList);
 	}
 
-	/* 从 Path 复制成本信息到 Plan */
+	/* Copy cost data from Path to Plan */
 	copy_generic_path_info(plan, &best_path->path);
 
 	return plan;
@@ -2044,9 +2079,9 @@ create_upper_unique_plan(PlannerInfo *root, UpperUniquePath *best_path, int flag
 
 /*
  * create_agg_plan
- *	  为 'best_path' 创建一个 Agg 计划节点，并递归处理其子路径。
  *
- *	  返回一个 Agg 节点。
+ *	  Create an Agg plan for 'best_path' and (recursively) plans
+ *	  for its subpaths.
  */
 static Agg *
 create_agg_plan(PlannerInfo *root, AggPath *best_path)
@@ -2057,18 +2092,15 @@ create_agg_plan(PlannerInfo *root, AggPath *best_path)
 	List	   *quals;
 
 	/*
-	 * Agg 节点可以做投影，因此对子计划的 tlist 不需要严格要求，
-	 * 但需要保证分组列可用。
+	 * Agg can project, so no need to be terribly picky about child tlist, but
+	 * we do need grouping columns to be available
 	 */
 	subplan = create_plan_recurse(root, best_path->subpath, CP_LABEL_TLIST);
 
-	/* 构建目标列列表 */
 	tlist = build_path_tlist(root, &best_path->path);
 
-	/* 对聚合条件进行排序优化 */
 	quals = order_qual_clauses(root, best_path->qual);
 
-	/* 构建 Agg 计划节点 */
 	plan = make_agg(tlist, quals,
 					best_path->aggstrategy,
 					best_path->aggsplit,
@@ -2083,7 +2115,6 @@ create_agg_plan(PlannerInfo *root, AggPath *best_path)
 					best_path->numGroups,
 					subplan);
 
-	/* 从 Path 复制成本信息到 Plan */
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
 	return plan;
@@ -2294,8 +2325,8 @@ create_groupingsets_plan(PlannerInfo *root, GroupingSetsPath *best_path)
 /*
  * create_minmaxagg_plan
  *
- *	  为 'best_path' 创建一个 Result 计划节点，并递归处理其子路径。
- *	  该函数用于处理 MIN/MAX 聚合优化路径。
+ *	  Create a Result plan for 'best_path' and (recursively) plans
+ *	  for its subpaths.
  */
 static Result *
 create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
@@ -2304,7 +2335,7 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 	List	   *tlist;
 	ListCell   *lc;
 
-	/* 为每个聚合的子查询准备一个 InitPlan。 */
+	/* Prepare an InitPlan for each aggregate's subquery. */
 	foreach(lc, best_path->mmaggregates)
 	{
 		MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
@@ -2313,8 +2344,10 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 		Plan	   *plan;
 
 		/*
-		 * 生成子查询的计划。我们已经有了 Path，但需要将其转换为 Plan，并在其上方添加 LIMIT 节点。
-		 * 由于进入了不同的 planner 上下文（subroot），需要递归调用 create_plan 而不是 create_plan_recurse。
+		 * Generate the plan for the subquery. We already have a Path, but we
+		 * have to convert it to a Plan and attach a LIMIT node above it.
+		 * Since we are entering a different planner context (subroot),
+		 * recurse to create_plan not create_plan_recurse.
 		 */
 		plan = create_plan(subroot, mminfo->path);
 
@@ -2322,7 +2355,7 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 								   subparse->limitOffset,
 								   subparse->limitCount);
 
-		/* 必须为 Limit 节点应用正确的成本和宽度信息 */
+		/* Must apply correct cost/width data to Limit node */
 		plan->startup_cost = mminfo->path->startup_cost;
 		plan->total_cost = mminfo->pathcost;
 		plan->plan_rows = 1;
@@ -2330,11 +2363,11 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 		plan->parallel_aware = false;
 		plan->parallel_safe = mminfo->path->parallel_safe;
 
-		/* 将该计划转换为外层查询的 InitPlan。 */
+		/* Convert the plan into an InitPlan in the outer query. */
 		SS_make_initplan_from_plan(root, subroot, plan, mminfo->param);
 	}
 
-	/* 生成输出计划 —— 基本上只是一个 Result 节点 */
+	/* Generate the output plan --- basically just a Result */
 	tlist = build_path_tlist(root, &best_path->path);
 
 	plan = make_result(tlist, (Node *) best_path->quals, NULL);
@@ -2342,12 +2375,14 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
 	/*
-	 * 在 setrefs.c 阶段，需要将对 Agg 节点的引用替换为 InitPlan 的输出参数。
-	 * （不能仅在 MinMaxAgg 节点本地替换，因为上层路径节点也可能有 Agg 引用。）
-	 * 保存 mmaggregates 列表以便 setrefs.c 处理。
+	 * During setrefs.c, we'll need to replace references to the Agg nodes
+	 * with InitPlan output params.  (We can't just do that locally in the
+	 * MinMaxAgg node, because path nodes above here may have Agg references
+	 * as well.)  Save the mmaggregates list to tell setrefs.c to do that.
 	 *
-	 * 如果处于继承子树中则不适用（见 create_modifytable_plan 的注释）。
-	 * 幸运的是，UPDATE/DELETE 不会有聚合，因此这里可以断言。
+	 * This doesn't work if we're in an inheritance subtree (see notes in
+	 * create_modifytable_plan).  Fortunately we can't be because there would
+	 * never be aggregates in an UPDATE/DELETE; but let's Assert that.
 	 */
 	Assert(root->inhTargetKind == INHKIND_NONE);
 	Assert(root->minmax_aggs == NIL);
@@ -2648,10 +2683,11 @@ create_limit_plan(PlannerInfo *root, LimitPath *best_path, int flags)
  *
  *****************************************************************************/
 
+
 /*
  * create_seqscan_plan
- *	 为 'best_path' 扫描的基础关系生成一个顺序扫描计划节点，
- *	 使用限制条件 'scan_clauses' 和目标列列表 'tlist'。
+ *	 Returns a seqscan plan for the base relation scanned by 'best_path'
+ *	 with restriction clauses 'scan_clauses' and targetlist 'tlist'.
  */
 static SeqScan *
 create_seqscan_plan(PlannerInfo *root, Path *best_path,
@@ -2660,32 +2696,27 @@ create_seqscan_plan(PlannerInfo *root, Path *best_path,
 	SeqScan    *scan_plan;
 	Index		scan_relid = best_path->parent->relid;
 
-	/* 应该是一个基础关系 */
+	/* it should be a base rel... */
 	Assert(scan_relid > 0);
 	Assert(best_path->parent->rtekind == RTE_RELATION);
 
-	/* 将限制条件按最佳执行顺序排序 */
+	/* Sort clauses into best execution order */
 	scan_clauses = order_qual_clauses(root, scan_clauses);
 
-	/* 将 RestrictInfo 列表简化为表达式列表，忽略伪常量 */
+	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
-	/*
-	 * 如果有参数化路径，则替换外部关系变量为 nestloop 参数
-	 * Var、PlaceHolderVar等类型变换。
-	 */
+	/* Replace any outer-relation variables with nestloop params */
 	if (best_path->param_info)
 	{
 		scan_clauses = (List *)
 			replace_nestloop_params(root, (Node *) scan_clauses);
 	}
 
-	/* 构建顺序扫描计划节点 */
 	scan_plan = make_seqscan(tlist,
 							 scan_clauses,
 							 scan_relid);
 
-	/* 从 Path 复制成本信息到 Plan */
 	copy_generic_path_info(&scan_plan->plan, best_path);
 
 	return scan_plan;
@@ -2693,8 +2724,8 @@ create_seqscan_plan(PlannerInfo *root, Path *best_path,
 
 /*
  * create_samplescan_plan
- *	 为 'best_path' 扫描的基础关系生成一个采样扫描计划节点，
- *	 使用限制条件 'scan_clauses' 和目标列列表 'tlist'。
+ *	 Returns a samplescan plan for the base relation scanned by 'best_path'
+ *	 with restriction clauses 'scan_clauses' and targetlist 'tlist'.
  */
 static SampleScan *
 create_samplescan_plan(PlannerInfo *root, Path *best_path,
@@ -2705,20 +2736,20 @@ create_samplescan_plan(PlannerInfo *root, Path *best_path,
 	RangeTblEntry *rte;
 	TableSampleClause *tsc;
 
-	/* 应该是一个带有采样子句的基础关系 */
+	/* it should be a base rel with a tablesample clause... */
 	Assert(scan_relid > 0);
 	rte = planner_rt_fetch(scan_relid, root);
 	Assert(rte->rtekind == RTE_RELATION);
 	tsc = rte->tablesample;
 	Assert(tsc != NULL);
 
-	/* 将限制条件按最佳执行顺序排序 */
+	/* Sort clauses into best execution order */
 	scan_clauses = order_qual_clauses(root, scan_clauses);
 
-	/* 将 RestrictInfo 列表简化为表达式列表，忽略伪常量 */
+	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
-	/* 如果有参数化路径，则替换外部关系变量为 nestloop 参数 */
+	/* Replace any outer-relation variables with nestloop params */
 	if (best_path->param_info)
 	{
 		scan_clauses = (List *)
@@ -2727,13 +2758,11 @@ create_samplescan_plan(PlannerInfo *root, Path *best_path,
 			replace_nestloop_params(root, (Node *) tsc);
 	}
 
-	/* 构建采样扫描计划节点 */
 	scan_plan = make_samplescan(tlist,
 								scan_clauses,
 								scan_relid,
 								tsc);
 
-	/* 从 Path 复制成本信息到 Plan */
 	copy_generic_path_info(&scan_plan->scan.plan, best_path);
 
 	return scan_plan;
@@ -2741,191 +2770,201 @@ create_samplescan_plan(PlannerInfo *root, Path *best_path,
 
 /*
  * create_indexscan_plan
- *    为best_path扫描的基础关系创建一个索引扫描计划，
- *    使用限制条件scan_clauses和目标列表tlist。
+ *	  Returns an indexscan plan for the base relation scanned by 'best_path'
+ *	  with restriction clauses 'scan_clauses' and targetlist 'tlist'.
  *
- * 我们使用此函数来构建普通索引扫描(IndexScan)和仅索引扫描(IndexOnlyScan)，
- * 因为两者的条件预处理工作是相同的。注意，由调用者告诉我们要构建哪一种，
- * 我们不查看best_path->path.pathtype，因为create_bitmap_subplan需要能够覆盖先前的决定。
+ * We use this for both plain IndexScans and IndexOnlyScans, because the
+ * qual preprocessing work is the same for both.  Note that the caller tells
+ * us which to build --- we don't look at best_path->path.pathtype, because
+ * create_bitmap_subplan needs to be able to override the prior decision.
  */
 static Scan *
-create_indexscan_plan(PlannerInfo *root,          /* 查询规划器的全局信息 */
-                      IndexPath *best_path,       /* 选择的索引路径 */
-                      List *tlist,                /* 目标列表（要检索的列） */
-                      List *scan_clauses,         /* 应用于此关系的限制条件列表 */
-                      bool indexonly)             /* 是否创建仅索引扫描 */
+create_indexscan_plan(PlannerInfo *root,
+					  IndexPath *best_path,
+					  List *tlist,
+					  List *scan_clauses,
+					  bool indexonly)
 {
-    Scan       *scan_plan;                      /* 最终生成的扫描计划节点 */
-    List       *indexclauses = best_path->indexclauses; /* 可用于索引扫描的条件 */
-    List       *indexorderbys = best_path->indexorderbys; /* 用于索引排序的表达式 */
-    Index      baserelid = best_path->path.parent->relid; /* 基表的关系ID */
-    IndexOptInfo *indexinfo = best_path->indexinfo; /* 索引的优化信息 */
-    Oid        indexoid = indexinfo->indexoid;  /* 索引的OID */
-    List       *qpqual;                         /* 传给执行器的查询谓词 */
-    List       *stripped_indexquals;            /* 去除RestrictInfo后的索引条件 */
-    List       *fixed_indexquals;               /* 替换为索引Var后的索引条件 */
-    List       *fixed_indexorderbys;            /* 修复后的索引ORDER BY表达式 */
-    List       *indexorderbyops = NIL;          /* ORDER BY表达式的排序操作符 */
-    ListCell   *l;                              /* 用于遍历列表的临时变量 */
+	Scan	   *scan_plan;
+	List	   *indexclauses = best_path->indexclauses;
+	List	   *indexorderbys = best_path->indexorderbys;
+	Index		baserelid = best_path->path.parent->relid;
+	IndexOptInfo *indexinfo = best_path->indexinfo;
+	Oid			indexoid = indexinfo->indexoid;
+	List	   *qpqual;
+	List	   *stripped_indexquals;
+	List	   *fixed_indexquals;
+	List	   *fixed_indexorderbys;
+	List	   *indexorderbyops = NIL;
+	ListCell   *l;
 
-    /* 验证这是一个基础关系... */
-    Assert(baserelid > 0);
-    Assert(best_path->path.parent->rtekind == RTE_RELATION);
+	/* it should be a base rel... */
+	Assert(baserelid > 0);
+	Assert(best_path->path.parent->rtekind == RTE_RELATION);
 
-    /*
-     * 从IndexClauses列表中提取索引条件表达式（去除RestrictInfo包装），
-     * 并准备一个将表Var替换为索引Var的副本。
-     * （此步骤还在fixed_indexquals上执行replace_nestloop_params）
-     */
-    fix_indexqual_references(root, best_path,
-                            &stripped_indexquals,
-                            &fixed_indexquals);
+	/*
+	 * Extract the index qual expressions (stripped of RestrictInfos) from the
+	 * IndexClauses list, and prepare a copy with index Vars substituted for
+	 * table Vars.  (This step also does replace_nestloop_params on the
+	 * fixed_indexquals.)
+	 */
+	fix_indexqual_references(root, best_path,
+							 &stripped_indexquals,
+							 &fixed_indexquals);
 
-    /*
-     * 同样修复ORDER BY表达式中的索引属性引用
-     */
-    fixed_indexorderbys = fix_indexorderby_references(root, best_path);
+	/*
+	 * Likewise fix up index attr references in the ORDER BY expressions.
+	 */
+	fixed_indexorderbys = fix_indexorderby_references(root, best_path);
 
-    /*
-     * qpqual列表必须包含所有不能由索引自动处理的限制条件，
-     * 除了伪常量条件，后者将由单独的门控计划节点处理。
-     * indexquals中的所有谓词都将被检查（由索引本身或nodeIndexscan.c），
-     * 但如果涉及任何"特殊"操作符，则必须将它们包含在qpqual中。
-     * 结果是qpqual必须包含scan_clauses中不在indexquals中的部分。
-     *
-     * is_redundant_with_indexclauses()检测扫描条件出现在indexclauses列表中，
-     * 或者是从与某些索引条件相同的等价类(EquivalenceClass)生成的情况，
-     * 因此尽管不相等，但与indexclauses冗余。
-     * （后者发生在indxpath.c偏好不同于generate_join_implied_equalities为参数化扫描的
-     * ppi_clauses选择的派生等式时。）注意，它不会匹配有损索引条件，
-     * 这很关键，因为在那种情况下我们必须在qpqual中包含原始条件。
-     *
-     * 在某些情况下（特别是带有OR的索引条件），我们可能有不等于但在逻辑上
-     * 被索引条件隐含的scan_clauses；因此我们也尝试使用predicate_implied_by()
-     * 检查，看看是否可以通过这种方式丢弃条件。（predicate_implied_by假设其
-     * 第一个输入只包含不可变函数，所以我们必须检查这一点。）
-     *
-     * 注意：如果你更改这段代码，你也应该查看costsize.c中的extract_nonindex_conditions()。
-     */
-    qpqual = NIL;
-    foreach(l, scan_clauses)
-    {
-        RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+	/*
+	 * The qpqual list must contain all restrictions not automatically handled
+	 * by the index, other than pseudoconstant clauses which will be handled
+	 * by a separate gating plan node.  All the predicates in the indexquals
+	 * will be checked (either by the index itself, or by nodeIndexscan.c),
+	 * but if there are any "special" operators involved then they must be
+	 * included in qpqual.  The upshot is that qpqual must contain
+	 * scan_clauses minus whatever appears in indexquals.
+	 *
+	 * is_redundant_with_indexclauses() detects cases where a scan clause is
+	 * present in the indexclauses list or is generated from the same
+	 * EquivalenceClass as some indexclause, and is therefore redundant with
+	 * it, though not equal.  (The latter happens when indxpath.c prefers a
+	 * different derived equality than what generate_join_implied_equalities
+	 * picked for a parameterized scan's ppi_clauses.)  Note that it will not
+	 * match to lossy index clauses, which is critical because we have to
+	 * include the original clause in qpqual in that case.
+	 *
+	 * In some situations (particularly with OR'd index conditions) we may
+	 * have scan_clauses that are not equal to, but are logically implied by,
+	 * the index quals; so we also try a predicate_implied_by() check to see
+	 * if we can discard quals that way.  (predicate_implied_by assumes its
+	 * first input contains only immutable functions, so we have to check
+	 * that.)
+	 *
+	 * Note: if you change this bit of code you should also look at
+	 * extract_nonindex_conditions() in costsize.c.
+	 */
+	qpqual = NIL;
+	foreach(l, scan_clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
 
-        if (rinfo->pseudoconstant)
-			continue;           /* 我们可以在这里丢弃伪常量 */
-		
+		if (rinfo->pseudoconstant)
+			continue;			/* we may drop pseudoconstants here */
 		if (is_redundant_with_indexclauses(rinfo, indexclauses))
-			continue;           /* 重复的或源自相同等价类 */
-		
-		if (!contain_mutable_functions((Node*)rinfo->clause) &&
-            predicate_implied_by(list_make1(rinfo->clause), stripped_indexquals, false))
-			continue;           /* 被索引条件逻辑隐含 */
-		
+			continue;			/* dup or derived from same EquivalenceClass */
+		if (!contain_mutable_functions((Node *) rinfo->clause) &&
+			predicate_implied_by(list_make1(rinfo->clause), stripped_indexquals,
+								 false))
+			continue;			/* provably implied by indexquals */
 		qpqual = lappend(qpqual, rinfo);
-    }
+	}
 
-    /* 将条件按最佳执行顺序排序 */
-    qpqual = order_qual_clauses(root, qpqual);
+	/* Sort clauses into best execution order */
+	qpqual = order_qual_clauses(root, qpqual);
 
-    /* 将RestrictInfo列表简化为裸表达式；忽略伪常量 */
-    qpqual = extract_actual_clauses(qpqual, false);
+	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
+	qpqual = extract_actual_clauses(qpqual, false);
 
-    /*
-     * 我们必须在indexqualorig、qpqual和indexorderbyorig表达式中
-     * 将外部关系变量替换为嵌套循环参数。这有点麻烦，需要与fix_indexqual_references
-     * 中的处理分开进行——在泛化内部索引扫描支持时重新考虑这一点。
-     * 但请注意，我们不能真的更早地执行此操作，因为这会破坏上面与谓词的比较...
-     * （或者不会？那些不会有外部引用）
-     */
-    if (best_path->path.param_info)
-    {
-        stripped_indexquals = (List *)
-            replace_nestloop_params(root, (Node *) stripped_indexquals);
-        qpqual = (List *)
-            replace_nestloop_params(root, (Node *) qpqual);
-        indexorderbys = (List *)
-            replace_nestloop_params(root, (Node *) indexorderbys);
-    }
+	/*
+	 * We have to replace any outer-relation variables with nestloop params in
+	 * the indexqualorig, qpqual, and indexorderbyorig expressions.  A bit
+	 * annoying to have to do this separately from the processing in
+	 * fix_indexqual_references --- rethink this when generalizing the inner
+	 * indexscan support.  But note we can't really do this earlier because
+	 * it'd break the comparisons to predicates above ... (or would it?  Those
+	 * wouldn't have outer refs)
+	 */
+	if (best_path->path.param_info)
+	{
+		stripped_indexquals = (List *)
+			replace_nestloop_params(root, (Node *) stripped_indexquals);
+		qpqual = (List *)
+			replace_nestloop_params(root, (Node *) qpqual);
+		indexorderbys = (List *)
+			replace_nestloop_params(root, (Node *) indexorderbys);
+	}
 
-    /*
-     * 如果有ORDER BY表达式，查找它们结果数据类型的排序操作符
-     */
-    if (indexorderbys)
-    {
-        ListCell   *pathkeyCell,
-                   *exprCell;
+	/*
+	 * If there are ORDER BY expressions, look up the sort operators for their
+	 * result datatypes.
+	 */
+	if (indexorderbys)
+	{
+		ListCell   *pathkeyCell,
+				   *exprCell;
 
-        /*
-         * PathKey包含我们排序所依据的btree操作符族的OID，
-         * 但这还不够，因为我们需要表达式的数据类型来查找操作符族中的排序操作符
-         */
-        Assert(list_length(best_path->path.pathkeys) == list_length(indexorderbys));
-        forboth(pathkeyCell, best_path->path.pathkeys, exprCell, indexorderbys)
-        {
-            PathKey    *pathkey = (PathKey *) lfirst(pathkeyCell);
-            Node       *expr = (Node *) lfirst(exprCell);
-            Oid         exprtype = exprType(expr);
-            Oid         sortop;
+		/*
+		 * PathKey contains OID of the btree opfamily we're sorting by, but
+		 * that's not quite enough because we need the expression's datatype
+		 * to look up the sort operator in the operator family.
+		 */
+		Assert(list_length(best_path->path.pathkeys) == list_length(indexorderbys));
+		forboth(pathkeyCell, best_path->path.pathkeys, exprCell, indexorderbys)
+		{
+			PathKey    *pathkey = (PathKey *) lfirst(pathkeyCell);
+			Node	   *expr = (Node *) lfirst(exprCell);
+			Oid			exprtype = exprType(expr);
+			Oid			sortop;
 
-            /* 从操作符族获取排序操作符 */
-            sortop = get_opfamily_member(pathkey->pk_opfamily,
-                                        exprtype,
-                                        exprtype,
-                                        pathkey->pk_strategy);
-            if (!OidIsValid(sortop))
-                elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
-                     pathkey->pk_strategy, exprtype, exprtype, pathkey->pk_opfamily);
-            indexorderbyops = lappend_oid(indexorderbyops, sortop);
-        }
-    }
+			/* Get sort operator from opfamily */
+			sortop = get_opfamily_member(pathkey->pk_opfamily,
+										 exprtype,
+										 exprtype,
+										 pathkey->pk_strategy);
+			if (!OidIsValid(sortop))
+				elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
+					 pathkey->pk_strategy, exprtype, exprtype, pathkey->pk_opfamily);
+			indexorderbyops = lappend_oid(indexorderbyops, sortop);
+		}
+	}
 
-    /*
-     * 对于仅索引扫描，我们必须将索引目标列表中索引AM无法返回的列标记为resjunk；
-     * 这提示setrefs.c不要生成对这些列的引用
-     */
-    if (indexonly)
-    {
-        int         i = 0;
+	/*
+	 * For an index-only scan, we must mark indextlist entries as resjunk if
+	 * they are columns that the index AM can't return; this cues setrefs.c to
+	 * not generate references to those columns.
+	 */
+	if (indexonly)
+	{
+		int			i = 0;
 
-        foreach(l, indexinfo->indextlist)
-        {
-            TargetEntry *indextle = (TargetEntry *) lfirst(l);
+		foreach(l, indexinfo->indextlist)
+		{
+			TargetEntry *indextle = (TargetEntry *) lfirst(l);
 
-            indextle->resjunk = !indexinfo->canreturn[i];
-            i++;
-        }
-    }
+			indextle->resjunk = !indexinfo->canreturn[i];
+			i++;
+		}
+	}
 
-    /* 最终准备构建计划节点 */
-    if (indexonly)
-        scan_plan = (Scan *) make_indexonlyscan(tlist,
-                                             qpqual,
-                                             baserelid,
-                                             indexoid,
-                                             fixed_indexquals,
-                                             stripped_indexquals,
-                                             fixed_indexorderbys,
-                                             indexinfo->indextlist,
-                                             best_path->indexscandir);
-    else
-        scan_plan = (Scan *) make_indexscan(tlist,
-                                         qpqual,
-                                         baserelid,
-                                         indexoid,
-                                         fixed_indexquals,
-                                         stripped_indexquals,
-                                         fixed_indexorderbys,
-                                         indexorderbys,
-                                         indexorderbyops,
-                                         best_path->indexscandir);
+	/* Finally ready to build the plan node */
+	if (indexonly)
+		scan_plan = (Scan *) make_indexonlyscan(tlist,
+												qpqual,
+												baserelid,
+												indexoid,
+												fixed_indexquals,
+												stripped_indexquals,
+												fixed_indexorderbys,
+												indexinfo->indextlist,
+												best_path->indexscandir);
+	else
+		scan_plan = (Scan *) make_indexscan(tlist,
+											qpqual,
+											baserelid,
+											indexoid,
+											fixed_indexquals,
+											stripped_indexquals,
+											fixed_indexorderbys,
+											indexorderbys,
+											indexorderbyops,
+											best_path->indexscandir);
 
-    /* 复制通用路径信息到计划节点 */
-    copy_generic_path_info(&scan_plan->plan, &best_path->path);
+	copy_generic_path_info(&scan_plan->plan, &best_path->path);
 
-    return scan_plan;
+	return scan_plan;
 }
-
 
 /*
  * create_bitmap_scan_plan
@@ -4068,196 +4107,171 @@ create_nestloop_plan(PlannerInfo *root,
 
 	return join_plan;
 }
-/*
- * create_mergejoin_plan
- *    为 'best_path' 创建一个 MergeJoin 计划节点，并递归处理其内外路径。
- *
- * 参数:
- * - root: 包含查询规划信息的根节点
- * - best_path: 要转换为计划节点的最佳MergeJoin路径
- *
- * 返回值:
- * - 指向新创建的MergeJoin计划节点的指针
- */
+
 static MergeJoin *
 create_mergejoin_plan(PlannerInfo *root,
-			  MergePath *best_path)
+					  MergePath *best_path)
 {
-	// 声明变量
-	MergeJoin  *join_plan;        // 最终构建的MergeJoin计划节点
-	Plan	   *outer_plan;      // 外连接子计划
-	Plan	   *inner_plan;      // 内连接子计划
-	// 构建目标列表(target list)，描述查询需要输出的列
+	MergeJoin  *join_plan;
+	Plan	   *outer_plan;
+	Plan	   *inner_plan;
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
-	// 连接条件相关变量
-	List	   *joinclauses;     // 普通连接条件
-	List	   *otherclauses;    // 外连接时的其他条件
-	List	   *mergeclauses;    // 用于执行合并连接的等式条件
-	// 排序键相关变量
-	List	   *outerpathkeys;   // 外部路径的排序键
-	List	   *innerpathkeys;   // 内部路径的排序键
-	// 合并连接执行所需的信息
-	int			nClauses;         // 合并条件数量
-	Oid		   *mergefamilies;   // 合并操作符族OID数组
-	Oid		   *mergecollations; // 排序规则OID数组
-	int		   *mergestrategies; // 合并策略数组
-	bool	   *mergenullsfirst; // NULL值排序策略数组
-	// 处理等价类和路径键的临时变量
-	PathKey    *opathkey;        // 当前处理的外部路径键
-	EquivalenceClass *opeclass;  // 当前处理的外部等价类
-	int			i;                // 循环计数器
-	ListCell   *lc;              // 用于遍历合并条件列表的指针
-	ListCell   *lop;             // 用于遍历外部路径键列表的指针
-	ListCell   *lip;             // 用于遍历内部路径键列表的指针
-	// 缓存外部和内部路径的引用
+	List	   *joinclauses;
+	List	   *otherclauses;
+	List	   *mergeclauses;
+	List	   *outerpathkeys;
+	List	   *innerpathkeys;
+	int			nClauses;
+	Oid		   *mergefamilies;
+	Oid		   *mergecollations;
+	int		   *mergestrategies;
+	bool	   *mergenullsfirst;
+	PathKey    *opathkey;
+	EquivalenceClass *opeclass;
+	int			i;
+	ListCell   *lc;
+	ListCell   *lop;
+	ListCell   *lip;
 	Path	   *outer_path = best_path->jpath.outerjoinpath;
 	Path	   *inner_path = best_path->jpath.innerjoinpath;
 
 	/*
-	 * MergeJoin 节点可以做投影，因此对子计划的 tlist 不需要严格要求。
-	 * 但如果需要对子计划排序，建议使用更窄的 tlist，避免排序多余数据。
+	 * MergeJoin can project, so we don't have to demand exact tlists from the
+	 * inputs.  However, if we're intending to sort an input's result, it's
+	 * best to request a small tlist so we aren't sorting more data than
+	 * necessary.
 	 */
-	
-	/* 递归创建外连接计划节点，根据是否需要排序选择小 tlist */
 	outer_plan = create_plan_recurse(root, best_path->jpath.outerjoinpath,
-					 (best_path->outersortkeys != NIL) ? CP_SMALL_TLIST : 0);
-	/* 递归创建内连接计划节点，根据是否需要排序选择小 tlist */
-	inner_plan = create_plan_recurse(root, best_path->jpath.innerjoinpath,
-					 (best_path->innersortkeys != NIL) ? CP_SMALL_TLIST : 0);
+									 (best_path->outersortkeys != NIL) ? CP_SMALL_TLIST : 0);
 
-	/* 对连接条件进行排序优化（mergeclauses 不可重排） */
+	inner_plan = create_plan_recurse(root, best_path->jpath.innerjoinpath,
+									 (best_path->innersortkeys != NIL) ? CP_SMALL_TLIST : 0);
+
+	/* Sort join qual clauses into best execution order */
+	/* NB: do NOT reorder the mergeclauses */
 	joinclauses = order_qual_clauses(root, best_path->jpath.joinrestrictinfo);
 
-	/* 获取连接条件（普通表达式形式），忽略伪常量条件 */
+	/* Get the join qual clauses (in plain expression form) */
+	/* Any pseudoconstant clauses are ignored here */
 	if (IS_OUTER_JOIN(best_path->jpath.jointype))
 	{
-		// 外连接时需要区分原始连接条件和下推条件
 		extract_actual_join_clauses(joinclauses,
-							best_path->jpath.path.parent->relids,
-							&joinclauses, &otherclauses);
+									best_path->jpath.path.parent->relids,
+									&joinclauses, &otherclauses);
 	}
 	else
 	{
-		// 内连接时所有条件都一样处理
+		/* We can treat all clauses alike for an inner join */
 		joinclauses = extract_actual_clauses(joinclauses, false);
 		otherclauses = NIL;
 	}
 
 	/*
-	 * 从连接条件中移除 mergeclauses，剩下的为需要检查的 qpqual 条件。
+	 * Remove the mergeclauses from the list of join qual clauses, leaving the
+	 * list of quals that must be checked as qpquals.
 	 */
-	// 获取用于合并连接的条件
 	mergeclauses = get_actual_clauses(best_path->path_mergeclauses);
-	// 从普通连接条件中移除已用于合并连接的条件
 	joinclauses = list_difference(joinclauses, mergeclauses);
 
 	/*
-	 * 如果是参数化路径，则替换外部关系变量为 nestloop 参数。
-	 * mergeclauses 不应包含外部参数。
+	 * Replace any outer-relation variables with nestloop params.  There
+	 * should not be any in the mergeclauses.
 	 */
 	if (best_path->jpath.path.param_info)
 	{
-		// 替换普通连接条件中的外部关系变量
 		joinclauses = (List *)
 			replace_nestloop_params(root, (Node *) joinclauses);
-		// 替换外连接其他条件中的外部关系变量
 		otherclauses = (List *)
 			replace_nestloop_params(root, (Node *) otherclauses);
 	}
 
 	/*
-	 * 调整 mergeclauses，使外部变量始终在左侧，并标记 outer_is_left 状态。
+	 * Rearrange mergeclauses, if needed, so that the outer variable is always
+	 * on the left; mark the mergeclause restrictinfos with correct
+	 * outer_is_left status.
 	 */
 	mergeclauses = get_switched_clauses(best_path->path_mergeclauses,
-							best_path->jpath.outerjoinpath->parent->relids);
+										best_path->jpath.outerjoinpath->parent->relids);
 
 	/*
-	 * 如有需要，为外部和内部路径添加显式排序节点。
+	 * Create explicit sort nodes for the outer and inner paths if necessary.
 	 */
 	if (best_path->outersortkeys)
 	{
-		// 获取外部关系ID集合
 		Relids		outer_relids = outer_path->parent->relids;
-		// 创建排序节点
 		Sort	   *sort = make_sort_from_pathkeys(outer_plan,
-						   best_path->outersortkeys,
-						   outer_relids);
+												   best_path->outersortkeys,
+												   outer_relids);
 
-		// 标记排序节点的成本和规模
 		label_sort_with_costsize(root, sort, -1.0);
-		// 更新外部计划为排序节点
 		outer_plan = (Plan *) sort;
 		outerpathkeys = best_path->outersortkeys;
 	}
 	else
-		// 使用已有外部路径的排序键
 		outerpathkeys = best_path->jpath.outerjoinpath->pathkeys;
 
 	if (best_path->innersortkeys)
 	{
-		// 获取内部关系ID集合
 		Relids		inner_relids = inner_path->parent->relids;
-		// 创建排序节点
 		Sort	   *sort = make_sort_from_pathkeys(inner_plan,
-						   best_path->innersortkeys,
-						   inner_relids);
+												   best_path->innersortkeys,
+												   inner_relids);
 
-		// 标记排序节点的成本和规模
 		label_sort_with_costsize(root, sort, -1.0);
-		// 更新内部计划为排序节点
 		inner_plan = (Plan *) sort;
 		innerpathkeys = best_path->innersortkeys;
 	}
 	else
-		// 使用已有内部路径的排序键
 		innerpathkeys = best_path->jpath.innerjoinpath->pathkeys;
 
 	/*
-	 * 如有需要，为内部计划添加物化节点，避免 mark/restore 操作。
+	 * If specified, add a materialize node to shield the inner plan from the
+	 * need to handle mark/restore.
 	 */
 	if (best_path->materialize_inner)
 	{
-		// 创建物化节点
 		Plan	   *matplan = (Plan *) make_material(inner_plan);
 
-		// 估算物化成本，假设不会落盘，仅每行 cpu_operator_cost
+		/*
+		 * We assume the materialize will not spill to disk, and therefore
+		 * charge just cpu_operator_cost per tuple.  (Keep this estimate in
+		 * sync with final_cost_mergejoin.)
+		 */
 		copy_plan_costsize(matplan, inner_plan);
 		matplan->total_cost += cpu_operator_cost * matplan->plan_rows;
 
-		// 更新内部计划为物化节点
 		inner_plan = matplan;
 	}
 
 	/*
-	 * 构建执行器需要的 opfamily/collation/strategy/nullsfirst 数组。
-	 * 信息来自于输入的 pathkeys，但需注意 mergeclauses 与 pathkeys 的顺序和冗余。
+	 * Compute the opfamily/collation/strategy/nullsfirst arrays needed by the
+	 * executor.  The information is in the pathkeys for the two inputs, but
+	 * we need to be careful about the possibility of mergeclauses sharing a
+	 * pathkey, as well as the possibility that the inner pathkeys are not in
+	 * an order matching the mergeclauses.
 	 */
-	// 获取合并条件数量
 	nClauses = list_length(mergeclauses);
 	Assert(nClauses == list_length(best_path->path_mergeclauses));
-	// 为合并操作分配必要的数据结构
 	mergefamilies = (Oid *) palloc(nClauses * sizeof(Oid));
 	mergecollations = (Oid *) palloc(nClauses * sizeof(Oid));
 	mergestrategies = (int *) palloc(nClauses * sizeof(int));
 	mergenullsfirst = (bool *) palloc(nClauses * sizeof(bool));
 
-	// 初始化变量
 	opathkey = NULL;
 	opeclass = NULL;
 	lop = list_head(outerpathkeys);
 	lip = list_head(innerpathkeys);
 	i = 0;
-	// 遍历所有合并条件，填充执行器所需信息
 	foreach(lc, best_path->path_mergeclauses)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-		EquivalenceClass *oeclass; // 外部等价类
-		EquivalenceClass *ieclass; // 内部等价类
-		PathKey    *ipathkey = NULL; // 当前处理的内部路径键
-		EquivalenceClass *ipeclass = NULL; // 当前处理的内部等价类
-		bool		first_inner_match = false; // 是否首次匹配内部路径键
+		EquivalenceClass *oeclass;
+		EquivalenceClass *ieclass;
+		PathKey    *ipathkey = NULL;
+		EquivalenceClass *ipeclass = NULL;
+		bool		first_inner_match = false;
 
-		// 获取 mergeclause 的外部/内部等价类
+		/* fetch outer/inner eclass from mergeclause */
 		if (rinfo->outer_is_left)
 		{
 			oeclass = rinfo->left_ec;
@@ -4272,12 +4286,23 @@ create_mergejoin_plan(PlannerInfo *root,
 		Assert(ieclass != NULL);
 
 		/*
-		 * 通过等价类匹配 pathkey 元素，确保顺序一致。
-		 * 外部 pathkeys 顺序应与 mergeclauses 一致，内部 pathkeys 可能有冗余。
+		 * We must identify the pathkey elements associated with this clause
+		 * by matching the eclasses (which should give a unique match, since
+		 * the pathkey lists should be canonical).  In typical cases the merge
+		 * clauses are one-to-one with the pathkeys, but when dealing with
+		 * partially redundant query conditions, things are more complicated.
+		 *
+		 * lop and lip reference the first as-yet-unmatched pathkey elements.
+		 * If they're NULL then all pathkey elements have been matched.
+		 *
+		 * The ordering of the outer pathkeys should match the mergeclauses,
+		 * by construction (see find_mergeclauses_for_outer_pathkeys()). There
+		 * could be more than one mergeclause for the same outer pathkey, but
+		 * no pathkey may be entirely skipped over.
 		 */
-		// 处理外部路径键
-		if (oeclass != opeclass)
+		if (oeclass != opeclass)	/* multiple matches are not interesting */
 		{
+			/* doesn't match the current opathkey, so must match the next */
 			if (lop == NULL)
 				elog(ERROR, "outer pathkeys do not match mergeclauses");
 			opathkey = (PathKey *) lfirst(lop);
@@ -4287,21 +4312,35 @@ create_mergejoin_plan(PlannerInfo *root,
 				elog(ERROR, "outer pathkeys do not match mergeclauses");
 		}
 
-		// 处理内部路径键
+		/*
+		 * The inner pathkeys likewise should not have skipped-over keys, but
+		 * it's possible for a mergeclause to reference some earlier inner
+		 * pathkey if we had redundant pathkeys.  For example we might have
+		 * mergeclauses like "o.a = i.x AND o.b = i.y AND o.c = i.x".  The
+		 * implied inner ordering is then "ORDER BY x, y, x", but the pathkey
+		 * mechanism drops the second sort by x as redundant, and this code
+		 * must cope.
+		 *
+		 * It's also possible for the implied inner-rel ordering to be like
+		 * "ORDER BY x, y, x DESC".  We still drop the second instance of x as
+		 * redundant; but this means that the sort ordering of a redundant
+		 * inner pathkey should not be considered significant.  So we must
+		 * detect whether this is the first clause matching an inner pathkey.
+		 */
 		if (lip)
 		{
 			ipathkey = (PathKey *) lfirst(lip);
 			ipeclass = ipathkey->pk_eclass;
 			if (ieclass == ipeclass)
 			{
-				// 第一次匹配该内部 pathkey
+				/* successful first match to this inner pathkey */
 				lip = lnext(lip);
 				first_inner_match = true;
 			}
 		}
 		if (!first_inner_match)
 		{
-			// 冗余条件，需在 lip 之前查找匹配的内部 pathkey
+			/* redundant clause ... must match something before lip */
 			ListCell   *l2;
 
 			foreach(l2, innerpathkeys)
@@ -4318,20 +4357,28 @@ create_mergejoin_plan(PlannerInfo *root,
 		}
 
 		/*
-		 * pathkeys 在 opfamily/collation 上必须一致，冗余内部 pathkey 的排序可忽略。
-		 * 非冗余内部 pathkey 排序必须与外部一致。
+		 * The pathkeys should always match each other as to opfamily and
+		 * collation (which affect equality), but if we're considering a
+		 * redundant inner pathkey, its sort ordering might not match.  In
+		 * such cases we may ignore the inner pathkey's sort ordering and use
+		 * the outer's.  (In effect, we're lying to the executor about the
+		 * sort direction of this inner column, but it does not matter since
+		 * the run-time row comparisons would only reach this column when
+		 * there's equality for the earlier column containing the same eclass.
+		 * There could be only one value in this column for the range of inner
+		 * rows having a given value in the earlier column, so it does not
+		 * matter which way we imagine this column to be ordered.)  But a
+		 * non-redundant inner pathkey had better match outer's ordering too.
 		 */
-		// 验证操作符族和排序规则一致性
 		if (opathkey->pk_opfamily != ipathkey->pk_opfamily ||
 			opathkey->pk_eclass->ec_collation != ipathkey->pk_eclass->ec_collation)
 			elog(ERROR, "left and right pathkeys do not match in mergejoin");
-		// 对于非冗余内部路径键，验证排序策略一致性
 		if (first_inner_match &&
 			(opathkey->pk_strategy != ipathkey->pk_strategy ||
 			 opathkey->pk_nulls_first != ipathkey->pk_nulls_first))
 			elog(ERROR, "left and right pathkeys do not match in mergejoin");
 
-		// 保存执行器需要的信息
+		/* OK, save info for executor */
 		mergefamilies[i] = opathkey->pk_opfamily;
 		mergecollations[i] = opathkey->pk_eclass->ec_collation;
 		mergestrategies[i] = opathkey->pk_strategy;
@@ -4340,32 +4387,32 @@ create_mergejoin_plan(PlannerInfo *root,
 	}
 
 	/*
-	 * 注意：如果 pathkeys 有多余元素（lop 或 lip 非 NULL），不是错误。
-	 * 输入路径可能比当前 mergejoin 需要的排序更好。
+	 * Note: it is not an error if we have additional pathkey elements (i.e.,
+	 * lop or lip isn't NULL here).  The input paths might be better-sorted
+	 * than we need for the current mergejoin.
 	 */
 
 	/*
-	 * 构建 MergeJoin 节点。
+	 * Now we can build the mergejoin node.
 	 */
-	join_plan = make_mergejoin(tlist,           // 目标列表
-				   joinclauses,      // 普通连接条件
-				   otherclauses,     // 外连接时的其他条件
-				   mergeclauses,     // 合并条件
-				   mergefamilies,    // 操作符族数组
-				   mergecollations,  // 排序规则数组
-				   mergestrategies,  // 合并策略数组
-				   mergenullsfirst,  // NULL值排序策略数组
-				   outer_plan,       // 外部子计划
-				   inner_plan,       // 内部子计划
-				   best_path->jpath.jointype,         // 连接类型
-				   best_path->jpath.inner_unique,     // 内部表是否唯一
-				   best_path->skip_mark_restore);     // 是否跳过mark/restore操作
+	join_plan = make_mergejoin(tlist,
+							   joinclauses,
+							   otherclauses,
+							   mergeclauses,
+							   mergefamilies,
+							   mergecollations,
+							   mergestrategies,
+							   mergenullsfirst,
+							   outer_plan,
+							   inner_plan,
+							   best_path->jpath.jointype,
+							   best_path->jpath.inner_unique,
+							   best_path->skip_mark_restore);
 
-	// 排序和物化的成本已包含在 path 的成本中
-	// 复制路径信息到计划节点
+	/* Costs of sort and material steps are included in path cost already */
 	copy_generic_path_info(&join_plan->join.plan, &best_path->jpath.path);
 
-	return join_plan; // 返回构建好的MergeJoin计划节点
+	return join_plan;
 }
 
 static HashJoin *
@@ -4550,15 +4597,17 @@ create_hashjoin_plan(PlannerInfo *root,
 
 /*
  * replace_nestloop_params
- *	  将表达式中的外部关系 Vars 和 PlaceHolderVars 替换为 nestloop Params。
+ *	  Replace outer-relation Vars and PlaceHolderVars in the given expression
+ *	  with nestloop Params
  *
- * 所有属于 root->curOuterRels 标识的关系的 Vars 和 PlaceHolderVars 都会被替换为 Param，
- * 并且如果尚未存在，则会将条目添加到 root->curOuterParams。
+ * All Vars and PlaceHolderVars belonging to the relation(s) identified by
+ * root->curOuterRels are replaced by Params, and entries are added to
+ * root->curOuterParams if not already present.
  */
 static Node *
 replace_nestloop_params(PlannerInfo *root, Node *expr)
 {
-	/* 不需要额外设置，直接递归处理表达式树 */
+	/* No setup needed for tree walk, so away we go */
 	return replace_nestloop_params_mutator(expr, root);
 }
 
@@ -4628,41 +4677,47 @@ replace_nestloop_params_mutator(Node *node, PlannerInfo *root)
 
 /*
  * fix_indexqual_references
- *    修正索引条件表达式，使其符合执行器对 indexqual 的要求。
+ *	  Adjust indexqual clauses to the form the executor's indexqual
+ *	  machinery needs.
  *
- * 主要任务：
- * 1. 从输入的 IndexClause 列表中提取实际的条件表达式，并去除 RestrictInfo 包装。
- * 2. 将外部关系的 Var 或 PlaceHolderVar 替换为 nestloop Param（嵌套循环参数）。
- * 3. 将索引键表达式转换为以索引列号为 varattno 的 Var 节点，而不是原始表的属性号。
+ * We have three tasks here:
+ *	* Select the actual qual clauses out of the input IndexClause list,
+ *	  and remove RestrictInfo nodes from the qual clauses.
+ *	* Replace any outer-relation Var or PHV nodes with nestloop Params.
+ *	  (XXX eventually, that responsibility should go elsewhere?)
+ *	* Index keys must be represented by Var nodes with varattno set to the
+ *	  index's attribute number, not the attribute number in the original rel.
  *
- * 输出参数：
- *   *stripped_indexquals_p 返回实际的条件表达式列表（去除 RestrictInfo）。
- *   *fixed_indexquals_p 返回修正后的条件表达式列表（深拷贝，避免子计划树共享）。
+ * *stripped_indexquals_p receives a list of the actual qual clauses.
+ *
+ * *fixed_indexquals_p receives a list of the adjusted quals.  This is a copy
+ * that shares no substructure with the original; this is needed in case there
+ * are subplans in it (we need two separate copies of the subplan tree, or
+ * things will go awry).
  */
 static void
 fix_indexqual_references(PlannerInfo *root, IndexPath *index_path,
 						 List **stripped_indexquals_p, List **fixed_indexquals_p)
 {
 	IndexOptInfo *index = index_path->indexinfo;
-	List *stripped_indexquals = NIL;
-	List *fixed_indexquals = NIL;
-	ListCell *lc;
+	List	   *stripped_indexquals;
+	List	   *fixed_indexquals;
+	ListCell   *lc;
+
+	stripped_indexquals = fixed_indexquals = NIL;
 
 	foreach(lc, index_path->indexclauses)
 	{
 		IndexClause *iclause = lfirst_node(IndexClause, lc);
-		int indexcol = iclause->indexcol;
-		ListCell *lc2;
+		int			indexcol = iclause->indexcol;
+		ListCell   *lc2;
 
 		foreach(lc2, iclause->indexquals)
 		{
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
-			Node *clause = (Node *) rinfo->clause;
+			Node	   *clause = (Node *) rinfo->clause;
 
-			/* 添加原始条件（去除 RestrictInfo） */
 			stripped_indexquals = lappend(stripped_indexquals, clause);
-
-			/* 修正条件表达式（替换参数、索引键等） */
 			clause = fix_indexqual_clause(root, index, indexcol,
 										  clause, iclause->indexcols);
 			fixed_indexquals = lappend(fixed_indexquals, clause);
@@ -4773,106 +4828,79 @@ fix_indexqual_clause(PlannerInfo *root, IndexOptInfo *index, int indexcol,
 
 /*
  * fix_indexqual_operand
- *    将索引条件表达式转换为引用索引列的Var节点。
+ *	  Convert an indexqual expression to a Var referencing the index column.
  *
- * 我们通过Var节点表示索引键，其中varno == INDEX_VAR，varattno等于
- * 索引的属性编号（索引列位置）。
+ * We represent index keys by Var nodes having varno == INDEX_VAR and varattno
+ * equal to the index's attribute number (index column position).
  *
- * 这里的大部分代码用于进行完整性交叉检查，确保给定的表达式
- * 确实与其声明的索引列匹配。
+ * Most of the code here is just for sanity cross-checking that the given
+ * expression actually matches the index column it's claimed to.
  */
 static Node *
 fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol)
 {
-    Var       *result;       /* 存储最终的Var节点结果 */
-    int        pos;          /* 用于遍历索引列的循环变量 */
-    ListCell  *indexpr_item; /* 指向索引表达式列表中项目的指针 */
+	Var		   *result;
+	int			pos;
+	ListCell   *indexpr_item;
 
-    /*
-     * 移除索引键上任何二进制兼容的类型转换（RelabelType）
-     * 这确保了我们能够正确比较底层表达式，而不会被类型标签干扰
-     */
-    if (IsA(node, RelabelType))
-        node = (Node *) ((RelabelType *) node)->arg;
+	/*
+	 * Remove any binary-compatible relabeling of the indexkey
+	 */
+	if (IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
 
-    /* 断言：确保索引列索引在有效范围内 */
-    Assert(indexcol >= 0 && indexcol < index->ncolumns);
+	Assert(indexcol >= 0 && indexcol < index->ncolumns);
 
-    /*
-     * 处理简单索引列的情况
-     * 当indexkeys[indexcol]不为0时，表示这是一个普通的表列索引
-     */
-    if (index->indexkeys[indexcol] != 0)
-    {
-        /* 这是一个简单索引列 */
-        if (IsA(node, Var) &&
-            ((Var *) node)->varno == index->rel->relid &&
-            ((Var *) node)->varattno == index->indexkeys[indexcol])
-        {
-            /* 复制原始Var节点并修改其属性以引用索引列 */
-            result = (Var *) copyObject(node);
-            result->varno = INDEX_VAR;      /* 将表变量号设置为特殊的INDEX_VAR值 */
-            result->varattno = indexcol + 1; /* 将属性号设置为索引中的列位置(+1因为从1开始) */
-            return (Node *) result;
-        }
-        else
-            /* 如果条件不匹配，输出错误信息 */
-            elog(ERROR, "index key does not match expected index column");
-    }
+	if (index->indexkeys[indexcol] != 0)
+	{
+		/* It's a simple index column */
+		if (IsA(node, Var) &&
+			((Var *) node)->varno == index->rel->relid &&
+			((Var *) node)->varattno == index->indexkeys[indexcol])
+		{
+			result = (Var *) copyObject(node);
+			result->varno = INDEX_VAR;
+			result->varattno = indexcol + 1;
+			return (Node *) result;
+		}
+		else
+			elog(ERROR, "index key does not match expected index column");
+	}
 
-    /*
-     * 处理索引表达式的情况
-     * 当indexkeys[indexcol]为0时，表示这是一个表达式索引
-     * 需要在indexprs列表中查找并交叉检查表达式
-     */
-    indexpr_item = list_head(index->indexprs); /* 获取索引表达式列表的头部 */
-    
-    /* 遍历所有索引列 */
-    for (pos = 0; pos < index->ncolumns; pos++)
-    {
-        /* 找到表达式索引列 */
-        if (index->indexkeys[pos] == 0)
-        {
-            /* 检查索引表达式列表是否有足够的项 */
-            if (indexpr_item == NULL)
-                elog(ERROR, "too few entries in indexprs list");
-                
-            /* 当找到目标索引列时 */
-            if (pos == indexcol)
-            {
-                Node   *indexkey; /* 当前索引表达式 */
+	/* It's an index expression, so find and cross-check the expression */
+	indexpr_item = list_head(index->indexprs);
+	for (pos = 0; pos < index->ncolumns; pos++)
+	{
+		if (index->indexkeys[pos] == 0)
+		{
+			if (indexpr_item == NULL)
+				elog(ERROR, "too few entries in indexprs list");
+			if (pos == indexcol)
+			{
+				Node	   *indexkey;
 
-                /* 获取索引表达式列表中的当前项 */
-                indexkey = (Node *) lfirst(indexpr_item);
-                
-                /* 同样移除任何二进制兼容的类型转换 */
-                if (indexkey && IsA(indexkey, RelabelType))
-                    indexkey = (Node *) ((RelabelType *) indexkey)->arg;
-                    
-                /* 比较输入的节点是否与索引表达式匹配 */
-                if (equal(node, indexkey))
-                {
-                    /* 如果匹配，则创建一个新的Var节点引用索引列 */
-                    result = makeVar(INDEX_VAR, indexcol + 1,
-                                     exprType(lfirst(indexpr_item)), -1,
-                                     exprCollation(lfirst(indexpr_item)),
-                                     0);
-                    return (Node *) result;
-                }
-                else
-                    /* 如果不匹配，输出错误信息 */
-                    elog(ERROR, "index key does not match expected index column");
-            }
-            /* 移动到索引表达式列表中的下一项 */
-            indexpr_item = lnext(indexpr_item);
-        }
-    }
+				indexkey = (Node *) lfirst(indexpr_item);
+				if (indexkey && IsA(indexkey, RelabelType))
+					indexkey = (Node *) ((RelabelType *) indexkey)->arg;
+				if (equal(node, indexkey))
+				{
+					result = makeVar(INDEX_VAR, indexcol + 1,
+									 exprType(lfirst(indexpr_item)), -1,
+									 exprCollation(lfirst(indexpr_item)),
+									 0);
+					return (Node *) result;
+				}
+				else
+					elog(ERROR, "index key does not match expected index column");
+			}
+			indexpr_item = lnext(indexpr_item);
+		}
+	}
 
-    /* 如果执行到这里，表示找不到匹配的索引列，输出错误信息 */
-    elog(ERROR, "index key does not match expected index column");
-    return NULL;              /* 保留此返回值以避免编译器警告 */
+	/* Oops... */
+	elog(ERROR, "index key does not match expected index column");
+	return NULL;				/* keep compiler quiet */
 }
-
 
 /*
  * get_switched_clauses
@@ -4926,33 +4954,48 @@ get_switched_clauses(List *clauses, Relids outerrelids)
 	}
 	return t_list;
 }
+
 /*
  * order_qual_clauses
- *		给定一个将在同一计划节点评估的条件列表，对其进行排序，
- *		以优化运行时的条件检查顺序。
+ *		Given a list of qual clauses that will all be evaluated at the same
+ *		plan node, sort the list into the order we want to check the quals
+ *		in at runtime.
  *
- * 当查询中使用安全屏障条件（security barrier quals）时，列表中可能包含不同安全级别的条件。
- * 较低 security_level 的条件必须排在较高 security_level 的条件之前，
- * 除非条件是 leakproof（不会泄漏数据），此时可以适当提前。
- * 如果安全级别不决定顺序，则优先按估算的执行成本排序，越便宜越靠前。
+ * When security barrier quals are used in the query, we may have quals with
+ * different security levels in the list.  Quals of lower security_level
+ * must go before quals of higher security_level, except that we can grant
+ * exceptions to move up quals that are leakproof.  When security level
+ * doesn't force the decision, we prefer to order clauses by estimated
+ * execution cost, cheapest first.
  *
- * 理想情况下，排序应同时考虑执行成本和选择性，但实际估算不准确，
- * 所以这里只按安全级别和每元组成本排序，且当估算相同时保持原有顺序。
+ * Ideally the order should be driven by a combination of execution cost and
+ * selectivity, but it's not immediately clear how to account for both,
+ * and given the uncertainty of the estimates the reliability of the decisions
+ * would be doubtful anyway.  So we just order by security level then
+ * estimated per-tuple cost, being careful not to change the order when
+ * (as is often the case) the estimates are identical.
  *
- * 虽然本函数可处理裸条件或 RestrictInfo，但建议传入 RestrictInfo，
- * 因为可复用其中缓存的成本信息。裸条件时无法应用安全级别排序，但目前不会影响 barrier quals。
+ * Although this will work on either bare clauses or RestrictInfos, it's
+ * much faster to apply it to RestrictInfos, since it can re-use cost
+ * information that is cached in RestrictInfos.  XXX in the bare-clause
+ * case, we are also not able to apply security considerations.  That is
+ * all right for the moment, because the bare-clause case doesn't occur
+ * anywhere that barrier quals could be present, but it would be better to
+ * get rid of it.
  *
- * 注意：有些调用者会传入包含后续会被移除的条目，仅为让本函数能看到 RestrictInfo，
- * 所以不建议在排序时考虑选择性，否则可能做出错误决策。
+ * Note: some callers pass lists that contain entries that will later be
+ * removed; this is the easiest way to let this routine see RestrictInfos
+ * instead of bare clauses.  This is another reason why trying to consider
+ * selectivity in the ordering would likely do the wrong thing.
  */
 static List *
 order_qual_clauses(PlannerInfo *root, List *clauses)
 {
 	typedef struct
 	{
-		Node	   *clause;			/* 条件表达式 */
-		Cost		cost;			/* 每元组执行成本 */
-		Index		security_level;	/* 安全级别 */
+		Node	   *clause;
+		Cost		cost;
+		Index		security_level;
 	} QualItem;
 	int			nitems = list_length(clauses);
 	QualItem   *items;
@@ -4960,13 +5003,13 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 	int			i;
 	List	   *result;
 
-	/* 0 或 1 个条件无需排序 */
+	/* No need to work hard for 0 or 1 clause */
 	if (nitems <= 1)
 		return clauses;
 
 	/*
-	 * 收集所有条件及其成本到数组，避免重复计算成本（尤其是裸条件）。
-	 * 同时获取安全级别，以便后续排序使用。
+	 * Collect the items and costs into an array.  This is to avoid repeated
+	 * cost_qual_eval work if the inputs aren't RestrictInfos.
 	 */
 	items = (QualItem *) palloc(nitems * sizeof(QualItem));
 	i = 0;
@@ -4983,9 +5026,14 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 			RestrictInfo *rinfo = (RestrictInfo *) clause;
 
 			/*
-			 * 如果条件是 leakproof 且成本较低（小于 10 倍 cpu_operator_cost），
-			 * 则将其安全级别视为 0，可提前执行。
-			 * 否则按原有安全级别排序。
+			 * If a clause is leakproof, it doesn't have to be constrained by
+			 * its nominal security level.  If it's also reasonably cheap
+			 * (here defined as 10X cpu_operator_cost), pretend it has
+			 * security_level 0, which will allow it to go in front of
+			 * more-expensive quals of lower security levels.  Of course, that
+			 * will also force it to go in front of cheaper quals of its own
+			 * security level, which is not so great, but we can alleviate
+			 * that risk by applying the cost limit cutoff.
 			 */
 			if (rinfo->leakproof && items[i].cost < 10 * cpu_operator_cost)
 				items[i].security_level = 0;
@@ -4998,16 +5046,16 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 	}
 
 	/*
-	 * 插入排序（不用 qsort，保证稳定性），按安全级别和成本升序排列。
-	 * 安全级别较低的条件优先；若相同，则成本较低的优先。
-	 * 成本相同时保持原有顺序。
+	 * Sort.  We don't use qsort() because it's not guaranteed stable for
+	 * equal keys.  The expected number of entries is small enough that a
+	 * simple insertion sort should be good enough.
 	 */
 	for (i = 1; i < nitems; i++)
 	{
 		QualItem	newitem = items[i];
 		int			j;
 
-		/* 将 newitem 插入已排序子数组 */
+		/* insert newitem into the already-sorted subarray */
 		for (j = i; j > 0; j--)
 		{
 			QualItem   *olditem = &items[j - 1];
@@ -5021,7 +5069,7 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 		items[j] = newitem;
 	}
 
-	/* 转换回 List */
+	/* Convert back to a list */
 	result = NIL;
 	for (i = 0; i < nitems; i++)
 		result = lappend(result, items[i].clause);
@@ -5030,9 +5078,9 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 }
 
 /*
- * 从 Path 节点复制成本和宽度等信息到 Plan 节点。
- * 执行器通常不会用这些信息，但 EXPLAIN 需要。
- * 同时复制并行相关标志，执行器会用到。
+ * Copy cost and size info from a Path node to the Plan node created from it.
+ * The executor usually won't use this info, but it's needed by EXPLAIN.
+ * Also copy the parallel-related flags, which the executor *will* use.
  */
 static void
 copy_generic_path_info(Plan *dest, Path *src)
@@ -5119,25 +5167,16 @@ bitmap_subplan_mark_shared(Plan *plan)
  *
  *	PLAN NODE BUILDING ROUTINES
  *
- * 通常，这些函数不会传入原始 Path，因此由调用者负责通过 copy_generic_path_info()
- * 从 Path 填充成本和宽度字段。这样做是历史原因，但支持上面某些场景，
- * 比如构建没有完全对应 Path 节点的计划节点。绝不能在这些函数中自行计算成本，
- * 否则会和 Path 构建时的计算重复。
+ * In general, these functions are not passed the original Path and therefore
+ * leave it to the caller to fill in the cost/width fields from the Path,
+ * typically by calling copy_generic_path_info().  This convention is
+ * somewhat historical, but it does support a few places above where we build
+ * a plan node without having an exactly corresponding Path node.  Under no
+ * circumstances should one of these functions do its own cost calculations,
+ * as that would be redundant with calculations done while building Paths.
  *
  *****************************************************************************/
 
-/*
- * make_seqscan
- *	 构建一个顺序扫描计划节点
- *
- * 参数：
- *	 qptlist    - 目标列列表
- *	 qpqual     - 限制条件列表
- *	 scanrelid  - 扫描的关系 ID
- *
- * 返回：
- *	 构建好的 SeqScan 节点
- */
 static SeqScan *
 make_seqscan(List *qptlist,
 			 List *qpqual,
@@ -5667,9 +5706,10 @@ make_mergejoin(List *tlist,
 }
 
 /*
- * make_sort --- 构建一个 Sort 计划节点的基本函数
+ * make_sort --- basic routine to build a Sort plan node
  *
- * 调用者必须已经构建好 sortColIdx、sortOperators、collations 和 nullsFirst 数组。
+ * Caller must have built the sortColIdx, sortOperators, collations, and
+ * nullsFirst arrays already.
  */
 static Sort *
 make_sort(Plan *lefttree, int numCols,
@@ -5679,16 +5719,15 @@ make_sort(Plan *lefttree, int numCols,
 	Sort	   *node = makeNode(Sort);
 	Plan	   *plan = &node->plan;
 
-	/* 设置目标列列表为输入计划的 targetlist */
 	plan->targetlist = lefttree->targetlist;
-	plan->qual = NIL;						/* Sort 节点没有 qual 条件 */
-	plan->lefttree = lefttree;				/* 输入计划节点 */
-	plan->righttree = NULL;					/* Sort 节点没有右子树 */
-	node->numCols = numCols;				/* 排序列数量 */
-	node->sortColIdx = sortColIdx;			/* 排序列索引数组 */
-	node->sortOperators = sortOperators;	/* 排序操作符数组 */
-	node->collations = collations;			/* 排序用的排序规则数组 */
-	node->nullsFirst = nullsFirst;			/* NULL 排序方式数组 */
+	plan->qual = NIL;
+	plan->lefttree = lefttree;
+	plan->righttree = NULL;
+	node->numCols = numCols;
+	node->sortColIdx = sortColIdx;
+	node->sortOperators = sortOperators;
+	node->collations = collations;
+	node->nullsFirst = nullsFirst;
 
 	return node;
 }
@@ -6774,63 +6813,47 @@ make_modifytable(PlannerInfo *root,
 
 /*
  * is_projection_capable_path
- *      功能：检查给定的Path节点是否能够执行投影操作
- *
- * 参数：
- *      path - 要检查的路径节点指针
- *
- * 返回值：
- *      true  - 路径节点能够执行投影操作
- *      false - 路径节点不能执行投影操作
- *
- * 投影操作(Projection)：
- *      在查询执行过程中，将输入元组转换为输出元组的过程，包括表达式计算、列重命名、
- *      列选择等操作。能够执行投影的路径可以直接生成所需的输出格式，无需额外的Result节点。
- *
- * 实现策略：
- *      采用白名单策略，默认大多数路径类型都支持投影，只需明确列出不支持投影的路径类型。
+ *		Check whether a given Path node is able to do projection.
  */
 bool
 is_projection_capable_path(Path *path)
 {
-    /* 大多数路径类型都能执行投影，因此只需列出不支持投影的类型 */
-    switch (path->pathtype)
-    {
-        case T_Hash:        /* 哈希连接路径 */
-        case T_Material:    /* 物化路径 */
-        case T_Sort:        /* 排序路径 */
-        case T_Unique:      /* 去重路径 */
-        case T_SetOp:       /* 集合操作路径(UNION, INTERSECT等) */
-        case T_LockRows:    /* 行锁定路径 */
-        case T_Limit:       /* 限制路径 */
-        case T_ModifyTable: /* 表修改路径 */
-        case T_MergeAppend: /* 合并追加路径 */
-        case T_RecursiveUnion: /* 递归联合路径 */
-            return false;   /* 这些路径类型不能执行投影 */
-            
-        case T_Append:      /* 追加路径 */
-            /*
-             * Append通常不能执行投影，但如果AppendPath用于表示一个虚拟路径(dummy path)，
-             * 实际生成的将是一个能够执行投影的Result节点。
-             */
-            return IS_DUMMY_APPEND(path);
-            
-        case T_ProjectSet:  /* 投影集合路径 */
-            /*
-             * 虽然ProjectSet肯定会执行投影，但我们仍然返回false，因为我们不希望
-             * 规划器随意替换它的目标列表(target list)。集合返回函数(SRFs)必须保持在顶层。
-             * 未来可能会放宽这一限制。
-             */
-            return false;
-            
-        default:            /* 其他所有路径类型 */
-            break;
-    }
-    
-    /* 默认情况下，其他所有路径类型都支持投影 */
-    return true;
-}
+	/* Most plan types can project, so just list the ones that can't */
+	switch (path->pathtype)
+	{
+		case T_Hash:
+		case T_Material:
+		case T_Sort:
+		case T_Unique:
+		case T_SetOp:
+		case T_LockRows:
+		case T_Limit:
+		case T_ModifyTable:
+		case T_MergeAppend:
+		case T_RecursiveUnion:
+			return false;
+		case T_Append:
 
+			/*
+			 * Append can't project, but if an AppendPath is being used to
+			 * represent a dummy path, what will actually be generated is a
+			 * Result which can project.
+			 */
+			return IS_DUMMY_APPEND(path);
+		case T_ProjectSet:
+
+			/*
+			 * Although ProjectSet certainly projects, say "no" because we
+			 * don't want the planner to randomly replace its tlist with
+			 * something else; the SRFs have to stay at top level.  This might
+			 * get relaxed later.
+			 */
+			return false;
+		default:
+			break;
+	}
+	return true;
+}
 
 /*
  * is_projection_capable_plan
