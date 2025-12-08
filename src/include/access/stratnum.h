@@ -15,16 +15,15 @@
 #define STRATNUM_H
 
 /*
- * Strategy numbers identify the semantics that particular operators have
- * with respect to particular operator classes.  In some cases a strategy
- * subtype (an OID) is used as further information.
+ * 策略编号用于标识特定操作符在特定操作符类中的语义。
+ * 在某些情况下，策略子类型（一个OID）会作为进一步的信息使用。
  */
 typedef uint16 StrategyNumber;
 
 #define InvalidStrategy ((StrategyNumber) 0)
 
 /*
- * Strategy numbers for B-tree indexes.
+ * B-tree 索引的策略编号。
  */
 #define BTLessStrategyNumber			1
 #define BTLessEqualStrategyNumber		2

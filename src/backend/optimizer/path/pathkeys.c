@@ -43,14 +43,22 @@ static bool right_merge_direction(PlannerInfo *root, PathKey *pathkey);
 
 /*
  * make_canonical_pathkey
- *	  Given the parameters for a PathKey, find any pre-existing matching
- *	  pathkey in the query's list of "canonical" pathkeys.  Make a new
- *	  entry if there's not one already.
+ *	  根据给定参数查找或创建规范化（canonical）的 PathKey。
  *
- * Note that this function must not be used until after we have completed
- * merging EquivalenceClasses.  (We don't try to enforce that here; instead,
- * equivclass.c will complain if a merge occurs after root->canon_pathkeys
- * has become nonempty.)
+ * 功能说明：
+ * - 如果查询的规范化 PathKey 列表（root->canon_pathkeys）中已存在完全匹配的 PathKey，则直接返回该 PathKey。
+ * - 如果没有，则新建一个 PathKey，并加入到规范化列表中。
+ *
+ * 参数说明：
+ * - root: 查询优化器上下文
+ * - eclass: 等价类（EquivalenceClass），可能不是规范化的，需要追溯到顶层
+ * - opfamily: 排序操作符族
+ * - strategy: 排序策略（升序/降序）
+ * - nulls_first: NULL 是否排在前面
+ *
+ * 注意事项：
+ * - 只有在所有 EquivalenceClass 合并完成后才能调用本函数，否则会导致规范化 PathKey 列表不一致。
+ * - 新建的 PathKey 必须分配在主规划内存上下文中（planner_cxt），以保证生命周期正确。
  */
 PathKey *
 make_canonical_pathkey(PlannerInfo *root,
@@ -61,10 +69,38 @@ make_canonical_pathkey(PlannerInfo *root,
 	ListCell   *lc;
 	MemoryContext oldcontext;
 
-	/* The passed eclass might be non-canonical, so chase up to the top */
+	/* 
+	 * 追溯到规范化的等价类（顶层 EC）
+	 * 
+	 * 详细解释：
+	 * 在查询规划过程中，等价类（EquivalenceClass, EC）可能会发生合并。
+	 * 例如，如果有 WHERE a = b AND b = c，最初可能有 {a, b} 和 {b, c} 两个 EC。
+	 * 后来优化器发现它们其实是同一个集合 {a, b, c}，于是会将其中一个 EC 合并到另一个 EC 中。
+	 * 被合并的 EC 会设置 ec_merged 指针指向合并后的主 EC。
+	 * 
+	 * PathKey 必须始终引用合并后的主 EC（Canonical EC），以确保唯一性和一致性。
+	 * 这个 while 循环就是为了找到那个最终的、未被合并的主 EC。
+	 */
 	while (eclass->ec_merged)
 		eclass = eclass->ec_merged;
 
+	/* 
+	 * 查找是否已存在完全匹配的 PathKey
+	 * 
+	 * 详细解释：
+	 * root->canon_pathkeys 是一个全局缓存列表，存储了当前查询中所有已知的“规范化 PathKey”。
+	 * 
+	 * 为什么要缓存？
+	 * 1. 节省内存：避免为相同的排序需求重复创建 PathKey 对象。
+	 * 2. 快速比较：如果两个 PathKey 指针相同（地址相同），我们就知道它们代表完全相同的排序顺序，
+	 *    而不需要去比较内部复杂的字段。这在比较两条路径的排序顺序是否一致时非常高效。
+	 * 
+	 * 匹配条件：
+	 * - eclass: 排序的列属于同一个等价类。
+	 * - opfamily: 使用相同的 B-Tree 操作符族（例如 integer_ops vs integer_ops）。
+	 * - strategy: 排序方向相同（BTLessStrategyNumber 表示 ASC，BTGreaterStrategyNumber 表示 DESC）。
+	 * - nulls_first: NULL 值的排序位置相同（NULLS FIRST vs NULLS LAST）。
+	 */
 	foreach(lc, root->canon_pathkeys)
 	{
 		pk = (PathKey *) lfirst(lc);
@@ -76,8 +112,14 @@ make_canonical_pathkey(PlannerInfo *root,
 	}
 
 	/*
-	 * Be sure canonical pathkeys are allocated in the main planning context.
-	 * Not an issue in normal planning, but it is for GEQO.
+	 * 确保新建的 PathKey 分配在主规划内存上下文（planner_cxt）中。
+	 * 在 GEQO（遗传优化）等特殊场景下尤为重要。
+	 * 
+	 * 详细解释：
+	 * PathKey 对象需要在整个查询规划期间存活。
+	 * 如果当前处于某个临时的内存上下文中（例如在处理某个子查询或临时计算），
+	 * 直接分配内存可能会导致 PathKey 在后续被意外释放。
+	 * 因此，必须切换到 root->planner_cxt，这是整个规划器的顶级内存上下文。
 	 */
 	oldcontext = MemoryContextSwitchTo(root->planner_cxt);
 
@@ -139,11 +181,40 @@ pathkey_is_redundant(PathKey *new_pathkey, List *pathkeys)
 	EquivalenceClass *new_ec = new_pathkey->pk_eclass;  /* 新路径键的等价类 */
 	ListCell   *lc;  /* 列表遍历指针 */
 
-	/* 检查等价类是否包含常量 --- 无条件冗余 */
+	/* 
+	 * 检查等价类是否包含常量 --- 无条件冗余 
+	 * 
+	 * 详细解释：
+	 * 如果一个等价类（EC）包含常量（例如 WHERE x = 5），那么在这个 EC 中的所有列的值都必须等于该常量。
+	 * 这意味着对于结果集中的每一行，这一列的值都是一样的。
+	 * 既然值都一样，那么按照这一列进行排序是没有任何意义的（顺序不会改变）。
+	 * 因此，这种 PathKey 是“冗余”的，可以被安全地忽略。
+	 * 
+	 * EC_MUST_BE_REDUNDANT 宏通常检查 ec_has_const 标志，但也需要排除外连接（Outer Join）下的情况
+	 * （因为在外连接下，常量可能变成 NULL，见前文关于 ec_below_outer_join 的讨论）。
+	 */
 	if (EC_MUST_BE_REDUNDANT(new_ec))
 		return true;
 
-	/* 如果列表中已使用相同的等价类，则冗余 */
+	/* 
+	 * 如果列表中已使用相同的等价类，则冗余 
+	 * 
+	 * 详细解释：
+	 * 假设我们有一个 PathKey 列表（pathkeys），代表当前的排序键序列，例如 (A, B)。
+	 * 现在我们要检查是否需要添加一个新的 PathKey C。
+	 * 
+	 * 如果 C 所属的等价类（new_ec）已经出现在列表 (A, B) 中，例如 A 和 C 属于同一个 EC（即 A = C），
+	 * 那么按照 A 排序之后，C 的值在每一组 A 相同的数据中也是相同的（因为 A=C）。
+	 * 或者更准确地说，既然 A 和 C 等价，那么按 A 排序就已经隐含了按 C 排序。
+	 * 
+	 * 举例：SELECT * FROM t WHERE a = c ORDER BY a, c;
+	 * 这里的 ORDER BY a, c 实际上等同于 ORDER BY a。
+	 * 因为当 a 确定时，c 也就确定了（因为 a=c）。
+	 * 所以第二个排序键 c 是冗余的。
+	 * 
+	 * 注意：这里只比较 pk_eclass 指针。因为 PathKey 已经被规范化（canonicalized），
+	 * 相同的 EC 指针意味着相同的等价类。
+	 */
 	foreach(lc, pathkeys)
 	{
 		PathKey    *old_pathkey = (PathKey *) lfirst(lc);
@@ -160,23 +231,19 @@ pathkey_is_redundant(PathKey *new_pathkey, List *pathkeys)
 
 /*
  * make_pathkey_from_sortinfo
- *	  Given an expression and sort-order information, create a PathKey.
- *	  The result is always a "canonical" PathKey, but it might be redundant.
+ *	  根据表达式和排序信息创建一个 PathKey。
+ *	  返回的总是“规范化”的 PathKey，但可能是冗余的。
  *
- * expr is the expression, and nullable_relids is the set of base relids
- * that are potentially nullable below it.
- *
- * If the PathKey is being generated from a SortGroupClause, sortref should be
- * the SortGroupClause's SortGroupRef; otherwise zero.
- *
- * If rel is not NULL, it identifies a specific relation we're considering
- * a path for, and indicates that child EC members for that relation can be
- * considered.  Otherwise child members are ignored.  (See the comments for
- * get_eclass_for_sort_expr.)
- *
- * create_it is true if we should create any missing EquivalenceClass
- * needed to represent the sort key.  If it's false, we return NULL if the
- * sort key isn't already present in any EquivalenceClass.
+ * expr: 排序表达式
+ * nullable_relids: 该表达式下方可能为 NULL 的基表 relids 集合
+ * opfamily: 排序操作符族
+ * opcintype: 操作符输入类型
+ * collation: 排序规则
+ * reverse_sort: 是否为降序（true 表示降序，false 表示升序）
+ * nulls_first: NULL 是否排在前面
+ * sortref: 如果由 SortGroupClause 生成，则为其 SortGroupRef，否则为 0
+ * rel: 指定具体关系的 relids，用于允许该关系的子成员参与等价类匹配，否则为 NULL
+ * create_it: 如果为 true，则必要时创建缺失的等价类；否则如果找不到等价类则返回 NULL
  */
 static PathKey *
 make_pathkey_from_sortinfo(PlannerInfo *root,
@@ -196,36 +263,71 @@ make_pathkey_from_sortinfo(PlannerInfo *root,
 	List	   *opfamilies;
 	EquivalenceClass *eclass;
 
+	/*
+	 * 根据排序方向选择策略号（升序/降序）。
+	 * BTLess (1): <，对应升序（ASC）。
+	 * BTGreater (5): >，对应降序（DESC）。
+	 * 如果 reverse_sort 为真，说明我们要降序，所以用 > 策略；否则用 < 策略。
+	 */
 	strategy = reverse_sort ? BTGreaterStrategyNumber : BTLessStrategyNumber;
 
 	/*
-	 * EquivalenceClasses need to contain opfamily lists based on the family
-	 * membership of mergejoinable equality operators, which could belong to
-	 * more than one opfamily.  So we have to look up the opfamily's equality
-	 * operator and get its membership.
+	 * 等价类需要包含基于等值操作符族的 opfamily 列表，
+	 * 因为等值操作符可能属于多个操作符族。
+	 * 所以需要查找排序操作符族对应的等值操作符，并获取其所有 opfamily。
+	 *
+	 * 目的：为了找到这个排序操作符族（OpFamily）背后的“等值”概念。
+	 * 为什么需要？
+	 * PathKey 是基于等价类（EquivalenceClass, EC）构建的。EC 的核心定义是“相等”。
+	 * 即使我们是在做排序（比如 ORDER BY a），优化器也需要知道 a 属于哪个等价类。
+	 * 而等价类的定义依赖于等值操作符。
 	 */
 	equality_op = get_opfamily_member(opfamily,
 									  opcintype,
 									  opcintype,
 									  BTEqualStrategyNumber);
-	if (!OidIsValid(equality_op))	/* shouldn't happen */
+
+	/* 如果没有找到等值操作符，则报错。理论上不应发生 */
+	if (!OidIsValid(equality_op))
 		elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
 			 BTEqualStrategyNumber, opcintype, opcintype, opfamily);
+
+	/*
+	 * 获取合并连接操作符族列表。
+	 * 目的：找到所有与这个等值操作符兼容的操作符族。
+	 * 原因：一个操作符可能属于多个族。等价类（EC）需要知道所有兼容的族，
+	 * 以便在不同表之间推导等价关系（比如 t1.a = t2.b）。
+	 */
 	opfamilies = get_mergejoin_opfamilies(equality_op);
-	if (!opfamilies)			/* certainly should find some */
+	if (!opfamilies)			/* 一定要能找到 */
 		elog(ERROR, "could not find opfamilies for equality operator %u",
 			 equality_op);
 
-	/* Now find or (optionally) create a matching EquivalenceClass */
+	/*
+	 * 查找或（可选）创建匹配的等价类。
+	 * 核心步骤：
+	 * 优化器检查现有的等价类列表中，是否已经有一个 EC 包含了当前的表达式 expr（比如 t1.a），
+	 * 且兼容我们刚才找到的 opfamilies。
+	 * - 如果找到了：直接复用这个 EC。
+	 * - 如果没找到：
+	 *   - 如果 create_it 为真：创建一个新的 EC，把 t1.a 放进去。
+	 *   - 如果 create_it 为假：返回 NULL（放弃）。
+	 */
 	eclass = get_eclass_for_sort_expr(root, expr, nullable_relids,
 									  opfamilies, opcintype, collation,
 									  sortref, rel, create_it);
 
-	/* Fail if no EC and !create_it */
+	/* 如果找不到等价类且不允许创建，则返回 NULL */
 	if (!eclass)
 		return NULL;
 
-	/* And finally we can find or create a PathKey node */
+	/*
+	 * 最后查找或创建规范化 PathKey 节点。
+	 * 把所有信息打包成一个 PathKey 对象。
+	 * 规范化（Canonical）：
+	 * 优化器会维护一个全局的 PathKey 列表。如果已经有一个完全一样的 PathKey
+	 * （同一个 EC，同一个 OpFamily，同一个方向），就直接返回那个现成的指针。
+	 */
 	return make_canonical_pathkey(root, eclass, opfamily,
 								  strategy, nulls_first);
 }
@@ -484,23 +586,19 @@ get_cheapest_parallel_safe_total_inner(List *paths)
 
 /*
  * build_index_pathkeys
- *	  Build a pathkeys list that describes the ordering induced by an index
- *	  scan using the given index.  (Note that an unordered index doesn't
- *	  induce any ordering, so we return NIL.)
+ *	  构建一个 pathkeys 列表，描述使用指定索引扫描时所产生的排序顺序。
+ *	  （注意：无序索引不会产生任何排序，因此直接返回 NIL。）
  *
- * If 'scandir' is BackwardScanDirection, build pathkeys representing a
- * backwards scan of the index.
+ * 如果 'scandir' 为 BackwardScanDirection，则构建代表索引反向扫描的 pathkeys。
  *
- * We iterate only key columns of covering indexes, since non-key columns
- * don't influence index ordering.  The result is canonical, meaning that
- * redundant pathkeys are removed; it may therefore have fewer entries than
- * there are key columns in the index.
+ * 只遍历覆盖索引的 key 列，因为非 key 列不会影响索引的排序顺序。
+ * 结果是规范化的（canonical），即会去除冗余的 pathkey，因此返回的 pathkey 数量
+ * 可能少于索引的 key 列数。
  *
- * Another reason for stopping early is that we may be able to tell that
- * an index column's sort order is uninteresting for this query.  However,
- * that test is just based on the existence of an EquivalenceClass and not
- * on position in pathkey lists, so it's not complete.  Caller should call
- * truncate_useless_pathkeys() to possibly remove more pathkeys.
+ * 另一个提前终止的原因是：如果我们能判断某个索引列的排序对本查询无意义，
+ * 就可以提前停止。但这种判断仅基于等价类（EquivalenceClass）的存在，
+ * 并不考虑 pathkey 列表中的具体位置，因此并不完全。调用者应再调用
+ * truncate_useless_pathkeys() 以进一步去除无用的 pathkey。
  */
 List *
 build_index_pathkeys(PlannerInfo *root,
@@ -511,8 +609,11 @@ build_index_pathkeys(PlannerInfo *root,
 	ListCell   *lc;
 	int			i;
 
+	/*
+     * sortopfamily 为 NULL 时，索引不支持排序，直接返回 NIL
+	 */
 	if (index->sortopfamily == NULL)
-		return NIL;				/* non-orderable index */
+		return NIL;
 
 	i = 0;
 	foreach(lc, index->indextlist)
@@ -524,17 +625,34 @@ build_index_pathkeys(PlannerInfo *root,
 		PathKey    *cpathkey;
 
 		/*
-		 * INCLUDE columns are stored in index unordered, so they don't
-		 * support ordered index scan.
+		 * INCLUDE 列在索引中是无序存储的，不支持有序索引扫描。
+		 * 例如：CREATE INDEX idx ON t(a) INCLUDE (b)
+		 * 这里 nkeycolumns 是 1。b 是 INCLUDE 列，它只是作为负载存储，不参与排序。
+		 * 因此，一旦遍历到 INCLUDE 列，我们就停止构建 PathKeys。
 		 */
 		if (i >= index->nkeycolumns)
 			break;
 
-		/* We assume we don't need to make a copy of the tlist item */
+		/* 直接取 tlist 项，无需拷贝 */
 		indexkey = indextle->expr;
 
+		/*
+		 * 根据扫描方向调整排序和 NULLS 位置。
+		 * B-Tree 索引支持双向扫描。
+		 *
+		 * 正向扫描 (ForwardScanDirection):
+		 * 直接使用索引定义中的排序属性。如果索引定义是 ASC，扫描出来就是 ASC。
+		 *
+		 * 反向扫描 (BackwardScanDirection):
+		 * 属性取反！
+		 * 如果索引定义是 ASC（升序），反向扫描出来的结果就是 DESC（降序）。
+		 * 如果索引定义是 NULLS FIRST，反向扫描出来的结果就是 NULLS LAST。
+		 * 
+		 * 这使得优化器可以利用同一个索引来满足 ORDER BY a DESC 的需求（即使索引是 a ASC 建的）。
+		 */
 		if (ScanDirectionIsBackward(scandir))
 		{
+			/* 反向扫描，属性取反 */
 			reverse_sort = !index->reverse_sort[i];
 			nulls_first = !index->nulls_first[i];
 		}
@@ -545,8 +663,8 @@ build_index_pathkeys(PlannerInfo *root,
 		}
 
 		/*
-		 * OK, try to make a canonical pathkey for this sort key.  Note we're
-		 * underneath any outer joins, so nullable_relids should be NULL.
+		 * 尝试为该排序键构建规范化 pathkey。注意此处在任何外连接之下，
+		 * 所以 nullable_relids 传 NULL。
 		 */
 		cpathkey = make_pathkey_from_sortinfo(root,
 											  indexkey,
@@ -563,8 +681,8 @@ build_index_pathkeys(PlannerInfo *root,
 		if (cpathkey)
 		{
 			/*
-			 * We found the sort key in an EquivalenceClass, so it's relevant
-			 * for this query.  Add it to list, unless it's redundant.
+			 * 找到了等价类中的排序键，说明对本查询有意义。
+			 * 如果不冗余，则加入结果列表。
 			 */
 			if (!pathkey_is_redundant(cpathkey, retval))
 				retval = lappend(retval, cpathkey);
@@ -572,14 +690,35 @@ build_index_pathkeys(PlannerInfo *root,
 		else
 		{
 			/*
-			 * Boolean index keys might be redundant even if they do not
-			 * appear in an EquivalenceClass, because of our special treatment
-			 * of boolean equality conditions --- see the comment for
-			 * indexcol_is_bool_constant_for_query().  If that applies, we can
-			 * continue to examine lower-order index columns.  Otherwise, the
-			 * sort key is not an interesting sort order for this query, so we
-			 * should stop considering index columns; any lower-order sort
-			 * keys won't be useful either.
+			 * 布尔类型的索引键即使不在等价类中，也可能是冗余的，
+			 * 参见 indexcol_is_bool_constant_for_query() 的注释。
+			 * 如果是这种情况，可以继续处理低阶索引列；
+			 * 否则，说明该排序键对本查询无意义，后续索引列也不会有用，直接停止。
+			 *
+			 * 详细解释：
+			 * 通常情况下，如果索引的某一列（例如第 i 列）没有对应的 PathKey（即 cpathkey 为 NULL），
+			 * 这意味着查询并没有要求按这一列排序，也没有 WHERE 条件约束这一列等于某个常量。
+			 * 在这种情况下，索引的排序顺序在这一列之后就“断掉”了。
+			 * 例如：索引是 (a, b)，查询是 ORDER BY a。
+			 * 当处理到列 b 时，发现没有 PathKey，通常我们会停止，因为 b 的顺序对查询没用。
+			 *
+			 * 但是，对于布尔类型的列，有一个特殊情况：
+			 * 如果查询中有类似 "WHERE bool_col" 或 "WHERE NOT bool_col" 这样的条件，
+			 * 虽然这看起来不像 "bool_col = true" 这种标准的等值约束（可能不会生成包含常量的 EC），
+			 * 但实际上它限制了 bool_col 必须为 true（或 false）。
+			 *
+			 * indexcol_is_bool_constant_for_query() 就是用来检测这种情况的。
+			 * 如果它返回 true，说明这一列实际上被约束为了常量。
+			 * 既然是常量，它就是冗余的（就像 pathkey_is_redundant 处理的那样）。
+			 * 我们可以跳过这一列，继续查看索引的下一列是否能提供有用的排序。
+			 *
+			 * 举例：索引 (bool_col, x)，查询 SELECT * FROM t WHERE bool_col ORDER BY x;
+			 * 1. 处理 bool_col：没有显式的 ORDER BY bool_col，也没有 bool_col = const 的 EC。
+			 *    但 WHERE bool_col 隐含了 bool_col = true。
+			 *    indexcol_is_bool_constant_for_query 返回 true。
+			 *    我们跳过 bool_col，继续处理下一列。
+			 * 2. 处理 x：发现匹配 ORDER BY x。
+			 * 3. 结果：我们可以利用这个索引来满足 ORDER BY x。
 			 */
 			if (!indexcol_is_bool_constant_for_query(root, index, i))
 				break;
@@ -1835,7 +1974,26 @@ pathkeys_useful_for_ordering(PlannerInfo *root, List *pathkeys)
 
 /*
  * truncate_useless_pathkeys
- *		Shorten the given pathkey list to just the useful pathkeys.
+ *		将给定的 pathkey 列表截断为仅包含“有用”的 pathkeys。
+ *
+ * 作用：
+ * - 只保留对后续 merge join 或满足查询排序要求有用的 pathkeys，去除无用部分。
+ *
+ * 参数说明：
+ * - root: 查询优化器上下文
+ * - rel: 当前关系
+ * - pathkeys: 原始 pathkey 列表
+ *
+ * 返回值：
+ * - List*: 截断后的 pathkey 列表（只包含有用部分），如果没有有用的则返回 NIL。
+ *
+ * 实现思路：
+ * 1. 计算对 merge join 有用的 pathkey 数量（nuseful）。
+ * 2. 计算对输出排序有用的 pathkey 数量（nuseful2）。
+ * 3. 取两者最大值作为最终有用的 pathkey 数量。
+ * 4. 如果没有有用的 pathkey，返回 NIL。
+ *    如果全部都有效，直接返回原列表。
+ *    否则，复制并截断列表，只保留有用部分。
  */
 List *
 truncate_useless_pathkeys(PlannerInfo *root,
@@ -1845,14 +2003,18 @@ truncate_useless_pathkeys(PlannerInfo *root,
 	int			nuseful;
 	int			nuseful2;
 
+	/* 计算对 merge join 有用的 pathkey 数量 */
 	nuseful = pathkeys_useful_for_merging(root, rel, pathkeys);
+
+	/* 计算对输出排序有用的 pathkey 数量 */
 	nuseful2 = pathkeys_useful_for_ordering(root, pathkeys);
+
+	/* 取最大值，确保不会漏掉任何有用的 pathkey */
 	if (nuseful2 > nuseful)
 		nuseful = nuseful2;
 
 	/*
-	 * Note: not safe to modify input list destructively, but we can avoid
-	 * copying the list if we're not actually going to change it
+	 * 注意：不能直接修改输入列表，但如果不需要截断则可直接返回原列表。
 	 */
 	if (nuseful == 0)
 		return NIL;
@@ -1864,25 +2026,43 @@ truncate_useless_pathkeys(PlannerInfo *root,
 
 /*
  * has_useful_pathkeys
- *		Detect whether the specified rel could have any pathkeys that are
- *		useful according to truncate_useless_pathkeys().
+ *		判断指定的 rel 是否可能拥有对 truncate_useless_pathkeys() 有用的 pathkeys。
  *
- * This is a cheap test that lets us skip building pathkeys at all in very
- * simple queries.  It's OK to err in the direction of returning "true" when
- * there really aren't any usable pathkeys, but erring in the other direction
- * is bad --- so keep this in sync with the routines above!
+ * 这是一个廉价的测试，用于在非常简单的查询中跳过 pathkeys 的构建。
+ * 如果返回 true 但实际上没有可用的 pathkeys 也没关系，但如果漏掉了有用的 pathkeys 就不好了——
+ * 所以要和上面的相关逻辑保持一致！
  *
- * We could make the test more complex, for example checking to see if any of
- * the joinclauses are really mergejoinable, but that likely wouldn't win
- * often enough to repay the extra cycles.  Queries with neither a join nor
- * a sort are reasonably common, though, so this much work seems worthwhile.
+ * 我们可以让测试更复杂，比如检查 joinclauses 是否真的可用于 mergejoin，
+ * 但这样做带来的收益通常不大。没有 join 也没有 sort 的查询还是比较常见的，
+ * 所以做这么多判断还是值得的。
  */
 bool
 has_useful_pathkeys(PlannerInfo *root, RelOptInfo *rel)
 {
+	/*
+	 * 检查当前关系是否参与了连接（Join）。
+	 * 如果表要参与连接，那么它的排序属性可能非常有价值，因为 Merge Join（归并连接）
+	 * 要求输入数据是有序的。如果扫描路径天然有序，就可以直接做 Merge Join，
+	 * 省去昂贵的 Sort 操作。
+	 *
+	 * rel->joininfo: 存储了涉及该表的连接条件。
+	 * rel->has_eclass_joins: 标记该表是否参与了基于等价类（EquivalenceClass）的连接。
+	 */
 	if (rel->joininfo != NIL || rel->has_eclass_joins)
-		return true;			/* might be able to use pathkeys for merging */
+		return true;			/* 可能可以用于 mergejoin 的 pathkeys */
+
+	/*
+	 * 检查整个查询是否有全局的排序要求（对应 SQL 中的 ORDER BY、GROUP BY 或 DISTINCT）。
+	 * 如果用户要求 ORDER BY a，而我们生成的路径正好按 a 排序，那就可以直接把这个路径
+	 * 作为最终结果，省去最后的 Sort 节点。
+	 */
 	if (root->query_pathkeys != NIL)
-		return true;			/* might be able to use them for ordering */
-	return false;				/* definitely useless */
+		return true;			/* 可能可以用于排序输出的 pathkeys */
+
+	/*
+	 * 既不参与连接，用户也没要求排序。
+	 * 例如：SELECT * FROM t WHERE a > 10; （没有 ORDER BY，单表查询）。
+	 * 在这种情况下，索引扫描出来的顺序无关紧要，我们只关心能不能快速把数据找出来。
+	 */
+	return false;				/* 肯定没有用处 */
 }

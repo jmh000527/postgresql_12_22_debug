@@ -631,11 +631,14 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 
 	/*
 	 * Ensure the expression exposes the correct type and collation.
+	 * 确保表达式暴露的类型和排序规则与操作符族（OpFamily）期望的一致。
+	 * 这是为了确保 equal() 比较能正确工作。
 	 */
 	expr = canonicalize_ec_expression(expr, opcintype, collation);
 
 	/*
 	 * Scan through the existing EquivalenceClasses for a match
+	 * 遍历现有的所有等价类，寻找匹配项。
 	 */
 	foreach(lc1, root->eq_classes)
 	{
@@ -645,37 +648,100 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 		/*
 		 * Never match to a volatile EC, except when we are looking at another
 		 * reference to the same volatile SortGroupClause.
+		 * 
+		 * 如果 EC 包含 volatile 表达式（如 random()），则不能轻易匹配。
+		 * 只有当 sortref 匹配时（说明是同一个语法层面的排序子句），才允许匹配。
+		 * 举例：ORDER BY random(), random()。这两个 random() 是不同的调用，值不同，不能视为等价。
+		 * 但如果是 SELECT random() as x ... ORDER BY x，引用的是同一个计算结果。
 		 */
 		if (cur_ec->ec_has_volatile &&
 			(sortref == 0 || sortref != cur_ec->ec_sortref))
 			continue;
 
+		/* 
+		 * 排序规则（Collation）和操作符族（OpFamilies）必须匹配。
+		 * 不同的排序规则意味着不同的排序顺序，属于不同的等价类。
+		 */
 		if (collation != cur_ec->ec_collation)
 			continue;
 		if (!equal(opfamilies, cur_ec->ec_opfamilies))
 			continue;
 
+		/* 遍历当前 EC 的成员，看是否有表达式匹配 */
 		foreach(lc2, cur_ec->ec_members)
 		{
 			EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc2);
 
-			/*
-			 * Ignore child members unless they match the request.
-			 */
-			if (cur_em->em_is_child &&
-				!bms_equal(cur_em->em_relids, rel))
+            /*
+             * Ignore child members unless they match the request.
+             * 忽略子关系的成员（用于继承表查询），除非调用者明确指定了 rel 并且匹配。
+             *
+             * 详细解释：
+             * 在 PostgreSQL 中，当处理继承表（Inheritance）或分区表（Partitioning）时，
+             * 优化器会将父表的 EquivalenceClass (EC) 成员复制并转换为子表的成员。
+             * 这些转换后的成员被称为 "child members" (em_is_child = true)。
+             *
+             * 例如，如果父表 parent 有成员 parent.x，且有两个子表 child1 和 child2。
+             * EC 中可能包含：
+             * 1. parent.x (em_is_child = false) -> 原始成员
+             * 2. child1.x (em_is_child = true)  -> 衍生成员
+             * 3. child2.x (em_is_child = true)  -> 衍生成员
+             *
+             * 当我们调用 get_eclass_for_sort_expr 时：
+             * - 如果参数 rel 为 NULL，通常表示我们在寻找通用的排序键（基于父表）。
+             *   此时我们不应该匹配 child1.x 或 child2.x，因为它们是特定于子表的实现细节。
+             * - 如果参数 rel 不为 NULL（例如指向 child1），表示我们正在为 child1 生成路径。
+             *   此时我们应该匹配 child1.x，但必须忽略 child2.x。
+             *
+             * 因此，这个判断逻辑的作用是：
+             * 如果当前成员是子表成员，只有当它严格对应我们当前查询的那个关系（rel）时，才允许匹配。
+             * 否则（rel 为 NULL 或 rel 指向其他表），跳过该成员。
+             */
+            if (cur_em->em_is_child &&
+                !bms_equal(cur_em->em_relids, rel))
+				continue;
+			
+            /*
+             * 如果在左外连接的右侧（nullable side），常量可能变成 NULL，所以不能视为普通常量匹配。
+             *
+             * 详细解释：
+             * 假设我们有查询：SELECT * FROM A LEFT JOIN B ON (B.x = 1) ORDER BY B.x;
+             *
+             * 1. 在连接条件 B.x = 1 中，优化器会创建一个等价类 EC = {B.x, 1}。
+             * 2. 因为这个条件在 LEFT JOIN 的 ON 子句中，所以 EC 标记为 ec_below_outer_join = true。
+             *    这意味着这个等价关系只在连接发生“之前”或者“在连接内部”成立。
+             * 3. 在连接发生“之后”（即查询输出结果时），B.x 的值可能是 1（匹配成功），也可能是 NULL（匹配失败）。
+             *
+             * 如果我们允许 get_eclass_for_sort_expr 匹配到这个包含常量 1 的 EC：
+             * - 优化器可能会误以为 B.x 是一个常量（因为它等于 1）。
+             * - 既然是常量，优化器可能认为不需要对 B.x 进行排序（排序代价为 0）。
+             * - 结果：输出结果中 1 和 NULL 可能会混合在一起，而不是按顺序排列，导致错误的查询结果。
+             *
+             * 因此，当 EC 位于外连接之下时，我们必须忽略其中的常量成员，
+             * 强迫优化器将 B.x 视为一个普通的变量，从而正确地生成排序路径（将 1 和 NULL 分开）。
+             */
+            if (cur_ec->ec_below_outer_join && cur_em->em_is_const)
 				continue;
 
 			/*
-			 * If below an outer join, don't match constants: they're not as
-			 * constant as they look.
+			 * 类型和表达式内容都相同，找到匹配！
+			 *
+			 * 1. opcintype == cur_em->em_datatype:
+			 *    首先检查数据类型是否匹配。这是一个快速的预检查。
+			 *    opcintype 是操作符族（OpFamily）期望的输入类型。
+			 *    如果类型不同，即使表达式结构看起来一样，它们在当前操作符语义下也不能视为同一个成员。
+			 *
+			 * 2. equal(expr, cur_em->em_expr):
+			 *    使用 equal() 函数进行深度的结构比较。
+			 *    注意：传入的 expr 已经在函数入口处通过 canonicalize_ec_expression() 进行了规范化
+			 *    （统一了类型和 Collation），而 EC 中的成员 em_expr 也是规范化过的。
+			 *    因此，如果 equal() 返回 true，说明这两个表达式在语义上是完全相同的。
+			 *
+			 * 如果找到了匹配的成员，说明当前的排序表达式已经存在于这个等价类中。
+			 * 我们直接返回这个 EC，这样优化器就可以利用该 EC 已有的知识（例如它与其他列的等价关系）
+			 * 来生成更优的执行计划（例如利用已有的索引顺序）。
 			 */
-			if (cur_ec->ec_below_outer_join &&
-				cur_em->em_is_const)
-				continue;
-
-			if (opcintype == cur_em->em_datatype &&
-				equal(expr, cur_em->em_expr))
+			if (opcintype == cur_em->em_datatype && equal(expr, cur_em->em_expr))
 				return cur_ec;	/* Match! */
 		}
 	}
@@ -686,6 +752,7 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 
 	/*
 	 * OK, build a new single-member EC
+	 * 没找到匹配，且 create_it 为 true，创建一个新的单成员 EC。
 	 *
 	 * Here, we must be sure that we construct the EC in the right context.
 	 */
@@ -712,10 +779,12 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 
 	/*
 	 * Get the precise set of nullable relids appearing in the expression.
+	 * 计算表达式中涉及的 nullable relids。
 	 */
 	expr_relids = pull_varnos(root, (Node *) expr);
 	nullable_relids = bms_intersect(nullable_relids, expr_relids);
 
+	/* 添加成员到新创建的 EC */
 	newem = add_eq_member(newec, copyObject(expr), expr_relids,
 						  nullable_relids, false, opcintype);
 
@@ -724,6 +793,10 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 	 * functions, aggregates, or window functions, but such could appear in
 	 * sort expressions; so we have to check whether its const-marking was
 	 * correct.
+	 * 
+	 * add_eq_member 可能会把没有 Var 的表达式标记为常量（const）。
+	 * 但如果它包含 volatile 函数、集合返回函数等，它并不是真正的常量，不能用于推理。
+	 * 这里进行修正。
 	 */
 	if (newec->ec_has_const)
 	{

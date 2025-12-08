@@ -68,14 +68,18 @@ typedef struct
 	List	   *indexclauses[INDEX_MAX_KEYS];
 } IndexClauseSet;
 
-/* Per-path data used within choose_bitmap_and() */
+/* choose_bitmap_and() 内部每条路径的辅助数据结构
+ *
+ * 该结构用于描述一条路径（IndexPath、BitmapAndPath 或 BitmapOrPath）所使用的
+ * WHERE 子句和部分索引谓词，并为去重和组合做准备。
+ */
 typedef struct
 {
-	Path	   *path;			/* IndexPath, BitmapAndPath, or BitmapOrPath */
-	List	   *quals;			/* the WHERE clauses it uses */
-	List	   *preds;			/* predicates of its partial index(es) */
-	Bitmapset  *clauseids;		/* quals+preds represented as a bitmapset */
-	bool		unclassifiable; /* has too many quals+preds to process? */
+	Path	   *path;			/* 路径对象（IndexPath、BitmapAndPath 或 BitmapOrPath） */
+	List	   *quals;			/* 路径使用的 WHERE 条件列表 */
+	List	   *preds;			/* 路径涉及的部分索引谓词列表 */
+	Bitmapset  *clauseids;		/* quals+preds 的唯一标识（位图集合） */
+	bool		unclassifiable; /* 是否因条件过多而无法分类（如>100个） */
 } PathClauseUsage;
 
 /* Callback argument for ec_member_matches_indexcol */
@@ -294,9 +298,25 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 						&bitindexpaths);
 
 		/*
-		 * 阶段2：匹配和处理连接条件
-		 * 查找未合并到等价类中的松散连接条件
-		 * 同时收集连接OR条件供后续处理
+		 * 阶段2：匹配和处理连接条件 (Join Clauses)
+		 *
+		 * 目标：
+		 * 寻找那些涉及其他表（Join）且能利用当前索引的条件。
+		 * 这些条件主要用于生成“参数化路径” (Parameterized Paths)。
+		 * 参数化路径通常用于 Nested Loop Join 的内表（Inner Rel），
+		 * 其中索引扫描的键值来自于外表（Outer Rel）的当前行。
+		 *
+		 * 区别：
+		 * - match_restriction_clauses_to_index: 处理单表限制条件 (WHERE t.a = 1)。
+		 * - match_join_clauses_to_index: 处理显式的 Join 条件 (WHERE t.a = other.b)，
+		 *   但不包括那些已经被 EquivalenceClass 机制吸收的等值连接。
+		 * - match_eclass_clauses_to_index: 处理基于 EquivalenceClass 推导出的连接条件。
+		 *
+		 * 逻辑：
+		 * 1. 遍历 rel->joininfo (松散的连接条件)。
+		 * 2. 检查条件是否可以“下推”或移动到当前关系 (join_clause_is_movable_to)。
+		 * 3. 如果是 OR 子句，收集到 joinorclauses 供后续分析。
+		 * 4. 如果是普通子句，调用 match_clause_to_index 尝试匹配索引列。
 		 */
 		MemSet(&jclauseset, 0, sizeof(jclauseset)); /* 重置连接条件集合 */
 		/* 查找未合并到等价类中的松散连接条件，将它们添加到jclauseset中 */
@@ -304,8 +324,24 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 							&jclauseset, &joinorclauses);
 
 		/*
-		 * 阶段3：匹配和处理等价类条件
-		 * 从等价类中提取能与索引匹配的条件
+		 * 阶段3：匹配和处理等价类条件 (Equivalence Class Clauses)
+		 *
+		 * 目标：
+		 * 利用等价类 (EquivalenceClass, EC) 推导出的“隐含”连接条件。
+		 *
+		 * 原理：
+		 * 如果查询中有 A.x = B.y 和 B.y = C.z，优化器会将 {A.x, B.y, C.z} 放入同一个 EC。
+		 * 即使 SQL 中没有写 A.x = C.z，优化器也能推导出这个条件。
+		 *
+		 * 作用：
+		 * 对于当前索引（假设在 A.x 上），match_eclass_clauses_to_index 会去查找
+		 * A.x 所属的 EC，并生成形如 "A.x = B.y" 或 "A.x = C.z" 的隐含等值条件。
+		 * 这些条件可以作为参数化索引扫描的键值（即用 B.y 或 C.z 的值来查 A.x 的索引）。
+		 *
+		 * 为什么需要单独处理？
+		 * 显式的 Join 条件在阶段 2 处理。
+		 * 但有些 Join 条件是隐式的（通过传递性推导出来的），它们只存在于 EC 结构中，
+		 * 不在 rel->joininfo 中，所以需要专门的函数来提取。
 		 */
 		MemSet(&eclauseset, 0, sizeof(eclauseset)); /* 重置等价类条件集合 */
 		/* 从等价类中提取能与索引匹配的条件，将它们添加到eclauseset中 */
@@ -313,8 +349,30 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 							&eclauseset);
 
 		/*
-		 * 如果找到连接条件或等价类条件，则生成参数化索引路径
-		 * 参数化路径主要用于嵌套循环连接的内表
+		 * 如果找到连接条件或等价类条件，则生成参数化索引路径。
+		 *
+		 * 详细解释：
+		 * 1. 目标：构建 "Parameterized Index Paths" (参数化索引路径)。
+		 *    这些路径的特点是：索引扫描的键值不是常量，而是来自于其他表（Outer Relations）。
+		 *
+		 * 2. 用途：
+		 *    这些路径专门用于 "Nested Loop Join" (嵌套循环连接)。
+		 *    当当前表作为内表 (Inner) 时，外表 (Outer) 的每一行都会提供具体的键值，
+		 *    驱动内表的索引扫描。
+		 *
+		 * 3. 组合逻辑：
+		 *    consider_index_join_clauses 不仅仅是把所有连接条件一股脑加进去。
+		 *    它会尝试各种合理的条件组合。
+		 *    例如，如果索引是 (a, b)，连接条件有 a=t1.x 和 b=t2.y。
+		 *    它可能会生成：
+		 *    - 路径 1: 仅使用 a=t1.x (参数化依赖于 t1)。
+		 *    - 路径 2: 使用 a=t1.x AND b=t2.y (参数化依赖于 t1, t2)。
+		 *    这样，上层规划器在选择 Join 顺序时，如果先 Join t1，就可以用路径 1；
+		 *    如果先 Join t1 和 t2，就可以用路径 2。
+		 *
+		 * 4. 输出：
+		 *    - 普通索引路径直接加入 rel->pathlist。
+		 *    - 位图路径收集到 bitjoinpaths。
 		 */
 		if (jclauseset.nonempty || eclauseset.nonempty)
 			consider_index_join_clauses(root, rel, index,
@@ -325,34 +383,87 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	}
 
 	/*
-	 * 处理OR条件：为限制条件中的OR条件生成BitmapOrPath
-	 * 这允许多个条件通过位图操作高效组合
+	 * 阶段 4: 处理 OR 条件 (OR Clauses)
+	 *
+	 * 目标：
+	 * 为形如 "A OR B" 的查询条件生成 BitmapOr 路径。
+	 *
+	 * 第一步：处理单表限制条件 (Restriction ORs)
+	 * 来源：rel->baserestrictinfo
+	 *
+	 * 举例：
+	 *   SELECT * FROM t1 WHERE a = 10 OR b = 20;
+	 *   这里 (a=10 OR b=20) 就是 Restriction OR。
+	 *   如果 a 和 b 都有索引，将生成 BitmapOr(BitmapIndexScan(a), BitmapIndexScan(b))。
+	 *
+	 * 逻辑：
+	 * 调用 generate_bitmap_or_paths 尝试为 OR 的每个分支找到索引。
+	 * 如果成功，生成 BitmapOrPath 并加入 bitindexpaths。
+	 * 注意第二个参数是 NIL，表示没有 "other clauses" 需要考虑（或者说已经在 baserestrictinfo 里了）。
 	 */
 	indexpaths = generate_bitmap_or_paths(root, rel,
 							rel->baserestrictinfo, NIL);
 	bitindexpaths = list_concat(bitindexpaths, indexpaths);
 
 	/*
-	 * 同理，为连接OR条件生成BitmapOrPath
+	 * 第二步：处理连接 OR 条件 (Join ORs)
+	 * 来源：joinorclauses (在阶段 2 中收集的)
+	 *
+	 * 举例：
+	 *   SELECT * FROM t1 JOIN t2 ON (t1.x = t2.a OR t1.y = t2.b) WHERE t1.z = 100;
+	 *   这里 (t1.x = t2.a OR t1.y = t2.b) 是 Join OR。
+	 *   t1.z = 100 是单表限制条件 (baserestrictinfo)。
+	 *
+	 * 逻辑：
+	 * 这些 OR 条件涉及其他表，因此生成的路径将是 "参数化路径" (Parameterized Paths)。
+	 * 我们把 rel->baserestrictinfo (即 t1.z=100) 作为 "other clauses" 传入。
+	 * 这样生成的路径可能是：
+	 *   BitmapOr(
+	 *     BitmapIndexScan(x, filter: z=100),
+	 *     BitmapIndexScan(y, filter: z=100)
+	 *   )
+	 * 这样在处理 Join OR 的同时，也能利用单表的过滤条件来进一步减少扫描量。
 	 */
 	indexpaths = generate_bitmap_or_paths(root, rel,
 							joinorclauses, rel->baserestrictinfo);
 	bitjoinpaths = list_concat(bitjoinpaths, indexpaths);
 
 	/*
-	 * 处理位图索引路径：为所有位图索引路径生成一个最优的BitmapHeapPath
-	 * 即使有多个索引，也只生成一个路径，因为最终会根据总成本选择最优组合
+	 * 阶段 5: 生成位图堆扫描路径 (Bitmap Heap Scan)
+	 *
+	 * 此时，bitindexpaths 列表中包含了所有可能的位图索引路径：
+	 * - 单个索引的 BitmapIndexScan
+	 * - OR 条件生成的 BitmapOrPath
+	 *
+	 * 逻辑：
+	 * 1. 组合 (choose_bitmap_and):
+	 *    我们可能收集到了多个独立的索引路径，例如 "a=1" 的路径和 "b=2" 的路径。
+	 *    如果查询是 "WHERE a=1 AND b=2"，我们可以把这两个路径组合成一个 BitmapAndPath。
+	 *    choose_bitmap_and 会尝试各种组合，找出成本最低的那个“最佳组合” (bitmapqual)。
+	 *    这个最佳组合可能是一个单独的索引扫描，也可能是多个索引扫描的 AND/OR 树。
+	 *
+	 * 2. 封装 (create_bitmap_heap_path):
+	 *    BitmapIndexScan 只负责生成 TID 位图。
+	 *    我们需要一个 BitmapHeapScan 节点来真正根据位图去堆表 (Heap) 中抓取数据。
+	 *    create_bitmap_heap_path 就负责创建这个节点。
+	 *
+	 * 3. 并行 (Parallel Query):
+	 *    如果表支持并行扫描 (consider_parallel) 且没有复杂的侧向引用 (lateral_relids)，
+	 *    我们还会尝试生成并行的位图堆扫描路径 (Parallel Bitmap Heap Scan)。
+	 *    这允许利用多个 worker 进程来分担“查表”和“处理数据”的繁重工作。
 	 */
 	if (bitindexpaths != NIL)
 	{
-		Path	   *bitmapqual; /* 位图条件的最优组合 */
-		BitmapHeapPath *bpath;  /* 生成的位图堆路径 */
+		Path	   		*bitmapqual; 	/* 位图条件的最优组合 */
+		BitmapHeapPath 	*bpath;  		/* 生成的位图堆路径 */
 
 		/* 选择位图索引路径的最优AND组合 */
 		bitmapqual = choose_bitmap_and(root, rel, bitindexpaths);
+
 		/* 创建位图堆路径，使用关系的lateral_relids作为参数化要求 */
 		bpath = create_bitmap_heap_path(root, rel, bitmapqual,
 								rel->lateral_relids, 1.0, 0);
+								
 		/* 将生成的路径添加到关系的路径列表中 */
 		add_path(rel, (Path *) bpath);
 
@@ -365,15 +476,27 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	}
 
 	/*
-	 * 处理位图连接路径：为每种不同的参数化方式生成对应的BitmapHeapPath
-	 * 这允许在不同的连接上下文中使用位图索引
+	 * 处理位图连接路径 (Parameterized Bitmap Paths)：
+	 *
+	 * 普通的索引扫描只依赖当前表的常量条件。但有些索引扫描依赖于连接条件（参数化路径），
+	 * 这些路径只有在特定的外部表（Outer Rels）被扫描后才有效。
+	 *
+	 * 这里的逻辑是：
+	 * 1. 找出所有可能的“外部依赖环境”（Parameterization），即不同的 required_outer 集合。
+	 * 2. 针对每种依赖环境，找出所有兼容的位图索引路径（包括依赖该环境子集的路径，以及不依赖任何环境的普通路径）。
+	 * 3. 使用 choose_bitmap_and 将这些路径组合起来（AND操作），生成该环境下的最佳位图堆扫描路径。
+	 *
+	 * 这允许优化器根据当前的连接顺序，动态地组合多个索引，在复杂的连接查询中利用位图扫描。
 	 */
 	if (bitjoinpaths != NIL)
 	{
 		List	   *all_path_outers; /* 所有不同的参数化集合 */
 		ListCell   *lc;
 
-		/* 步骤1：收集所有不同的参数化集合 */
+		/*
+		 * 步骤1：收集所有不同的参数化集合
+		 * 找出所有出现在 bitjoinpaths 中的“外部依赖集合”（required_outer）。
+		 */
 		all_path_outers = NIL;
 		foreach(lc, bitjoinpaths)
 		{
@@ -388,13 +511,13 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 		/* 步骤2：为每种参数化集合生成对应的位图堆路径 */
 		foreach(lc, all_path_outers)
 		{
-			Relids		max_outers = (Relids) lfirst(lc);
-			List	   *this_path_set; /* 特定参数化集合的路径集合 */
-			Path	   *bitmapqual; /* 位图条件的最优组合 */
-			Relids		required_outer; /* 最终路径需要的外部关系 */
-			double		loop_count; /* 循环迭代次数估计 */
-			BitmapHeapPath *bpath; /* 生成的位图堆路径 */
-			ListCell   *lcp;
+			Relids			max_outers = (Relids) lfirst(lc);
+			List	   		*this_path_set; 	/* 特定参数化集合的路径集合 */
+			Path	   		*bitmapqual; 		/* 位图条件的最优组合 */
+			Relids			required_outer; 	/* 最终路径需要的外部关系 */
+			double			loop_count; 		/* 循环迭代次数估计 */
+			BitmapHeapPath 	*bpath; 			/* 生成的位图堆路径 */
+			ListCell   		*lcp;
 
 			/* 收集所有与当前参数化集合兼容的位图连接路径 */
 			this_path_set = NIL;
@@ -408,22 +531,71 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			}
 
 			/*
-			 * 添加限制条件的位图路径，因为它们不依赖特定连接上下文
-			 * 可以与任何连接条件组合使用
+			 * 将普通的位图索引路径（bitindexpaths）也加入到候选集合中。
+			 *
+			 * 原因：
+			 * 1. bitindexpaths 中包含的是基于单表限制条件（Restriction Clauses，如 WHERE a = 1）生成的路径。
+			 *    这些路径不依赖于任何外部表（Outer Relations），因此它们的参数化集合是空的（或仅包含自身）。
+			 * 2. 参数化路径（Parameterized Paths，如 WHERE a = t2.x）必须在特定的外部表（t2）可用时才能执行。
+			 * 3. 但是，非参数化的路径可以在任何上下文中执行。
+			 *
+			 * 目的：
+			 * 我们希望 choose_bitmap_and 能够尝试将“基于连接条件的索引扫描”与“基于单表条件的索引扫描”结合起来。
+			 * 例如：SELECT * FROM t1, t2 WHERE t1.x = t2.a AND t1.y = 100;
+			 * - 路径 A (来自 bitjoinpaths): BitmapIndexScan on t1.x (条件: x = t2.a)
+			 * - 路径 B (来自 bitindexpaths): BitmapIndexScan on t1.y (条件: y = 100)
+			 *
+			 * 通过将它们合并到 this_path_set，choose_bitmap_and 可以生成一个 BitmapAndPath(A, B)。
+			 * 这样在执行 Nested Loop Join 时，内表 t1 的扫描不仅利用了连接条件，还利用了本地过滤条件，
+			 * 从而进一步减少扫描的堆表行数。
 			 */
 			this_path_set = list_concat(this_path_set, bitindexpaths);
 
-			/* 选择该参数化集合下的最优位图组合 */
+			/*
+			 * 步骤3：选择最优的位图组合
+			 *
+			 * choose_bitmap_and 会分析 this_path_set 中的所有路径，
+			 * 尝试各种 AND 组合（例如将参数化路径与普通路径结合），
+			 * 并基于成本估算（Cost Estimation）选出最佳方案。
+			 *
+			 * 结果 bitmapqual 可能是一个单独的 IndexPath，
+			 * 也可能是一个复杂的 BitmapAndPath/BitmapOrPath 树。
+			 */
 			bitmapqual = choose_bitmap_and(root, rel, this_path_set);
 
-			/* 获取最终路径所需的外部关系集合 */
+			/*
+			 * 步骤4：确定最终路径的参数化依赖
+			 *
+			 * 虽然我们是基于 max_outers 来收集路径的，但最终选出的 bitmapqual
+			 * 可能只使用了其中的一部分外部表（或者完全没用，如果普通路径更优）。
+			 * 因此，我们需要从生成的路径中提取实际的 required_outer。
+			 */
 			required_outer = PATH_REQ_OUTER(bitmapqual);
-			/* 估计嵌套循环的迭代次数 */
+
+			/*
+			 * 步骤5：估算循环次数
+			 *
+			 * 这是一个参数化路径，通常用于 Nested Loop Join 的内表。
+			 * 我们需要估算外表（Outer Relations）会产生多少行，即内表会被扫描多少次。
+			 * 这对于计算总成本至关重要。
+			 */
 			loop_count = get_loop_count(root, rel->relid, required_outer);
-			/* 创建位图堆路径，包含参数化信息和循环次数估计 */
+
+			/*
+			 * 步骤6：创建位图堆扫描路径 (Bitmap Heap Scan)
+			 *
+			 * 将位图索引扫描的结果（bitmapqual）封装成一个完整的堆表扫描路径。
+			 * 传入 required_outer 和 loop_count 以便正确计算参数化路径的成本。
+			 */
 			bpath = create_bitmap_heap_path(root, rel, bitmapqual,
 									required_outer, loop_count, 0);
-			/* 添加生成的路径到关系的路径列表 */
+
+			/*
+			 * 步骤7：提交路径
+			 *
+			 * 将生成的路径添加到 RelOptInfo 的 pathlist 中。
+			 * add_path 会负责与已有的路径进行比较，保留成本最低的那些。
+			 */
 			add_path(rel, (Path *) bpath);
 		}
 	}
@@ -746,10 +918,45 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 				IndexOptInfo *index, IndexClauseSet *clauses,
 				List **bitindexpaths)
 {
-	List	   *indexpaths;
+	List		*indexpaths;
+	ListCell   	*lc;
+
+	/*
+	 * skip_nonnative_saop:
+	 * 标记是否跳过了非原生的 ScalarArrayOpExpr (SAOP) 条件。
+	 *
+	 * 含义：
+	 * 如果索引 AM (Access Method) 不支持原生数组搜索 (amsearcharray = false)，
+	 * 那么在构建普通 Index Scan 时，我们通常不能将 SAOP (如 col IN (...)) 作为索引键，
+	 * 只能作为过滤条件。
+	 * 如果发生了这种情况，build_index_paths 会将此变量置为 true。
+	 *
+	 * 后续处理：
+	 * 如果此变量为 true，我们会在函数末尾生成一个 Bitmap Scan 路径。
+	 * 因为 Bitmap Scan 允许执行器在外部处理 SAOP（通过多次查找并 OR 位图），
+	 * 即使索引本身不支持数组也能利用索引加速。
+	 */
 	bool		skip_nonnative_saop = false;
+
+	/*
+	 * skip_lower_saop:
+	 * 标记是否跳过了位于较低（非第一）列的 ScalarArrayOpExpr 条件。
+	 *
+	 * 含义：
+	 * 对于多列索引，如果 SAOP 出现在非第一列（或者虽然在第一列但我们想保留排序），
+	 * 我们面临两个选择：
+	 * 1. (Skip): 把它当做 Filter。扫描更多行，但严格保留索引的物理顺序。
+	 * 2. (Include): 把它当做 Index Key。扫描更少行，但可能会被视为无序（取决于具体实现和代价模型）。
+	 *
+	 * 第一次调用 build_index_paths 时，我们倾向于生成“保留顺序”的路径，
+	 * 因此可能会跳过某些 SAOP 并将此变量置为 true。
+	 *
+	 * 后续处理：
+	 * 如果此变量为 true，我们会再次调用 build_index_paths，
+	 * 强制包含这些 SAOP 条件，生成一个“牺牲顺序但过滤更强”的路径。
+	 * 最终由优化器根据 Cost 决定选哪个。
+	 */
 	bool		skip_lower_saop = false;
-	ListCell   *lc;
 
 	/*
 	 * 首先用条件构造普通索引路径。
@@ -771,6 +978,39 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	/*
 	 * 如果跳过了非首列的 ScalarArrayOpExpr（且索引 AM 支持），
 	 * 则再尝试一次，把这些条件也包含进来（但会失去排序）。
+	 *
+	 * 详细解释：
+	 * 1. 背景：ScalarArrayOpExpr 通常指 "col IN (val1, val2)" 这种条件。
+	 *    在索引扫描中，处理这种条件有两种策略：
+	 *    策略 A (Skip): 把它当做普通 Filter。只扫描前导列，取出所有行后，再用 IN 条件过滤。
+	 *                  优点：保留了索引的物理顺序（PathKeys）。
+	 *                  缺点：扫描的行数多，I/O 开销大。
+	 *    策略 B (Include): 把它当做索引键（Index Key）。执行器会多次扫描索引（针对 val1 扫一次，针对 val2 扫一次...）。
+	 *                  优点：扫描行数少，精确获取数据。
+	 *                  缺点：通常会破坏排序顺序（或者被视为无序），导致无法利用索引消除 Sort 节点。
+	 *
+	 * 2. 逻辑：
+	 *    - 在此之前的代码（第一次 build_index_paths 调用）尝试优先保留排序（策略 A）。
+	 *      如果在该过程中遇到了会破坏排序的 SAOP 条件，它会选择“跳过”该条件（即不作为索引键），
+	 *      并将 skip_lower_saop 标记为 true。
+	 *    - 现在的代码块（if (skip_lower_saop)）则是为了补全另一种可能性（策略 B）。
+	 *      既然之前为了排序牺牲了过滤效率，现在我们反过来，牺牲排序来换取过滤效率。
+	 *      我们再次调用 build_index_paths，这次允许包含那些 SAOP 条件。
+	 *
+	 * 3. 举例：
+	 *    索引: (x, y)
+	 *    查询: SELECT * FROM t WHERE x = 1 AND y IN (10, 20) ORDER BY y;
+	 *
+	 *    - 路径 1 (之前生成的): 索引扫描 x=1。Filter: y IN (10, 20)。
+	 *      结果是有序的 (x, y)，满足 ORDER BY y。不需要额外 Sort。
+	 *      但如果 x=1 的行很多，性能可能差。
+	 *
+	 *    - 路径 2 (这里生成的): 索引扫描 x=1 AND y=10; x=1 AND y=20。
+	 *      结果被视为无序（或顺序被打断）。
+	 *      需要额外的 Sort 节点来满足 ORDER BY y。
+	 *      但如果 x=1 的行有一百万条，而 y IN (10, 20) 只有两条，这个路径会快得多。
+	 *
+	 *    优化器生成这两条路径，通过代价估算（Cost Estimation）选择最便宜的一条。
 	 */
 	if (skip_lower_saop)
 	{
@@ -790,6 +1030,28 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	 *
 	 * 同时，挑选出能用于位图扫描的路径。只考虑支持位图扫描的索引，
 	 * 且只要路径有选择性（即不是仅用于排序的路径）。
+	 *
+	 * 详细解释：
+	 * 1. 普通索引扫描 (Index Scan):
+	 *    - 必须检查 index->amhasgettuple。这是访问方法 (AM) 的属性，
+	 *      表示该索引是否支持一次返回一个元组 (Iterate)。
+	 *      绝大多数索引（B-Tree, GiST, SP-GiST）都支持。
+	 *      如果支持，直接调用 add_path 将其作为候选路径加入 RelOptInfo。
+	 *
+	 * 2. 位图索引扫描 (Bitmap Index Scan):
+	 *    - 必须检查 index->amhasgetbitmap。表示该索引是否支持返回元组 ID 的位图 (Bitmap)。
+	 *      GIN, BRIN 以及 B-Tree, GiST 等都支持。
+	 *    - 收集到的路径存入 bitindexpaths 列表，供后续 generate_bitmap_or_paths 使用
+	 *      （位图扫描可以组合多个索引，如 WHERE a=1 AND b=2）。
+	 *
+	 * 3. 过滤条件 (ipath->path.pathkeys == NIL || ipath->indexselectivity < 1.0):
+	 *    - 如果 ipath->path.pathkeys == NIL：说明这个索引路径本来就是无序的（比如 Hash 索引，或者查询不需要排序）。
+	 *      那么转成位图扫描没有损失排序能力（因为本来就没有），所以是可以接受的。
+	 *	  - 如果 ipath->path.pathkeys != NIL：说明这个索引路径是有序的（比如 B-Tree）。转成位图扫描会丢失这个排序。
+	 *	    如果丢失排序，我们必须有其他收益（比如 indexselectivity < 1.0，即过滤掉了很多行，减少了 I/O）才值得这么做。
+	 *    - 如果一个索引路径存在的唯一价值是提供排序（pathkeys != NIL），
+	 *      但它不进行任何过滤（selectivity == 1.0，即全表扫描），那么把它转成位图扫描是毫无意义的：既不减少 I/O（全表），又丢失了排序。
+	 *    - 因此，我们只收集那些“有过滤效果”的路径，或者“本来就无序”的路径。
 	 */
 	foreach(lc, indexpaths)
 	{
@@ -807,6 +1069,29 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	/*
 	 * 如果有 ScalarArrayOpExpr 条件但索引不支持原生处理，
 	 * 则生成依赖于执行器处理 ScalarArrayOpExpr 的位图扫描路径。
+	 *
+	 * 详细解释：
+	 * 1. ScalarArrayOpExpr (SAOP): 通常指 "col IN (val1, val2)" 或 "col = ANY(arr)"。
+	 *
+	 * 2. 原生支持 (Native Support):
+	 *    - 某些索引访问方法 (AM)（如 B-Tree）原生支持 SAOP (amsearcharray = true)。
+	 *      它们可以在一次扫描中处理整个数组，或者由 AM 内部处理迭代。
+	 *    - 另一些 AM 可能不支持（amsearcharray = false）。
+	 *      对于普通 Index Scan，如果 AM 不支持，我们通常无法将 SAOP 作为索引条件（Index Qual），
+	 *      只能把它当做普通的过滤条件（Filter），这会降低效率。
+	 *      因此，之前的逻辑可能会跳过这些条件 (skip_nonnative_saop = true)。
+	 *
+	 * 3. 位图扫描的特殊性 (Bitmap Scan Magic):
+	 *    - 位图扫描 (Bitmap Index Scan) 有一种特殊能力：即使索引 AM 本身不支持 SAOP，
+	 *      执行器 (Executor) 也可以在外部处理它。
+	 *    - 执行器会遍历数组中的每个元素，对每个元素执行一次索引查找，
+	 *      然后将生成的所有位图进行 OR 运算（并集）。
+	 *
+	 * 4. 逻辑：
+	 *    - 如果之前因为 AM 不支持而跳过了某些 SAOP 条件 (skip_nonnative_saop)，
+	 *      现在我们专门请求生成位图扫描路径 (ST_BITMAPSCAN)。
+	 *    - 在 ST_BITMAPSCAN 模式下，build_index_paths 会允许使用这些非原生的 SAOP 条件。
+	 *    - 这样我们就能利用索引来加速 IN 查询，即使索引本身并不“懂”数组。
 	 */
 	if (skip_nonnative_saop)
 	{
@@ -1055,39 +1340,80 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
                                !found_lower_saop_clause &&
                                has_useful_pathkeys(root, rel));
     // 检查索引是否有序（通过sortopfamily是否存在判断）
-    index_is_ordered = (index->sortopfamily != NULL);
-    if (index_is_ordered && pathkeys_possibly_useful)
-    {
-        // 构建正向扫描方向的索引排序键
-        index_pathkeys = build_index_pathkeys(root, index,
-                                              ForwardScanDirection);
-        // 截断无用的排序键
-        useful_pathkeys = truncate_useless_pathkeys(root, rel,
-                                                   index_pathkeys);
-        orderbyclauses = NIL;
-        orderbyclausecols = NIL;
-    }
-    else if (index->amcanorderbyop && pathkeys_possibly_useful)
-    {
-        /* 查看我们是否可以为query_pathkeys生成排序操作符 */
-        match_pathkeys_to_index(index, root->query_pathkeys,
-                               &orderbyclauses,
-                               &orderbyclausecols);
-        if (orderbyclauses)
-            useful_pathkeys = root->query_pathkeys;
-        else
-            useful_pathkeys = NIL;
-    }
-    else
-    {
-        // 排序键无用的情况
-        useful_pathkeys = NIL;
-        orderbyclauses = NIL;
-        orderbyclausecols = NIL;
-    }
+	index_is_ordered = (index->sortopfamily != NULL);
 
-    /*
-     * 第三步：检查是否可以进行仅索引扫描
+	/*
+	 * 1. 处理有序索引 (Ordered Index, 如 B-Tree)
+	 * 
+	 * 如果索引本身是有序的 (index_is_ordered)，并且查询可能需要排序 (pathkeys_possibly_useful)，
+	 * 我们尝试利用索引的顺序来满足查询的排序需求 (ORDER BY) 或合并连接 (Merge Join) 的需求。
+	 */
+	if (index_is_ordered && pathkeys_possibly_useful)
+	{
+		/*
+		 * build_index_pathkeys:
+		 * 根据索引的定义（列顺序、操作符族、排序方向等）构建该索引能提供的 PathKeys。
+		 * 这里默认构建正向扫描 (ForwardScanDirection) 的 PathKeys。
+		 * (反向扫描 BackwardScanDirection 的处理通常在 create_index_paths 中通过单独的逻辑处理)
+		 */
+		index_pathkeys = build_index_pathkeys(root, index,
+											  ForwardScanDirection);
+		
+		/*
+		 * truncate_useless_pathkeys:
+		 * 索引提供的 PathKeys 可能比查询需要的更多。
+		 * 例如：索引是 (a, b, c)，查询是 ORDER BY a, b。
+		 * 虽然索引提供了 (a, b, c) 的顺序，但对于优化器来说，只有前两个是有用的。
+		 * 这个函数会截断多余的部分，只保留对当前查询有意义的前缀。
+		 * 这有助于后续代价计算和路径比较的准确性。
+		 */
+		useful_pathkeys = truncate_useless_pathkeys(root, rel,
+													index_pathkeys);
+		orderbyclauses = NIL;
+		orderbyclausecols = NIL;
+	}
+	/*
+	 * 2. 处理支持排序操作符的索引 (如 GiST / KNN-GiST)
+	 * 
+	 * 某些索引（如 GiST）本身不是全序的，但支持通过特定的操作符进行“距离排序” (KNN, K-Nearest Neighbor)。
+	 * 例如：ORDER BY point <-> center_point (按距离排序)。
+	 * index->amcanorderbyop 标志表示该索引访问方法支持这种排序。
+	 */
+	else if (index->amcanorderbyop && pathkeys_possibly_useful)
+	{
+		/* 
+		 * match_pathkeys_to_index:
+		 * 尝试将查询请求的排序键 (root->query_pathkeys) 映射到索引支持的排序操作符上。
+		 * 
+		 * 这里的逻辑与 B-Tree 不同：
+		 * - B-Tree 是“索引决定顺序”，我们看索引能提供什么。
+		 * - KNN 是“查询决定顺序”，我们看索引能否满足查询特定的 ORDER BY 表达式。
+		 * 
+		 * 如果匹配成功，orderbyclauses 会包含对应的排序子句，
+		 * useful_pathkeys 直接设置为查询需要的 pathkeys。
+		 */
+		match_pathkeys_to_index(index, root->query_pathkeys,
+								&orderbyclauses,
+								&orderbyclausecols);
+		if (orderbyclauses)
+			useful_pathkeys = root->query_pathkeys;
+		else
+			useful_pathkeys = NIL;
+	}
+	else
+	{
+		/*
+		 * 3. 既无序也不支持排序操作符，或者查询不需要排序
+		 * 
+		 * 这种情况下，索引扫描产生的路径被视为无序的。
+		 */
+		useful_pathkeys = NIL;
+		orderbyclauses = NIL;
+		orderbyclausecols = NIL;
+	}
+
+	/*
+	 * 第三步：检查是否可以进行仅索引扫描
      * 如果我们不构建普通索引扫描，则这无关紧要，因为位图扫描无论如何都不支持索引数据检索
      */
     index_only_scan = (scantype != ST_BITMAPSCAN &&
@@ -1097,8 +1423,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
      * 第四步：如果当前条件中有相关的限制条件，或者索引排序可能对后续合并或最终输出排序有用，
      * 或者索引有有用的谓词，或者可以进行仅索引扫描，则生成索引扫描路径
      */
-    if (index_clauses != NIL || useful_pathkeys != NIL || useful_predicate ||
-        index_only_scan)
+    if (index_clauses != NIL || useful_pathkeys != NIL || useful_predicate || index_only_scan)
     {
         // 创建索引路径（非并行）
         ipath = create_index_path(root, index,
@@ -1106,9 +1431,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
                                  orderbyclauses,
                                  orderbyclausecols,
                                  useful_pathkeys,
-                                 index_is_ordered ?
-                                 ForwardScanDirection :
-                                 NoMovementScanDirection,
+                                 index_is_ordered ? ForwardScanDirection : NoMovementScanDirection,
                                  index_only_scan,
                                  outer_relids,
                                  loop_count,
@@ -1131,18 +1454,32 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
                                      orderbyclauses,
                                      orderbyclausecols,
                                      useful_pathkeys,
-                                     index_is_ordered ?
-                                     ForwardScanDirection :
-                                     NoMovementScanDirection,
+                                     index_is_ordered ? ForwardScanDirection : NoMovementScanDirection,
                                      index_only_scan,
                                      outer_relids,
                                      loop_count,
                                      true); // 启用并行
 
-            /*
-             * 成本计算后，如果发现使用并行工作进程不值得，就释放它
-             * 否则将其添加为部分路径
-             */
+			/*
+			 * 成本计算后，如果发现使用并行工作进程不值得，就释放它
+			 * 否则将其添加为部分路径
+			 *
+			 * 详细解释：
+			 * 1. create_index_path 在最后会调用 cost_index 来估算路径的成本。
+			 *    在估算过程中，优化器会根据表的大小、索引的大小以及 CPU/IO 参数来决定
+			 *    是否值得启动并行工作进程 (Parallel Workers)。
+			 *
+			 * 2. 如果优化器认为并行执行的开销（启动进程、通信等）超过了收益（例如表太小），
+			 *    它会将 ipath->path.parallel_workers 设置为 0。
+			 *
+			 * 3. add_partial_path 用于将路径添加到关系的 "partial_pathlist" 中。
+			 *    Partial Path 是指只扫描部分数据的路径，必须由 Gather 或 Gather Merge 节点汇总。
+			 *    如果 parallel_workers 为 0，说明这实际上退化成了一个串行路径，
+			 *    它不应该作为 Partial Path 存在（因为 Partial Path 必须并行运行）。
+			 *
+			 * 4. 因此，如果 parallel_workers == 0，我们直接丢弃这个路径 (pfree)，
+			 *    避免将其加入候选列表。
+			 */
             if (ipath->path.parallel_workers > 0)
                 add_partial_path(rel, (Path *) ipath);
             else
@@ -1197,14 +1534,30 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
                                          loop_count,
                                          true); // 启用并行
 
-                /*
-                 * 成本计算后，如果发现使用并行工作进程不值得，就释放它
-                 * 否则将其添加为部分路径
-                 */
-                if (ipath->path.parallel_workers > 0)
-                    add_partial_path(rel, (Path *) ipath);
-                else
-                    pfree(ipath);
+				/*
+				 * 成本计算后，如果发现使用并行工作进程不值得，就释放它
+				 * 否则将其添加为部分路径
+				 *
+				 * 详细解释：
+				 * 1. create_index_path 在最后会调用 cost_index 来估算路径的成本。
+				 *    在估算过程中，优化器会根据表的大小、索引的大小以及 CPU/IO 参数来决定
+				 *    是否值得启动并行工作进程 (Parallel Workers)。
+				 *
+				 * 2. 如果优化器认为并行执行的开销（启动进程、通信等）超过了收益（例如表太小），
+				 *    它会将 ipath->path.parallel_workers 设置为 0。
+				 *
+				 * 3. add_partial_path 用于将路径添加到关系的 "partial_pathlist" 中。
+				 *    Partial Path 是指只扫描部分数据的路径，必须由 Gather 或 Gather Merge 节点汇总。
+				 *    如果 parallel_workers 为 0，说明这实际上退化成了一个串行路径，
+				 *    它不应该作为 Partial Path 存在（因为 Partial Path 必须并行运行）。
+				 *
+				 * 4. 因此，如果 parallel_workers == 0，我们直接丢弃这个路径 (pfree)，
+				 *    避免将其加入候选列表。
+				 */
+				if (ipath->path.parallel_workers > 0)
+					add_partial_path(rel, (Path *) ipath);
+				else
+					pfree(ipath);
             }
         }
     }
@@ -1213,106 +1566,183 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
     return result;
 }
 
-
 /*
  * build_paths_for_OR
- *	  Given a list of restriction clauses from one arm of an OR clause,
- *	  construct all matching IndexPaths for the relation.
+ *	  给定一个 OR 子句的某个分支的限制条件列表，为该关系构造所有匹配的 IndexPath。
  *
- * Here we must scan all indexes of the relation, since a bitmap OR tree
- * can use multiple indexes.
+ * 这里必须扫描关系的所有索引，因为位图 OR 树可以使用多个索引。
  *
- * The caller actually supplies two lists of restriction clauses: some
- * "current" ones and some "other" ones.  Both lists can be used freely
- * to match keys of the index, but an index must use at least one of the
- * "current" clauses to be considered usable.  The motivation for this is
- * examples like
+ * 调用者实际上会提供两个限制条件列表：一些“当前”条件和一些“其他”条件。
+ * 两个列表都可以自由用于匹配索引的键，但一个索引必须至少使用一个“当前”条件才被认为可用。
+ * 这样做的动机如下：
  *		WHERE (x = 42) AND (... OR (y = 52 AND z = 77) OR ....)
- * While we are considering the y/z subclause of the OR, we can use "x = 42"
- * as one of the available index conditions; but we shouldn't match the
- * subclause to any index on x alone, because such a Path would already have
- * been generated at the upper level.  So we could use an index on x,y,z
- * or an index on x,y for the OR subclause, but not an index on just x.
- * When dealing with a partial index, a match of the index predicate to
- * one of the "current" clauses also makes the index usable.
+ * 当我们考虑 OR 的 y/z 分支时，可以用 "x = 42" 作为可用的索引条件之一；
+ * 但不应该把该分支匹配到仅包含 x 的索引，因为这种路径已经在上层生成过了。
+ * 所以对于 OR 分支，可以用 x,y,z 或 x,y 的索引，但不能用只有 x 的索引。
+ * 对于部分索引，如果索引谓词能被“当前”条件证明，也可以使用该索引。
  *
- * 'rel' is the relation for which we want to generate index paths
- * 'clauses' is the current list of clauses (RestrictInfo nodes)
- * 'other_clauses' is the list of additional upper-level clauses
+ * 'rel' 是我们要为其生成索引路径的关系
+ * 'clauses' 是当前分支的条件列表（RestrictInfo 节点）
+ * 'other_clauses' 是额外的上层条件列表
  */
 static List *
 build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 				   List *clauses, List *other_clauses)
 {
 	List	   *result = NIL;
-	List	   *all_clauses = NIL;	/* not computed till needed */
+	List	   *all_clauses = NIL;	/* 直到需要时才计算 */
 	ListCell   *lc;
 
+	/*
+	 * 遍历关系上的每一个索引，寻找能用于当前 OR 分支的位图路径。
+	 */
 	foreach(lc, rel->indexlist)
 	{
-		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
-		IndexClauseSet clauseset;
-		List	   *indexpaths;
-		bool		useful_predicate;
+		IndexOptInfo 	*index = (IndexOptInfo *) lfirst(lc);
+		IndexClauseSet 	clauseset;
+		List	   		*indexpaths;
+		bool			useful_predicate;
 
-		/* Ignore index if it doesn't support bitmap scans */
+		/* 
+		 * 必须支持位图扫描 (Bitmap Scan)。
+		 * 绝大多数索引类型 (B-Tree, GIN, GiST, BRIN) 都支持。
+		 */
 		if (!index->amhasgetbitmap)
 			continue;
 
 		/*
-		 * Ignore partial indexes that do not match the query.  If a partial
-		 * index is marked predOK then we know it's OK.  Otherwise, we have to
-		 * test whether the added clauses are sufficient to imply the
-		 * predicate. If so, we can use the index in the current context.
-		 *
-		 * We set useful_predicate to true iff the predicate was proven using
-		 * the current set of clauses.  This is needed to prevent matching a
-		 * predOK index to an arm of an OR, which would be a legal but
-		 * pointlessly inefficient plan.  (A better plan will be generated by
-		 * just scanning the predOK index alone, no OR.)
+		 * 处理部分索引 (Partial Index) 的逻辑。
+		 * 部分索引是指带有 WHERE 子句的索引，例如: CREATE INDEX idx ON t(a) WHERE b > 10;
+		 * 
+		 * 核心问题：
+		 * 我们能否在这个查询上下文中使用这个部分索引？
+		 * 只有当查询条件 (Query Quals) 能够证明索引的谓词 (Index Predicate) 为真时，才能使用。
+		 * 
+		 * 变量 useful_predicate:
+		 * 标记这个索引是否是因为当前处理的 OR 分支条件才变得可用的。
+		 * 
+		 * 举例：
+		 *   索引: WHERE b > 10
+		 *   查询: SELECT * FROM t WHERE (a = 1 AND b > 10) OR (c = 2)
+		 *   当前处理的分支: (a = 1 AND b > 10)
+		 * 
+		 *   - 如果索引谓词 (b > 10) 被当前分支的条件 (b > 10) 所蕴含，
+		 *     那么 useful_predicate = true。这意味着这个索引对这个分支特别有用。
+		 * 
+		 *   - 如果索引谓词已经被顶层的其他条件 (other_clauses) 蕴含了（即 index->predOK 为真），
+		 *     那么虽然索引可用，但 useful_predicate = false。
+		 *     这通常意味着我们不需要把它作为 OR 的一部分，直接在顶层用它可能更好。
 		 */
 		useful_predicate = false;
 		if (index->indpred != NIL)
 		{
 			if (index->predOK)
 			{
-				/* Usable, but don't set useful_predicate */
+				/* 可用，但不设置 useful_predicate */
 			}
 			else
 			{
-				/* Form all_clauses if not done already */
+				/* 如果还没构造 all_clauses，则现在构造 */
 				if (all_clauses == NIL)
 					all_clauses = list_concat(list_copy(clauses),
 											  other_clauses);
 
+				/* 检查：当前所有条件是否蕴含索引谓词？ */
 				if (!predicate_implied_by(index->indpred, all_clauses, false))
-					continue;	/* can't use it at all */
+					continue;	/* 完全不可用，跳过 */
 
+				/* 检查：是否仅靠 other_clauses 就能蕴含？如果不是，说明当前 clauses 起到了关键作用 */
 				if (!predicate_implied_by(index->indpred, other_clauses, false))
 					useful_predicate = true;
 			}
 		}
 
 		/*
-		 * Identify the restriction clauses that can match the index.
+		 * 找出能与索引匹配的限制条件。
+		 * 这里只匹配当前 OR 分支的条件 (clauses)。
+		 *
+		 * 举例说明列匹配 (Column Matching):
+		 *   假设索引 idx_ab 是 (a, b)。
+		 *   当前 OR 分支是 (a = 1 AND b = 2)。
+		 *   match_clauses_to_index 会遍历 clauses 列表：
+		 *   1. 看到 a=1，发现它匹配索引第 1 列。
+		 *   2. 看到 b=2，发现它匹配索引第 2 列。
+		 *   结果：clauseset 中记录了这两个匹配，后续 build_index_paths 将利用它们生成
+		 *        Bitmap Index Scan (a=1 AND b=2)。
 		 */
 		MemSet(&clauseset, 0, sizeof(clauseset));
 		match_clauses_to_index(root, clauses, index, &clauseset);
 
 		/*
-		 * If no matches so far, and the index predicate isn't useful, we
-		 * don't want it.
+		 * 过滤无用索引 (Filter Useless Indexes)。
+		 *
+		 * 逻辑：
+		 * 我们只有在以下两种情况下才会使用一个索引：
+		 * 1. 索引列匹配 (clauseset.nonempty):
+		 *    查询条件中有类似 "col = val" 的子句，可以利用索引快速定位行。
+		 *    例如：WHERE id = 100，利用 id 上的索引。
+		 *
+		 * 2. 部分索引谓词匹配 (useful_predicate):
+		 *    虽然没有直接对索引列的查询条件，但查询条件隐含了部分索引的 WHERE 子句。
+		 *    例如：索引是 WHERE status = 'active'。查询是 WHERE status = 'active'。
+		 *    虽然我们可能没有 status 列的索引（或者 status 不是索引键），
+		 *    但扫描这个部分索引本身就相当于执行了 status = 'active' 的过滤。
+		 *    这比全表扫描要快（假设 active 的行只占一小部分）。
+		 *
+		 * 如果以上两点都不满足：
+		 * 意味着我们要么进行全索引扫描（Full Index Scan），要么全表扫描。
+		 * 在 OR 优化的上下文中，全索引扫描通常没有意义（除非是 Index-Only Scan，但这里是 Bitmap Scan），
+		 * 所以我们直接跳过，不生成路径。
 		 */
 		if (!clauseset.nonempty && !useful_predicate)
 			continue;
 
 		/*
-		 * Add "other" restriction clauses to the clauseset.
+		 * 尝试匹配“其他”限制条件 (other_clauses)。
+		 *
+		 * 逻辑：
+		 * other_clauses 是那些必须同时满足的顶层条件（Top-level AND clauses）。
+		 * 它们不属于当前的 OR 分支，但对整个查询都有效。
+		 *
+		 * 为什么这样做？
+		 * 即使我们已经确定索引对当前 OR 分支有用（通过上面的检查），
+		 * 如果能把顶层的公共条件也下推到索引扫描中，效率会更高。
+		 *
+		 * 举例：
+		 *   索引: idx_xz ON t(x, z)
+		 *   查询: SELECT * FROM t WHERE (x = 1 OR y = 2) AND z = 3;
+		 *   当前处理的分支: x = 1
+		 *
+		 *   1. 初始匹配: clauses (x=1) 匹配索引第 1 列。索引被判定为有用。
+		 *   2. 额外匹配: other_clauses (z=3) 匹配索引第 2 列。
+		 *   3. 结果: 生成的 Bitmap Index Scan 将使用条件 "x=1 AND z=3"。
+		 *      这比只扫描 "x=1" 然后再过滤 "z=3" 要快得多。
 		 */
 		match_clauses_to_index(root, other_clauses, index, &clauseset);
 
 		/*
-		 * Construct paths if possible.
+		 * 构造位图扫描路径 (Construct Bitmap Paths)。
+		 *
+		 * 关键参数解释：
+		 * 1. clauseset: 
+		 *    包含了我们刚才辛苦匹配到的所有索引条件（来自当前 OR 分支 + 公共条件）。
+		 * 
+		 * 2. useful_predicate: 
+		 *    告诉函数，即使 clauseset 为空，这个部分索引也是有用的（因为它隐含了过滤条件）。
+		 * 
+		 * 3. ST_BITMAPSCAN: 
+		 *    这是最重要的指令！它告诉 build_index_paths：
+		 *    "不要给我生成普通的 IndexScan，我要的是 BitmapIndexScan。"
+		 *    
+		 *    区别：
+		 *    - IndexScan: 直接返回元组 (Tuple)。
+		 *    - BitmapIndexScan: 返回元组 ID 的位图 (TID Bitmap)。
+		 *    
+		 *    为什么这里必须是 BitmapScan？
+		 *    因为我们正在处理 OR 查询。OR 的逻辑是 "集合的并集"。
+		 *    我们无法直接合并两个 IndexScan 的元组流（除非它们有序且我们做归并，但这很复杂且受限）。
+		 *    但是，合并两个位图（Bitwise OR）是非常简单且高效的。
+		 *    所以，OR 优化的基础就是将所有分支都转换为位图，然后进行位运算。
 		 */
 		indexpaths = build_index_paths(root, rel,
 									   index, &clauseset,
@@ -1325,6 +1755,7 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 
 	return result;
 }
+
 /*
  * generate_bitmap_or_paths
  *    遍历条件列表寻找OR子句，并为每个可以处理的OR子句生成一个BitmapOrPath
@@ -1346,191 +1777,206 @@ static List *
 generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
                          List *clauses, List *other_clauses)
 {
-    List       *result = NIL;          // 存储生成的BitmapOrPath结果列表
-    List       *all_clauses;           // 所有条件（clauses和other_clauses的合并）
-    ListCell   *lc;                    // 用于遍历clauses列表的迭代器
+	List	   *result = NIL;
+	List	   *all_clauses;
+	ListCell   *lc;
 
-    /*
-     * 我们可以将当前条件和其他条件都用作build_paths_for_OR的上下文；
-     * 无需从列表中移除OR子句
-     */
-    // 复制clauses列表并与other_clauses合并
-    all_clauses = list_concat(list_copy(clauses), other_clauses);
+	/*
+	 * 我们可以将当前条件和其他条件都用作build_paths_for_OR的上下文；
+	 * 无需从列表中移除OR子句
+	 */
+	all_clauses = list_concat(list_copy(clauses), other_clauses);
 
-    // 遍历每个条件，寻找OR子句
-    foreach(lc, clauses)
-    {
-        RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);  // 当前条件
-        List       *pathlist;          // 存储每个OR分支匹配的最佳位图路径
-        Path       *bitmapqual;        // 位图条件路径
-        ListCell   *j;                 // 用于遍历OR子句参数的迭代器
+	/*
+	 * 遍历每个条件，寻找 OR 子句。
+	 * 
+	 * 目标：
+	 * 为形如 "A OR B" 的查询条件生成 BitmapOr 路径。
+	 * 
+	 * 原理：
+	 * BitmapOr 路径的工作方式是：
+	 * 1. 分别为 A 生成一个位图扫描路径。
+	 * 2. 分别为 B 生成一个位图扫描路径。
+	 * 3. 将两个位图进行 OR 运算（并集）。
+	 * 
+	 * 限制：
+	 * 必须保证 OR 的 *每一个* 分支都能被索引覆盖。
+	 * 如果 A 能走索引但 B 不能，那么整个 OR 条件就不能用索引加速（必须全表扫描）。
+	 */
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		List	   *pathlist;
+		Path	   *bitmapqual;
+		ListCell   *j;
 
-        /* 忽略不是OR子句的RestrictInfo */
-        if (!restriction_is_or_clause(rinfo))
-            continue;
+		/* 忽略不是OR子句的RestrictInfo */
+		if (!restriction_is_or_clause(rinfo))
+			continue;
 
-        /*
-         * 我们必须能够为OR的每个分支匹配至少一个索引，否则无法使用它
-         */
-        pathlist = NIL;  // 初始化OR分支路径列表
-        // 遍历OR子句的每个参数
-        foreach(j, ((BoolExpr *) rinfo->orclause)->args)
-        {
-            Node       *orarg = (Node *) lfirst(j);  // OR子句的一个分支
-            List       *indlist;                     // 该分支匹配的索引路径列表
+		/*
+		 * 我们必须能够为OR的每个分支匹配至少一个索引，否则无法使用它
+		 */
+		pathlist = NIL;
+		foreach(j, ((BoolExpr *) rinfo->orclause)->args)
+		{
+			Node	   *orarg = (Node *) lfirst(j);
+			List	   *indlist;
 
-            /* OR参数应该是AND子句或子RestrictInfo */
-            if (is_andclause(orarg))
-            {
-                // OR分支是AND子句
-                List       *andargs = ((BoolExpr *) orarg)->args;
+			/* OR参数应该是AND子句或子RestrictInfo */
+			if (is_andclause(orarg))
+			{
+				/*
+				 * 情况 1: OR 的分支是一个 AND 组合。
+				 * 例如: (a=1 AND b=2) OR (c=3)
+				 * 这里处理的是 (a=1 AND b=2) 这一部分。
+				 * 
+				 * 我们递归调用 build_paths_for_OR 来为这个 AND 组合寻找索引路径。
+				 * 同时也递归调用 generate_bitmap_or_paths，以防这个分支内部还嵌套了 OR。
+				 */
+				List	   *andargs = ((BoolExpr *) orarg)->args;
 
-                // 为AND子句构建索引路径
-                indlist = build_paths_for_OR(root, rel,
-                                            andargs,
-                                            all_clauses);
+				indlist = build_paths_for_OR(root, rel,
+											 andargs,
+											 all_clauses);
 
-                /* 递归处理可能存在的子OR子句 */
-                indlist = list_concat(indlist,
-                                    generate_bitmap_or_paths(root, rel,
-                                                            andargs,
-                                                            all_clauses));
-            }
-            else
-            {
-                // OR分支是单个条件
-                RestrictInfo *or_rinfo = castNode(RestrictInfo, orarg);
-                List       *orargs;
+				/* Recurse in case there are sub-ORs */
+				indlist = list_concat(indlist,
+									  generate_bitmap_or_paths(root, rel,
+															   andargs,
+															   all_clauses));
+			}
+			else
+			{
+				/*
+				 * 情况 2: OR 的分支是一个简单条件。
+				 * 例如: a=1 OR b=2
+				 * 这里处理的是 a=1 或 b=2。
+				 */
+				RestrictInfo *or_rinfo = castNode(RestrictInfo, orarg);
+				List	   *orargs;
 
-                // 断言：单个OR分支不应该是OR子句
-                Assert(!restriction_is_or_clause(or_rinfo));
-                // 创建只有一个元素的列表
-                orargs = list_make1(or_rinfo);
+				Assert(!restriction_is_or_clause(or_rinfo));
+				orargs = list_make1(or_rinfo);
 
-                // 为单个条件构建索引路径
-                indlist = build_paths_for_OR(root, rel,
-                                            orargs,
-                                            all_clauses);
-            }
+				indlist = build_paths_for_OR(root, rel,
+											 orargs,
+											 all_clauses);
+			}
 
-            /*
-             * 如果这个分支没有匹配到任何索引路径，
-             * 我们就无法处理这个OR子句
-             */
-            if (indlist == NIL)
-            {
-                pathlist = NIL;  // 标记整个OR子句无法处理
-                break;          // 跳出循环，不再处理其他分支
-            }
+			/*
+			 * 关键检查：
+			 * 如果这个分支（无论是简单条件还是 AND 组合）找不到任何索引路径，
+			 * 那么整个 OR 优化宣告失败。
+			 * 我们清空 pathlist 并跳出内层循环，放弃处理这个 OR 子句。
+			 */
+			if (indlist == NIL)
+			{
+				pathlist = NIL;
+				break;
+			}
 
-            /*
-             * 从匹配的索引路径中选择最有希望的AND组合，
-             * 并将其添加到pathlist
-             */
-            bitmapqual = choose_bitmap_and(root, rel, indlist);
-            pathlist = lappend(pathlist, bitmapqual);
-        }
+			/*
+			 * 选择最佳路径：
+			 * 对于当前分支，可能找到了多个候选索引路径（例如有多个索引可用）。
+			 * choose_bitmap_and 会从中挑选出“最有希望”的一个（或者组合多个索引生成 BitmapAnd）。
+			 * 选出的路径被加入 pathlist，作为 BitmapOr 的一个子节点。
+			 */
+			bitmapqual = choose_bitmap_and(root, rel, indlist);
+			pathlist = lappend(pathlist, bitmapqual);
+		}
 
-        /*
-         * 如果我们为OR的每个分支都找到了匹配的路径，
-         * 那么将它们转换为BitmapOrPath，并添加到结果列表
-         */
-        if (pathlist != NIL)
-        {
-            // 创建位图OR路径
-            bitmapqual = (Path *) create_bitmap_or_path(root, rel, pathlist);
-            // 将路径添加到结果列表
-            result = lappend(result, bitmapqual);
-        }
-    }
+		/*
+		 * 成功！
+		 * 如果我们顺利走完了所有分支，并且 pathlist 不为空，
+		 * 说明每个分支都有索引可用。
+		 * 我们创建一个 BitmapOrPath 将它们组合起来，并加入结果列表。
+		 * 
+		 * 举例：
+		 *   SELECT * FROM t WHERE a=1 OR b=2;
+		 *   假设 a 和 b 都有索引。
+		 *   1. 处理 a=1: 找到 idx_a，生成 BitmapIndexScan(idx_a)。
+		 *   2. 处理 b=2: 找到 idx_b，生成 BitmapIndexScan(idx_b)。
+		 *   3. 组合: 生成 BitmapOrPath(BitmapIndexScan(idx_a), BitmapIndexScan(idx_b))。
+		 *   执行时，先查 idx_a 得到位图1，再查 idx_b 得到位图2，然后位图1 OR 位图2，最后回表。
+		 */
+		if (pathlist != NIL)
+		{
+			bitmapqual = (Path *) create_bitmap_or_path(root, rel, pathlist);
+			result = lappend(result, bitmapqual);
+		}
+	}
 
-    // 返回生成的所有BitmapOrPath列表
-    return result;
+	return result;
 }
-
 
 /*
  * choose_bitmap_and
- *		Given a nonempty list of bitmap paths, AND them into one path.
+ *		给定一个非空的位图路径列表，将它们通过 AND 组合成一个路径。
  *
- * This is a nontrivial decision since we can legally use any subset of the
- * given path set.  We want to choose a good tradeoff between selectivity
- * and cost of computing the bitmap.
+ * 这是一个非平凡的决策，因为我们可以合法地使用给定路径集的任意子集。
+ * 我们希望在选择性（selectivity）和计算位图的成本之间做出良好的权衡。
  *
- * The result is either a single one of the inputs, or a BitmapAndPath
- * combining multiple inputs.
+ * 返回结果要么是输入中的某一个路径，要么是将多个输入通过 BitmapAndPath 组合的路径。
  */
 static Path *
 choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 {
-	int			npaths = list_length(paths);
+	int				npaths = list_length(paths);
 	PathClauseUsage **pathinfoarray;
 	PathClauseUsage *pathinfo;
-	List	   *clauselist;
-	List	   *bestpaths = NIL;
-	Cost		bestcost = 0;
-	int			i,
-				j;
-	ListCell   *l;
+	List	   		*clauselist;
+	List	   		*bestpaths = NIL;
+	Cost			bestcost = 0;
+	int				i, j;
+	ListCell   		*l;
 
-	Assert(npaths > 0);			/* else caller error */
+	Assert(npaths > 0);	/* 调用者保证非空 */
 	if (npaths == 1)
-		return (Path *) linitial(paths);	/* easy case */
+		return (Path *) linitial(paths);	/* 只有一个路径，直接返回 */
 
 	/*
-	 * In theory we should consider every nonempty subset of the given paths.
-	 * In practice that seems like overkill, given the crude nature of the
-	 * estimates, not to mention the possible effects of higher-level AND and
-	 * OR clauses.  Moreover, it's completely impractical if there are a large
-	 * number of paths, since the work would grow as O(2^N).
+	 * 理论上我们应该考虑所有非空子集的组合（2^N-1 种）。
+	 * 实际上这样做太昂贵，且估算本身就很粗糙，N 较大时不可接受。
 	 *
-	 * As a heuristic, we first check for paths using exactly the same sets of
-	 * WHERE clauses + index predicate conditions, and reject all but the
-	 * cheapest-to-scan in any such group.  This primarily gets rid of indexes
-	 * that include the interesting columns but also irrelevant columns.  (In
-	 * situations where the DBA has gone overboard on creating variant
-	 * indexes, this can make for a very large reduction in the number of
-	 * paths considered further.)
+	 * 启发式做法：
+	 * 1. 首先，找出使用完全相同 WHERE 子句和索引谓词的路径，只保留其中成本最低的一个。
+	 *    这样可以去除那些包含无关列的冗余索引路径。
+	 * 2. 对剩下的路径按成本升序排序。
+	 *    对每个路径，考虑它单独作为 AND 组的“组长”，然后依次尝试与后续更高成本的路径组合，
+	 *    只要组合后总成本下降就保留，否则丢弃。
+	 *    这样只需 O(N^2) 复杂度，且实际 N 通常很小。
 	 *
-	 * We then sort the surviving paths with the cheapest-to-scan first, and
-	 * for each path, consider using that path alone as the basis for a bitmap
-	 * scan.  Then we consider bitmap AND scans formed from that path plus
-	 * each subsequent (higher-cost) path, adding on a subsequent path if it
-	 * results in a reduction in the estimated total scan cost. This means we
-	 * consider about O(N^2) rather than O(2^N) path combinations, which is
-	 * quite tolerable, especially given than N is usually reasonably small
-	 * because of the prefiltering step.  The cheapest of these is returned.
-	 *
-	 * We will only consider AND combinations in which no two indexes use the
-	 * same WHERE clause.  This is a bit of a kluge: it's needed because
-	 * costsize.c and clausesel.c aren't very smart about redundant clauses.
-	 * They will usually double-count the redundant clauses, producing a
-	 * too-small selectivity that makes a redundant AND step look like it
-	 * reduces the total cost.  Perhaps someday that code will be smarter and
-	 * we can remove this limitation.  (But note that this also defends
-	 * against flat-out duplicate input paths, which can happen because
-	 * match_join_clauses_to_index will find the same OR join clauses that
-	 * extract_restriction_or_clauses has pulled OR restriction clauses out
-	 * of.)
-	 *
-	 * For the same reason, we reject AND combinations in which an index
-	 * predicate clause duplicates another clause.  Here we find it necessary
-	 * to be even stricter: we'll reject a partial index if any of its
-	 * predicate clauses are implied by the set of WHERE clauses and predicate
-	 * clauses used so far.  This covers cases such as a condition "x = 42"
-	 * used with a plain index, followed by a clauseless scan of a partial
-	 * index "WHERE x >= 40 AND x < 50".  The partial index has been accepted
-	 * only because "x = 42" was present, and so allowing it would partially
-	 * double-count selectivity.  (We could use predicate_implied_by on
-	 * regular qual clauses too, to have a more intelligent, but much more
-	 * expensive, check for redundancy --- but in most cases simple equality
-	 * seems to suffice.)
+	 * 限制：
+	 * - 不允许 AND 组合中有两个索引用到同一个 WHERE 子句（避免选择性被重复计算）。
+	 * - 不允许 AND 组合中有索引谓词与已有条件重复（避免部分索引的谓词被重复计入）。
 	 */
 
+	/* 第一步：提取每个路径的子句使用信息，去除完全重复的路径，只保留成本最低的 */
 	/*
-	 * Extract clause usage info and detect any paths that use exactly the
-	 * same set of clauses; keep only the cheapest-to-scan of any such groups.
-	 * The surviving paths are put into an array for qsort'ing.
+	 * 举例说明去重逻辑：
+	 * 假设查询是 WHERE a = 1 AND b = 2。
+	 * 我们有三个索引：
+	 * 1. idx_a (a)
+	 * 2. idx_ab (a, b)
+	 * 3. idx_a_copy (a) -- 假设这是 idx_a 的一个完全冗余的副本
+	 *
+	 * 生成的路径可能包括：
+	 * - Path 1: 使用 idx_a (条件: a=1)
+	 * - Path 2: 使用 idx_ab (条件: a=1 AND b=2)
+	 * - Path 3: 使用 idx_a_copy (条件: a=1)
+	 *
+	 * 处理过程：
+	 * 1. 处理 Path 1: 记录它使用了条件 {a=1}。加入数组。
+	 * 2. 处理 Path 2: 记录它使用了条件 {a=1, b=2}。与 Path 1 不同，加入数组。
+	 * 3. 处理 Path 3: 记录它使用了条件 {a=1}。
+	 *    发现与 Path 1 使用的条件集完全相同（都是只用了 a=1）。
+	 *    比较 Path 1 和 Path 3 的成本。
+	 *    保留成本较低的那个（假设是 Path 1），丢弃 Path 3。
+	 *
+	 * 结果：
+	 * 数组中只剩下 Path 1 和 Path 2。
+	 * 这样避免了后续尝试组合 "Path 1 AND Path 3" 这种毫无意义的组合（因为它们做的是同一件事）。
 	 */
 	pathinfoarray = (PathClauseUsage **)
 		palloc(npaths * sizeof(PathClauseUsage *));
@@ -1542,26 +1988,27 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 
 		pathinfo = classify_index_clause_usage(ipath, &clauselist);
 
-		/* If it's unclassifiable, treat it as distinct from all others */
+		/* 如果无法分类，视为独立路径 */
 		if (pathinfo->unclassifiable)
 		{
 			pathinfoarray[npaths++] = pathinfo;
 			continue;
 		}
 
+		/* 检查是否有完全相同的子句集，若有只保留成本最低的 */
 		for (i = 0; i < npaths; i++)
 		{
 			if (!pathinfoarray[i]->unclassifiable &&
 				bms_equal(pathinfo->clauseids, pathinfoarray[i]->clauseids))
 				break;
 		}
+
+		/* 找到重复子句集的位置 i */
 		if (i < npaths)
 		{
-			/* duplicate clauseids, keep the cheaper one */
-			Cost		ncost;
-			Cost		ocost;
-			Selectivity nselec;
-			Selectivity oselec;
+			/* 已有重复子句集，保留成本更低的那个 */
+			Cost		ncost, ocost;
+			Selectivity nselec, oselec;
 
 			cost_bitmap_tree_node(pathinfo->path, &ncost, &nselec);
 			cost_bitmap_tree_node(pathinfoarray[i]->path, &ocost, &oselec);
@@ -1570,56 +2017,76 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 		}
 		else
 		{
-			/* not duplicate clauseids, add to array */
+			/* 没有重复，直接加入数组 */
 			pathinfoarray[npaths++] = pathinfo;
 		}
 	}
 
-	/* If only one surviving path, we're done */
+	/* 如果只剩一个路径，直接返回 */
 	if (npaths == 1)
 		return pathinfoarray[0]->path;
 
-	/* Sort the surviving paths by index access cost */
+	/* 第二步：按索引访问成本升序排序 */
 	qsort(pathinfoarray, npaths, sizeof(PathClauseUsage *),
 		  path_usage_comparator);
 
 	/*
-	 * For each surviving index, consider it as an "AND group leader", and see
-	 * whether adding on any of the later indexes results in an AND path with
-	 * cheaper total cost than before.  Then take the cheapest AND group.
+	 * 第三步：枚举每个路径作为 AND 组合的起始点（“组长”），尝试与后续路径组合。
+	 * 只要组合后的总成本下降，就保留该路径；否则丢弃。
+	 * 最终在所有尝试过的组合中，选择成本最低的一个。
 	 *
-	 * Note: paths that are either clauseless or unclassifiable will have
-	 * empty clauseids, so that they will not be rejected by the clauseids
-	 * filter here, nor will they cause later paths to be rejected by it.
+	 * 这种贪心策略虽然不能保证找到全局最优解（那是 NP 难问题），
+	 * 但在 O(N^2) 的复杂度内能找到一个相当不错的局部最优解。
 	 */
 	for (i = 0; i < npaths; i++)
 	{
-		Cost		costsofar;
-		List	   *qualsofar;
-		Bitmapset  *clauseidsofar;
-		ListCell   *lastcell;
+		Cost		costsofar;      /* 当前组合的累积成本 */
+		List	   *qualsofar;      /* 当前组合已覆盖的所有条件（用于冗余检查） */
+		Bitmapset  *clauseidsofar;  /* 当前组合已覆盖条件的 ID 集合（用于快速去重） */
+		ListCell   *lastcell;       /* 指向 paths 列表最后一个有效节点的指针，用于快速删除 */
 
+		/* 以第 i 个路径作为基础开始构建组合 */
 		pathinfo = pathinfoarray[i];
 		paths = list_make1(pathinfo->path);
+		/* 估算单个路径的位图扫描成本 */
 		costsofar = bitmap_scan_cost_est(root, rel, pathinfo->path);
+		/* 收集该路径使用的所有 WHERE 条件和索引谓词 */
 		qualsofar = list_concat(list_copy(pathinfo->quals),
 								list_copy(pathinfo->preds));
+		/* 复制该路径的条件 ID 集合 */
 		clauseidsofar = bms_copy(pathinfo->clauseids);
-		lastcell = list_head(paths);	/* for quick deletions */
+		lastcell = list_head(paths);	/* 初始化 lastcell 指向链表头 */
 
+		/* 尝试将后续的路径（j > i）加入当前组合 */
 		for (j = i + 1; j < npaths; j++)
 		{
 			Cost		newcost;
 
 			pathinfo = pathinfoarray[j];
-			/* Check for redundancy */
+			
+			/* 
+			 * 检查是否有重复子句：
+			 * 如果新路径使用的条件（clauseids）与当前组合已有的条件（clauseidsofar）有交集，
+			 * 说明这两个路径部分或全部在做相同的事情（过滤相同的条件）。
+			 * 为了避免重复计算选择性（selectivity）导致估算偏差，我们跳过这种路径。
+			 * 
+			 * 注意：如果路径被标记为 unclassifiable（条件太多），clauseids 为 NULL，
+			 * bms_overlap 会返回 false，所以不可分类的路径总是被视为不重复。
+			 */
 			if (bms_overlap(pathinfo->clauseids, clauseidsofar))
-				continue;		/* consider it redundant */
+				continue;
+
+			/* 
+			 * 检查谓词冗余：
+			 * 如果新路径是一个部分索引（带有谓词 preds），我们需要检查这些谓词
+			 * 是否已经被当前组合中的其他条件（qualsofar）所隐含。
+			 * 如果隐含了，说明这个部分索引的过滤效果已经被其他索引覆盖了，
+			 * 再加进来可能不会带来额外收益，反而增加开销。
+			 */
 			if (pathinfo->preds)
 			{
 				bool		redundant = false;
 
-				/* we check each predicate clause separately */
 				foreach(l, pathinfo->preds)
 				{
 					Node	   *np = (Node *) lfirst(l);
@@ -1627,52 +2094,74 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 					if (predicate_implied_by(list_make1(np), qualsofar, false))
 					{
 						redundant = true;
-						break;	/* out of inner foreach loop */
+						break;
 					}
 				}
 				if (redundant)
 					continue;
 			}
-			/* tentatively add new path to paths, so we can estimate cost */
+
+			/* 
+			 * 暂时将新路径加入列表，并估算新的 AND 组合成本。
+			 * bitmap_and_cost_est 会计算多个位图索引扫描加上位图 AND 运算的总成本。
+			 */
 			paths = lappend(paths, pathinfo->path);
 			newcost = bitmap_and_cost_est(root, rel, paths);
+
+			/*
+			 * 决策时刻：
+			 * 如果加入新路径后总成本降低了（newcost < costsofar），说明这个过滤是值得的。
+			 * 比如：虽然多读了一个索引，但过滤掉了很多行，减少了后续回表（Heap Fetch）的开销。
+			 */
 			if (newcost < costsofar)
 			{
-				/* keep new path in paths, update subsidiary variables */
+				/* 保留新路径，更新累积成本 */
 				costsofar = newcost;
+				/* 将新路径的条件加入累积集合，供后续迭代检查 */
 				qualsofar = list_concat(qualsofar,
 										list_copy(pathinfo->quals));
 				qualsofar = list_concat(qualsofar,
 										list_copy(pathinfo->preds));
 				clauseidsofar = bms_add_members(clauseidsofar,
 												pathinfo->clauseids);
+				/* 更新 lastcell 指针，指向新加入的节点 */
 				lastcell = lnext(lastcell);
 			}
 			else
 			{
-				/* reject new path, remove it from paths list */
+				/* 
+				 * 成本没有降低（甚至增加了），说明这个路径不划算。
+				 * 把它从 paths 列表中移除。
+				 * list_delete_cell 是 O(1) 操作，因为它利用了前驱节点 lastcell。
+				 */
 				paths = list_delete_cell(paths, lnext(lastcell), lastcell);
 			}
+			/* 确保链表结构正确 */
 			Assert(lnext(lastcell) == NULL);
 		}
 
-		/* Keep the cheapest AND-group (or singleton) */
+		/* 
+		 * 一轮组合尝试结束。
+		 * 如果这是第一轮（i=0），或者当前组合的成本比之前记录的最佳成本还低，
+		 * 则更新最佳路径集合（bestpaths）和最佳成本（bestcost）。
+		 */
 		if (i == 0 || costsofar < bestcost)
 		{
 			bestpaths = paths;
 			bestcost = costsofar;
 		}
 
-		/* some easy cleanup (we don't try real hard though) */
+		/* 简单清理本轮循环使用的临时列表（不做彻底释放以节省开销） */
 		list_free(qualsofar);
 	}
 
 	if (list_length(bestpaths) == 1)
-		return (Path *) linitial(bestpaths);	/* no need for AND */
+		return (Path *) linitial(bestpaths);	/* 只有一个，无需 AND */
+		
 	return (Path *) create_bitmap_and_path(root, rel, bestpaths);
 }
 
-/* qsort comparator to sort in increasing index access cost order */
+/* qsort 比较函数：按索引访问成本升序排序 */
 static int
 path_usage_comparator(const void *a, const void *b)
 {
@@ -1683,17 +2172,21 @@ path_usage_comparator(const void *a, const void *b)
 	Selectivity aselec;
 	Selectivity bselec;
 
+	/* 估算两个路径的成本和选择性 */
 	cost_bitmap_tree_node(pa->path, &acost, &aselec);
 	cost_bitmap_tree_node(pb->path, &bcost, &bselec);
 
 	/*
-	 * If costs are the same, sort by selectivity.
+	 * 如果成本不同，按成本升序排列
 	 */
 	if (acost < bcost)
 		return -1;
 	if (acost > bcost)
 		return 1;
 
+	/*
+	 * 如果成本相同，则按选择性升序排列
+	 */
 	if (aselec < bselec)
 		return -1;
 	if (aselec > bselec)
@@ -1757,40 +2250,49 @@ bitmap_and_cost_est(PlannerInfo *root, RelOptInfo *rel, List *paths)
 
 /*
  * classify_index_clause_usage
- *		Construct a PathClauseUsage struct describing the WHERE clauses and
- *		index predicate clauses used by the given indexscan path.
- *		We consider two clauses the same if they are equal().
+ *		构造一个 PathClauseUsage 结构体，描述给定索引扫描路径所用到的 WHERE 子句和索引谓词子句。
+ *		我们认为两个子句只要 equal() 就视为相同。
  *
- * At some point we might want to migrate this info into the Path data
- * structure proper, but for the moment it's only needed within
- * choose_bitmap_and().
+ * 详细解释：
+ * 1. 目的：
+ *    为了在 choose_bitmap_and 中去除冗余路径，我们需要一种方法来判断两个路径是否“做了相同的事情”。
+ *    这里的“相同事情”定义为：使用了完全相同的查询条件集合。
  *
- * *clauselist is used and expanded as needed to identify all the distinct
- * clauses seen across successive calls.  Caller must initialize it to NIL
- * before first call of a set.
+ * 2. 工作流程：
+ *    - 递归遍历路径 (find_indexpath_quals)，收集它用到的所有 Index Quals 和 Index Predicates。
+ *    - 将这些条件映射到一个全局列表 (clauselist) 中的位置索引。
+ *    - 使用一个 Bitmapset (clauseids) 来存储这些位置索引。
+ *    - 这样，两个路径是否等价，就变成了比较两个 Bitmapset 是否相等 (bms_equal)，非常快。
+ *
+ * 3. 限制：
+ *    为了防止在极端复杂的查询（成百上千个条件）中消耗过多内存或 CPU，
+ *    如果条件数量超过 100，就标记为 "unclassifiable"（不可分类）。
+ *    不可分类的路径会被视为独一无二，不参与去重逻辑。
+ *
+ * *clauselist 用于记录所有已见过的不同子句，并在需要时扩展。调用者在一组调用前需初始化为 NIL。
  */
 static PathClauseUsage *
 classify_index_clause_usage(Path *path, List **clauselist)
 {
 	PathClauseUsage *result;
-	Bitmapset  *clauseids;
-	ListCell   *lc;
+	Bitmapset  		*clauseids;
+	ListCell   		*lc;
 
 	result = (PathClauseUsage *) palloc(sizeof(PathClauseUsage));
 	result->path = path;
 
-	/* Recursively find the quals and preds used by the path */
+	/* 
+	 * 递归提取路径中用到的 quals 和 preds 条件。
+	 * 注意：BitmapOrPath 可能包含多个子路径，find_indexpath_quals 会递归遍历它们，
+	 * 收集所有子路径用到的所有条件。
+	 */
 	result->quals = NIL;
 	result->preds = NIL;
 	find_indexpath_quals(path, &result->quals, &result->preds);
 
 	/*
-	 * Some machine-generated queries have outlandish numbers of qual clauses.
-	 * To avoid getting into O(N^2) behavior even in this preliminary
-	 * classification step, we want to limit the number of entries we can
-	 * accumulate in *clauselist.  Treat any path with more than 100 quals +
-	 * preds as unclassifiable, which will cause calling code to consider it
-	 * distinct from all other paths.
+	 * 防御性措施：有些自动生成的 SQL 可能包含极多的条件，为避免 O(N^2) 行为，
+	 * 如果 quals + preds 超过 100 个，则视为不可分类，调用方会将其视为与其他路径不同。
 	 */
 	if (list_length(result->quals) + list_length(result->preds) > 100)
 	{
@@ -1799,7 +2301,17 @@ classify_index_clause_usage(Path *path, List **clauselist)
 		return result;
 	}
 
-	/* Build up a bitmapset representing the quals and preds */
+	/* 
+	 * 构建一个 bitmapset，唯一标识所有 quals 和 preds 子句。
+	 * 
+	 * find_list_position 的作用：
+	 * 它在全局列表 clauselist 中查找当前条件节点 node。
+	 * - 如果找到，返回其索引（0, 1, 2...）。
+	 * - 如果没找到，将其添加到列表末尾，并返回新索引。
+	 * 
+	 * 这样，我们就把复杂的表达式节点映射成了一个简单的整数 ID。
+	 * 随后用 bms_add_member 将这些 ID 加入 Bitmapset。
+	 */
 	clauseids = NULL;
 	foreach(lc, result->quals)
 	{
@@ -1821,30 +2333,54 @@ classify_index_clause_usage(Path *path, List **clauselist)
 	return result;
 }
 
-
 /*
  * find_indexpath_quals
  *
- * Given the Path structure for a plain or bitmap indexscan, extract lists
- * of all the index clauses and index predicate conditions used in the Path.
- * These are appended to the initial contents of *quals and *preds (hence
- * caller should initialize those to NIL).
+ * 给定一个普通或位图索引扫描路径（Path 结构），递归提取该路径中用到的所有索引条件（index clauses）
+ * 和索引谓词条件（index predicate conditions），分别追加到 *quals 和 *preds 列表中。
+ * （调用者应先将 *quals 和 *preds 初始化为 NIL。）
  *
- * Note we are not trying to produce an accurate representation of the AND/OR
- * semantics of the Path, but just find out all the base conditions used.
+ * 注意：这里不试图还原路径的 AND/OR 语义，仅仅是收集所有底层用到的基本条件。
  *
- * The result lists contain pointers to the expressions used in the Path,
- * but all the list cells are freshly built, so it's safe to destructively
- * modify the lists (eg, by concat'ing with other lists).
+ * 结果列表中的元素是路径中实际用到的表达式指针，但列表节点是新分配的，可以安全地进行拼接等操作。
  */
 static void
 find_indexpath_quals(Path *bitmapqual, List **quals, List **preds)
 {
+	/*
+	 * 递归遍历位图路径树，收集所有叶子节点（IndexPath）使用的条件。
+	 *
+	 * 举例说明：
+	 *   假设路径结构是：
+	 *   BitmapAndPath
+	 *     -> BitmapIndexScan (idx_a, 条件: a=1)
+	 *     -> BitmapOrPath
+	 *          -> BitmapIndexScan (idx_b, 条件: b=2)
+	 *          -> BitmapIndexScan (idx_c, 条件: c=3)
+	 *
+	 *   执行过程：
+	 *   1. 遇到 BitmapAndPath，递归遍历其子节点。
+	 *   2. 访问第一个子节点 (idx_a):
+	 *      - 它是 IndexPath。
+	 *      - 收集条件 "a=1" 到 quals 列表。
+	 *   3. 访问第二个子节点 (BitmapOrPath)，递归遍历其子节点。
+	 *   4. 访问 OR 的第一个子节点 (idx_b):
+	 *      - 它是 IndexPath。
+	 *      - 收集条件 "b=2" 到 quals 列表。
+	 *   5. 访问 OR 的第二个子节点 (idx_c):
+	 *      - 它是 IndexPath。
+	 *      - 收集条件 "c=3" 到 quals 列表。
+	 *
+	 *   最终结果：
+	 *   quals = {a=1, b=2, c=3}
+	 *   preds = { ...如果索引有部分索引谓词也会被收集... }
+	 */
 	if (IsA(bitmapqual, BitmapAndPath))
 	{
 		BitmapAndPath *apath = (BitmapAndPath *) bitmapqual;
 		ListCell   *l;
 
+		/* 递归处理 AND 组合的每个子路径 */
 		foreach(l, apath->bitmapquals)
 		{
 			find_indexpath_quals((Path *) lfirst(l), quals, preds);
@@ -1855,6 +2391,7 @@ find_indexpath_quals(Path *bitmapqual, List **quals, List **preds)
 		BitmapOrPath *opath = (BitmapOrPath *) bitmapqual;
 		ListCell   *l;
 
+		/* 递归处理 OR 组合的每个子路径 */
 		foreach(l, opath->bitmapquals)
 		{
 			find_indexpath_quals((Path *) lfirst(l), quals, preds);
@@ -1865,32 +2402,39 @@ find_indexpath_quals(Path *bitmapqual, List **quals, List **preds)
 		IndexPath  *ipath = (IndexPath *) bitmapqual;
 		ListCell   *l;
 
+		/* 收集所有索引条件（indexclauses）中的原始表达式 */
 		foreach(l, ipath->indexclauses)
 		{
 			IndexClause *iclause = (IndexClause *) lfirst(l);
 
 			*quals = lappend(*quals, iclause->rinfo->clause);
 		}
+		/* 收集索引的谓词条件（indpred） */
 		*preds = list_concat(*preds, list_copy(ipath->indexinfo->indpred));
 	}
 	else
 		elog(ERROR, "unrecognized node type: %d", nodeTag(bitmapqual));
 }
-
-
 /*
  * find_list_position
- *		Return the given node's position (counting from 0) in the given
- *		list of nodes.  If it's not equal() to any existing list member,
- *		add it at the end, and return that position.
+ *		返回给定节点在节点列表中的位置（从0开始计数）。
+ *		如果节点与列表中任何已有成员 equal()，则返回其下标；
+ *		否则将其追加到列表末尾，并返回新下标。
+ *
+ * 参数说明：
+ *   node      - 要查找或插入的节点指针
+ *   nodelist  - 指向节点列表的指针（List**，允许原地扩展列表）
+ *
+ * 返回值：
+ *   节点在列表中的下标（从0开始）
  */
 static int
 find_list_position(Node *node, List **nodelist)
 {
-	int			i;
+	int			i = 0;
 	ListCell   *lc;
 
-	i = 0;
+	/* 遍历列表，查找是否已存在 equal() 的节点 */
 	foreach(lc, *nodelist)
 	{
 		Node	   *oldnode = (Node *) lfirst(lc);
@@ -1900,52 +2444,82 @@ find_list_position(Node *node, List **nodelist)
 		i++;
 	}
 
+	/* 没找到则追加到列表末尾 */
 	*nodelist = lappend(*nodelist, node);
 
 	return i;
 }
 
-
 /*
  * check_index_only
- *		Determine whether an index-only scan is possible for this index.
+ *		判断是否可以对该索引执行仅索引扫描（Index-Only Scan）。
+ *
+ * 仅索引扫描 (Index-Only Scan) 是 PostgreSQL 的一种优化技术。
+ * 如果查询所需的所有列（包括 SELECT 列表、WHERE 条件、JOIN 条件等）都可以直接从索引元组中获取，
+ * 那么我们就不需要访问堆表（Heap Table）来获取数据（除非需要检查可见性，即 VM 检查）。
+ * 这可以显著减少 I/O，因为索引通常比堆表小得多，且访问更集中。
+ *
+ * 此函数的核心逻辑是集合包含测试：
+ *      {查询需要的所有列}  ⊆  {索引能返回的所有列}
+ *
+ * 举例说明：
+ * 假设表 users (id int, name text, age int, bio text)
+ * 索引 idx_name_age ON users (name, age) USING btree
+ *
+ * 场景 1：SELECT name, age FROM users WHERE name = 'Alice';
+ * - attrs_used: {name, age} (SELECT 和 WHERE 中用到的列)
+ * - index_canreturn_attrs: {name, age} (B-Tree 索引存储并可返回这两列的值)
+ * - 判断: {name, age} ⊆ {name, age} -> true
+ * - 结果: 可以使用 Index-Only Scan。
+ *
+ * 场景 2：SELECT id, name FROM users WHERE name = 'Alice';
+ * - attrs_used: {id, name} (id 需要输出)
+ * - index_canreturn_attrs: {name, age}
+ * - 判断: {id, name} ⊆ {name, age} -> false (id 缺失)
+ * - 结果: 不可使用 Index-Only Scan，必须回表（Heap Fetch）。
+ *
+ * 场景 3：索引改为 Hash 索引 idx_name_hash ON users USING hash (name)
+ *        SELECT name FROM users WHERE name = 'Alice';
+ * - attrs_used: {name}
+ * - index_canreturn_attrs: {} (Hash 索引存储的是哈希值，canreturn=false，无法还原 name)
+ * - 判断: {name} ⊆ {} -> false
+ * - 结果: 不可使用 Index-Only Scan。
  */
 static bool
 check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 {
 	bool		result;
-	Bitmapset  *attrs_used = NULL;
-	Bitmapset  *index_canreturn_attrs = NULL;
-	Bitmapset  *index_cannotreturn_attrs = NULL;
+	Bitmapset  *attrs_used = NULL;					/* 查询所需的所有属性集合 */
+	Bitmapset  *index_canreturn_attrs = NULL;		/* 索引能直接返回的属性集合 */
+	Bitmapset  *index_cannotreturn_attrs = NULL;	/* 索引不能直接返回的属性集合 */
 	ListCell   *lc;
 	int			i;
 
-	/* Index-only scans must be enabled */
+	/* 必须启用仅索引扫描功能 */
 	if (!enable_indexonlyscan)
 		return false;
 
 	/*
-	 * Check that all needed attributes of the relation are available from the
-	 * index.
-	 */
-
-	/*
-	 * First, identify all the attributes needed for joins or final output.
-	 * Note: we must look at rel's targetlist, not the attr_needed data,
-	 * because attr_needed isn't computed for inheritance child rels.
+	 * 第一步：收集查询所需的所有属性（列）。
+	 * 
+	 * rel->reltarget->exprs 包含了查询层面对该关系的所有输出需求，
+	 * 例如 SELECT list 中的列、JOIN ON 条件中引用的列、RETURNING 子句等。
+	 * 我们使用 pull_varattnos 遍历这些表达式，提取出所有涉及的列号，存入 attrs_used 集合。
 	 */
 	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &attrs_used);
 
 	/*
-	 * Add all the attributes used by restriction clauses; but consider only
-	 * those clauses not implied by the index predicate, since ones that are
-	 * so implied don't need to be checked explicitly in the plan.
-	 *
-	 * Note: attributes used only in index quals would not be needed at
-	 * runtime either, if we are certain that the index is not lossy.  However
-	 * it'd be complicated to account for that accurately, and it doesn't
-	 * matter in most cases, since we'd conclude that such attributes are
-	 * available from the index anyway.
+	 * 第二步：收集所有限制条件（WHERE 子句）中用到的属性。
+	 * 
+	 * 即使某些 WHERE 条件被用作索引扫描的边界条件（Index Qual），
+	 * 我们仍然需要确保这些条件中引用的列能从索引中获取。
+	 * 
+	 * 为什么？
+	 * 1. 对于“有损”索引（Lossy Index，如某些 Bitmap 索引或 GIN），索引匹配后必须回表（Recheck）验证条件。
+	 *    如果列值不在索引中，就无法做 Index-Only Scan。
+	 * 2. 即使是精确索引，如果条件复杂，执行器可能需要在 Filter 步骤再次求值。
+	 * 
+	 * 因此，我们将所有与该索引关联的限制条件（indrestrictinfo）中的列也加入 attrs_used。
 	 */
 	foreach(lc, index->indrestrictinfo)
 	{
@@ -1955,24 +2529,37 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 	}
 
 	/*
-	 * Construct a bitmapset of columns that the index can return back in an
-	 * index-only scan.  If there are multiple index columns containing the
-	 * same attribute, all of them must be capable of returning the value,
-	 * since we might recheck operators on any of them.  (Potentially we could
-	 * be smarter about that, but it's such a weird situation that it doesn't
-	 * seem worth spending a lot of sweat on.)
+	 * 第三步：构建索引能直接返回的属性集合。
+	 * 
+	 * 并非所有索引列都能返回原始值。
+	 * 例如：
+	 * - Hash 索引存储的是哈希值，无法还原原始数据。
+	 * - GIN 索引在某些配置下可能不存储原始值。
+	 * - 表达式索引（Expression Index）存储的是计算结果，而不是原始列值。
+	 * 
+	 * index->canreturn[i] 数组标记了第 i 个索引列是否支持返回原始值。
 	 */
 	for (i = 0; i < index->ncolumns; i++)
 	{
 		int			attno = index->indexkeys[i];
 
 		/*
-		 * For the moment, we just ignore index expressions.  It might be nice
-		 * to do something with them, later.
+		 * 暂时忽略索引表达式列（attno == 0）。
+		 * 虽然理论上可以支持（直接返回表达式计算结果），但目前实现尚未完全支持
+		 * 从索引元组直接映射回表达式结果用于 IOS。
 		 */
 		if (attno == 0)
 			continue;
 
+		/*
+		 * 如果该列支持返回原始值，加入 index_canreturn_attrs。
+		 * 否则，加入 index_cannotreturn_attrs。
+		 * 
+		 * 注意：同一个表列可能出现在索引的多个位置（虽然少见）。
+		 * 如果它在某个位置是“不可返回”的（例如被哈希了），而在另一个位置是“可返回”的，
+		 * 我们必须小心。目前的逻辑是：只要有一次“不可返回”，就认为该列不可用于 IOS。
+		 * 这是通过最后的 bms_del_members 实现的。
+		 */
 		if (index->canreturn[i])
 			index_canreturn_attrs =
 				bms_add_member(index_canreturn_attrs,
@@ -1983,10 +2570,17 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 							   attno - FirstLowInvalidHeapAttributeNumber);
 	}
 
+	/* 
+	 * 从可返回集合中移除那些被标记为不可返回的属性。
+	 * 确保集合中的属性是绝对安全的。
+	 */
 	index_canreturn_attrs = bms_del_members(index_canreturn_attrs,
 											index_cannotreturn_attrs);
 
-	/* Do we have all the necessary attributes? */
+	/* 
+	 * 第四步：核心判断。
+	 * 检查 {查询所需列} 是否是 {索引可返回列} 的子集。
+	 */
 	result = bms_is_subset(attrs_used, index_canreturn_attrs);
 
 	bms_free(attrs_used);
@@ -2189,21 +2783,62 @@ match_join_clauses_to_index(PlannerInfo *root,
         /* 获取当前连接条件的RestrictInfo结构 */
         RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-        /* 检查该连接条件是否可以移动到当前关系上执行
-		 * 这是谓词下推(predicate pushdown)优化的关键步骤，确保条件尽可能早地执行
-		 * 如果约束条件不满足谓词下推的要求，则它没有产生参数化路径的可能性
-		 * 因此，我们跳过
+		/* 
+		 * 检查该连接条件是否可以移动到当前关系上执行。
+		 * 
+		 * 详细解释：
+		 * "Movable" (可移动) 意味着我们是否可以在扫描表 'rel' 的时候，
+		 * 安全地使用这个条件来进行过滤（或者作为索引条件）。
+		 * 
+		 * 关键限制 - 外连接 (Outer Join):
+		 * 如果 'rel' 是 LEFT JOIN 的左表（Outer Side），那么定义在 ON 子句中的连接条件
+		 * 是不能“下推”到 'rel' 的扫描层面的。
+		 * 
+		 * 举例：
+		 *   SELECT * FROM A LEFT JOIN B ON A.id = B.id;
+		 * 
+		 *   1. 考虑表 A (rel = A):
+		 *      连接条件 "A.id = B.id" 不能用于限制 A 的扫描。
+		 *      因为 LEFT JOIN 要求即使 A 的行在 B 中找不到匹配，也要返回 A 的行。
+		 *      如果我们用 B 的值去过滤 A（例如做参数化索引扫描），就会错误地过滤掉那些不匹配的 A 行。
+		 *      所以，对于 A 来说，这个条件是 "Not Movable" 的。
+		 * 
+		 *   2. 考虑表 B (rel = B):
+		 *      连接条件 "A.id = B.id" 可以用于限制 B 的扫描。
+		 *      在 Nested Loop Join 中，对于 A 的每一行，我们都希望在 B 中找到匹配的行。
+		 *      所以，对于 B 来说，这个条件是 "Movable" 的，可以生成参数化路径。
+		 * 
+		 * 如果条件不可移动，我们就不能用它来生成基于当前索引的参数化路径，因此跳过。
 		 */
-        if (!join_clause_is_movable_to(rinfo, rel))
-            continue; /* 如果不可移动，则跳过该子句 */
+		if (!join_clause_is_movable_to(rinfo, rel))
+			continue;
 
         /* 子句可能可用，检查它是否是OR子句或是可匹配索引的子句 */
         if (restriction_is_or_clause(rinfo))
             /* 如果是OR子句，添加到joinorclauses列表中供后续处理 */
             *joinorclauses = lappend(*joinorclauses, rinfo);
-        else
-			/* 否则，尝试将该子句与索引进行匹配 */
+		else
+		{
+			/* 
+			 * 否则，尝试将该普通子句与索引进行匹配。
+			 * 
+			 * 详细解释：
+			 * match_clause_to_index 会遍历索引的所有列，
+			 * 检查当前的连接条件 rinfo 是否能作为索引条件（Index Qual）。
+			 * 
+			 * 例如：
+			 *   索引: on table T(a, b)
+			 *   连接条件: T.a = OtherTable.x
+			 * 
+			 * 这个函数会发现 T.a 匹配索引的第一列，并且操作符 '=' 也是索引支持的。
+			 * 于是它会创建一个 IndexClause 结构，记录下 "T.a = OtherTable.x" 可以作为索引扫描的一个键。
+			 * 
+			 * 结果：
+			 * 匹配成功的 IndexClause 会被添加到 clauseset 中。
+			 * 这些收集到的 clauseset 最终会被用来生成 Parameterized Index Scan 路径。
+			 */
 			match_clause_to_index(root, rinfo, index, clauseset);
+		}
     }
 }
 
@@ -2225,40 +2860,88 @@ static void
 match_eclass_clauses_to_index(PlannerInfo *root, IndexOptInfo *index,
                            IndexClauseSet *clauseset)
 {
-    int         indexcol; /* 用于遍历索引列的循环变量 */
+	int			indexcol;
 
-    /* 如果关系不在任何等价类连接中，则无需处理，直接返回 */
-    if (!index->rel->has_eclass_joins)
-        return;
+	/*
+	 * 快速检查：如果当前关系没有参与任何等价类连接，
+	 * 那么就不可能从等价类中推导出任何新的连接条件。
+	 * 直接返回，节省开销。
+	 */
+	if (!index->rel->has_eclass_joins)
+		return;
 
-    /* 遍历索引的每个键列 */
-    for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
-    {
-        ec_member_matches_arg arg; /* 用于传递给回调函数的参数结构体 */
-        List       *clauses;       /* 存储生成的隐含相等性子句 */
+	/*
+	 * 遍历索引的每一个键列 (Key Column)。
+	 * 我们需要检查每一列是否属于某个等价类，并从中提取潜在的连接条件。
+	 */
+	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
+	{
+		ec_member_matches_arg arg;
+		List	   *clauses;
 
-        /* 设置回调函数参数，指定当前处理的索引和列 */
-        arg.index = index;
-        arg.indexcol = indexcol;
-        
-        /* 为索引列生成隐含的相等性条件
-         * 该函数会查找与指定列相关的等价类，并生成所有可能的等式条件
-         * ec_member_matches_indexcol作为回调函数，用于过滤出与索引列兼容的等价成员
-         * 最后一个参数排除连接到LATERAL引用表的条件，因为这些条件不能下推
-         */
-        clauses = generate_implied_equalities_for_column(root,
-                                                       index->rel,
-                                                       ec_member_matches_indexcol,
-                                                       (void *) &arg,
-                                                       index->rel->lateral_referencers);
+		arg.index = index;
+		arg.indexcol = indexcol;
 
-        /*
-         * 对于非B树索引，需要进一步验证生成的条件是否真正匹配索引
-         * 因为等价类中的相等性操作符可能不在索引操作符类中
-         * 例如，某些特殊索引类型可能有自己特定的相等性语义
-         */
-        match_clauses_to_index(root, clauses, index, clauseset);
-    }
+		/*
+		 * 核心逻辑：生成隐含的等值条件 (Implied Equalities)。
+		 *
+		 * 1. 查找 EC: 检查当前索引列 (indexcol) 是否是某个等价类 (EC) 的成员。
+		 * 2. 遍历成员: 如果是，遍历该 EC 中的其他所有成员（来自其他表的列）。
+		 * 3. 生成条件: 为每一个“其他成员”生成一个 "indexcol = other_member" 的条件。
+		 *
+		 * 举例说明：
+		 *   假设表 A 有索引 idx_a_x (列 x)。
+		 *   查询: SELECT * FROM A, B, C WHERE A.x = B.y AND B.y = C.z
+		 *
+		 *   过程：
+		 *   1. 优化器创建 EC: {A.x, B.y, C.z}。
+		 *   2. 在为表 A 生成路径时，检查索引列 A.x。
+		 *   3. generate_implied_equalities_for_column 发现 A.x 在 EC 中。
+		 *   4. 它看到 EC 中还有 B.y 和 C.z。
+		 *   5. 它生成两个隐含条件：
+		 *      - A.x = B.y
+		 *      - A.x = C.z
+		 *   6. 后续逻辑会利用这些条件生成两个可能的参数化路径：
+		 *      - Nested Loop Join (外表 B，内表 A，使用 A.x = B.y 索引扫描)。
+		 *      - Nested Loop Join (外表 C，内表 A，使用 A.x = C.z 索引扫描)。
+		 *
+		 * 回调函数 ec_member_matches_indexcol:
+		 * 用于验证“其他成员”的数据类型和操作符是否与当前索引列兼容。
+		 * 只有兼容的成员才会生成条件。
+		 *
+		 * lateral_referencers:
+		 * 排除那些引用了 LATERAL 子查询中不可访问的表的条件。
+		 */
+		clauses = generate_implied_equalities_for_column(root,
+														 index->rel,
+														 ec_member_matches_indexcol,
+														 (void *) &arg,
+														 index->rel->lateral_referencers);
+
+		/*
+		 * 验证并注册生成的条件。
+		 *
+		 * 详细解释：
+		 * 1. 输入: 'clauses' 是上一步生成的原始表达式列表（通常是 OpExpr）。
+		 * 
+		 * 2. 转换与验证: 
+		 *    match_clauses_to_index (复数形式) 会遍历这个列表，
+		 *    对每个表达式调用 match_clause_to_index (单数形式)。
+		 *    它会将原始的 OpExpr 封装成 IndexClause 结构，这是索引路径生成所需的格式。
+		 * 
+		 * 3. 去重 (De-duplication):
+		 *    这是一个非常重要的步骤。
+		 *    有可能同一个连接条件既显式写在 SQL 中（在阶段 2 被处理），
+		 *    又被包含在等价类中（在阶段 3 被推导）。
+		 *    match_clause_to_index 内部有检查机制（指针比较），
+		 *    如果发现同一个 RestrictInfo 已经被加入 clauseset，就会忽略它。
+		 *    这防止了同一个条件被重复计算。
+		 * 
+		 * 4. 结果:
+		 *    最终，clauseset 中包含了所有来自 EC 的、合法的、未重复的索引扫描条件。
+		 */
+		match_clauses_to_index(root, clauses, index, clauseset);
+	}
 }
 
 /*
@@ -3352,30 +4035,31 @@ expand_indexqual_rowcompare(PlannerInfo *root,
 
 /*
  * match_pathkeys_to_index
- *		Test whether an index can produce output ordered according to the
- *		given pathkeys using "ordering operators".
+ *		判断一个索引是否可以通过“排序操作符”实现给定的 pathkeys 顺序输出。
  *
- * If it can, return a list of suitable ORDER BY expressions, each of the form
- * "indexedcol operator pseudoconstant", along with an integer list of the
- * index column numbers (zero based) that each clause would be used with.
- * NIL lists are returned if the ordering is not achievable this way.
+ * 如果可以，则返回一个合适的 ORDER BY 表达式列表，每个表达式形如
+ * “索引列 operator 伪常量”，以及一个整数列表，表示每个子句对应的索引列号（从0开始）。
+ * 如果无法实现所需排序，则返回 NIL。
  *
- * On success, the result list is ordered by pathkeys, and in fact is
- * one-to-one with the requested pathkeys.
+ * 成功时，结果列表与 pathkeys 一一对应，顺序一致。
  */
 static void
 match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 						List **orderby_clauses_p,
 						List **clause_columns_p)
 {
-	List	   *orderby_clauses = NIL;
-	List	   *clause_columns = NIL;
+	List	   *orderby_clauses = NIL;		// 存储ORDER BY表达式
+	List	   *clause_columns = NIL;		// 存储对应的索引列号
 	ListCell   *lc1;
 
-	*orderby_clauses_p = NIL;	/* set default results */
+	*orderby_clauses_p = NIL;	// 默认输出为空
 	*clause_columns_p = NIL;
 
-	/* Only indexes with the amcanorderbyop property are interesting here */
+	/* 
+	 * 只有支持 amcanorderbyop 的索引才有意义。
+	 * 目前主要指 GiST 和 SP-GiST 索引，用于支持 KNN (K-Nearest Neighbor) 查询。
+	 * 例如：ORDER BY location <-> point(0,0)
+	 */
 	if (!index->amcanorderbyop)
 		return;
 
@@ -3386,48 +4070,55 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 		ListCell   *lc2;
 
 		/*
-		 * Note: for any failure to match, we just return NIL immediately.
-		 * There is no value in matching just some of the pathkeys.
+		 * 注意：只要有一个 pathkey 匹配失败，立即返回 NIL。
+		 * 因为如果索引不能满足完整的排序要求，那么它对消除排序步骤就没有帮助
+		 * (除非是前缀匹配，但 KNN 通常涉及计算表达式，部分匹配很难利用)。
 		 */
 
-		/* Pathkey must request default sort order for the target opfamily */
+		/*
+		 * 只接受默认升序 (ASC) 且 NULLS LAST 的排序请求。
+		 * KNN 查询通常是 "ORDER BY distance ASC"，即寻找最近的邻居。
+		 * BTLessStrategyNumber 对应 "<" 语义，在这里引申为 "距离最小"。
+		 */
 		if (pathkey->pk_strategy != BTLessStrategyNumber ||
 			pathkey->pk_nulls_first)
 			return;
 
-		/* If eclass is volatile, no hope of using an indexscan */
+		/* 如果等价类包含易变表达式 (volatile)，无法用索引排序 */
 		if (pathkey->pk_eclass->ec_has_volatile)
 			return;
 
 		/*
-		 * Try to match eclass member expression(s) to index.  Note that child
-		 * EC members are considered, but only when they belong to the target
-		 * relation.  (Unlike regular members, the same expression could be a
-		 * child member of more than one EC.  Therefore, the same index could
-		 * be considered to match more than one pathkey list, which is OK
-		 * here.  See also get_eclass_for_sort_expr.)
+		 * 尝试将等价类成员表达式与索引匹配。
+		 * 我们遍历 PathKey 对应的等价类中的所有成员，看是否有哪一个能对应到索引列上。
 		 */
 		foreach(lc2, pathkey->pk_eclass->ec_members)
 		{
 			EquivalenceMember *member = (EquivalenceMember *) lfirst(lc2);
 			int			indexcol;
 
-			/* No possibility of match if it references other relations */
+			/* 只考虑只引用本表的表达式 (em_relids与索引表一致) */
 			if (!bms_equal(member->em_relids, index->rel->relids))
 				continue;
 
 			/*
-			 * We allow any column of the index to match each pathkey; they
-			 * don't have to match left-to-right as you might expect.  This is
-			 * correct for GiST, and it doesn't matter for SP-GiST because
-			 * that doesn't handle multiple columns anyway, and no other
-			 * existing AMs support amcanorderbyop.  We might need different
-			 * logic in future for other implementations.
+			 * 尝试匹配索引的任意一列。
+			 * 
+			 * 与 B-Tree 不同，这里允许 pathkeys 与索引列以任意顺序匹配。
+			 * 
+			 * 举例：假设索引是 GiST(a, b)。
+			 * 查询：ORDER BY a <-> 10, b <-> 20。
+			 * 即使 pathkeys 的顺序与索引列定义顺序不同，GiST 往往也能支持。
+			 * (注：目前的 GiST 实现通常只支持单个排序列的 KNN，但架构上允许更多)
 			 */
 			for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
 			{
 				Expr	   *expr;
 
+				/*
+				 * match_clause_to_ordering_op 会检查表达式是否形如 "index_col OP const"，
+				 * 并且该 OP 是索引支持的排序操作符 (如 <->)。
+				 */
 				expr = match_clause_to_ordering_op(index,
 												   indexcol,
 												   member->em_expr,
@@ -3441,15 +4132,16 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 				}
 			}
 
-			if (found)			/* don't want to look at remaining members */
+			if (found)	/* 已找到匹配，跳出内层循环，处理下一个 pathkey */
 				break;
 		}
 
-		if (!found)				/* fail if no match for this pathkey */
+		if (!found)		/* 只要有一个 pathkey 没匹配上，整体失败 */
 			return;
 	}
 
-	*orderby_clauses_p = orderby_clauses;	/* success! */
+	/* 全部匹配成功，输出结果 */
+	*orderby_clauses_p = orderby_clauses;
 	*clause_columns_p = clause_columns;
 }
 

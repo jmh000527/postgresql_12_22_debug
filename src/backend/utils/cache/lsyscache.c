@@ -154,10 +154,24 @@ get_op_opfamily_properties(Oid opno, Oid opfamily, bool ordering_op,
 
 /*
  * get_opfamily_member
- *		Get the OID of the operator that implements the specified strategy
- *		with the specified datatypes for the specified opfamily.
+ *		获取指定操作符族、数据类型和策略下实现该策略的操作符OID。
  *
- * Returns InvalidOid if there is no pg_amop entry for the given keys.
+ * 核心功能：
+ * 回答“在某个操作符族（比如 B-Tree 整数比较族）中，用于比较 lefttype 和 righttype
+ * 这两种数据类型，且对应策略号为 strategy 的那个操作符，它的 OID 是多少？”
+ *
+ * 参数：
+ * - opfamily: 操作符族的 OID（如 integer_ops）。
+ * - lefttype: 左操作数类型 OID（如 INT4OID）。
+ * - righttype: 右操作数类型 OID。
+ * - strategy: 策略号（如 B-Tree 中 1=<, 3==, 5=>）。
+ *
+ * 举例：
+ * 要找“在 B-Tree 整数族中，用于比较 int4 和 int4 的‘小于’操作符是什么？”
+ * 调用：get_opfamily_member(INTEGER_BTREE_FAM_OID, INT4OID, INT4OID, BTLessStrategyNumber);
+ * 返回：< (int4 < int4) 的 OID（通常是 97）。
+ *
+ * 如果没有对应的pg_amop条目，则返回InvalidOid。
  */
 Oid
 get_opfamily_member(Oid opfamily, Oid lefttype, Oid righttype,
@@ -342,22 +356,14 @@ get_ordering_op_for_equality_op(Oid opno, bool use_lhs_type)
 
 /*
  * get_mergejoin_opfamilies
- *		Given a putatively mergejoinable operator, return a list of the OIDs
- *		of the btree opfamilies in which it represents equality.
+ *		给定一个可能可用于合并连接（mergejoin）的操作符，返回其作为等值操作符时所在的所有btree操作符族OID列表。
  *
- * It is possible (though at present unusual) for an operator to be equality
- * in more than one opfamily, hence the result is a list.  This also lets us
- * return NIL if the operator is not found in any opfamilies.
+ * 说明：
+ * 一个操作符可能在多个操作符族中都被定义为等值操作符（虽然目前这种情况较少见），
+ * 因此返回的是一个OID链表。如果没有找到，则返回NIL。
  *
- * The planner currently uses simple equal() tests to compare the lists
- * returned by this function, which makes the list order relevant, though
- * strictly speaking it should not be.  Because of the way syscache list
- * searches are handled, in normal operation the result will be sorted by OID
- * so everything works fine.  If running with system index usage disabled,
- * the result ordering is unspecified and hence the planner might fail to
- * recognize optimization opportunities ... but that's hardly a scenario in
- * which performance is good anyway, so there's no point in expending code
- * or cycles here to guarantee the ordering in that case.
+ * planner目前用equal()比较该函数返回的列表，因此列表顺序有影响。
+ * 正常情况下，结果会按OID排序。如果禁用系统索引，顺序不保证，但那种场景下性能本就不重要。
  */
 List *
 get_mergejoin_opfamilies(Oid opno)
@@ -367,8 +373,7 @@ get_mergejoin_opfamilies(Oid opno)
 	int			i;
 
 	/*
-	 * Search pg_amop to see if the target operator is registered as the "="
-	 * operator of any btree opfamily.
+	 * 在pg_amop中查找目标操作符是否被注册为某个btree操作符族的“=”操作符。
 	 */
 	catlist = SearchSysCacheList1(AMOPOPID, ObjectIdGetDatum(opno));
 
@@ -377,7 +382,7 @@ get_mergejoin_opfamilies(Oid opno)
 		HeapTuple	tuple = &catlist->members[i]->tuple;
 		Form_pg_amop aform = (Form_pg_amop) GETSTRUCT(tuple);
 
-		/* must be btree equality */
+		/* 必须是btree且为等值策略 */
 		if (aform->amopmethod == BTREE_AM_OID &&
 			aform->amopstrategy == BTEqualStrategyNumber)
 			result = lappend_oid(result, aform->amopfamily);

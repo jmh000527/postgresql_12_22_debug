@@ -141,34 +141,73 @@ bool
 predicate_implied_by(List *predicate_list, List *clause_list,
                      bool weak)
 {
-    Node       *p,  /* 转换后的谓词节点 */
-               *c;  /* 转换后的条件列表节点 */
+	Node	   *p,
+			   *c;
 
-    /* 边界条件处理：若没有谓词，则隐含关系空真成立 */
-    if (predicate_list == NIL)
-        return true;        /* no predicate: implication is vacuous */
-    
-    /* 边界条件处理：若没有约束条件，则无法隐含任何谓词 */
-    if (clause_list == NIL)
-        return false;       /* no restriction: implication must fail */
+	/*
+	 * 边界条件 1: 谓词为空 (predicate_list == NIL)。
+	 *
+	 * 逻辑含义：
+	 * 空的谓词列表等价于逻辑真 (TRUE)。
+	 * 我们在检查： "已知条件 C 成立 => 目标条件 P 成立？"
+	 * 当 P 为 TRUE 时，无论 C 是什么，推导总是成立的 (C => TRUE 恒为真)。
+	 *
+	 * 实际意义 (以部分索引为例)：
+	 * predicate_list 代表索引的筛选条件。NIL 表示这是一个普通的全量索引，包含表中的所有行。
+	 * clause_list 代表查询的筛选条件。
+	 *
+	 * 问题转化为：“查询需要的数据行（子集 C），是否都包含在索引的数据行（全集 P）中？”
+	 * 既然索引包含所有行，那么答案显然是肯定的。所以返回 true。
+	 */
+	if (predicate_list == NIL)
+		return true;		/* no predicate: implication is vacuous */
 
-    /*
-     * 优化处理：如果任一输入是单元素列表，则将其替换为该元素
-     * 这避免了一层无用的AND递归。我们只需在顶层处理这种情况，
-     * 因为eval_const_expressions应该已经处理了下面的所有简单AND或OR。
-     */
-    if (list_length(predicate_list) == 1)
-        p = (Node *) linitial(predicate_list);
-    else
-        p = (Node *) predicate_list;
-    
-    if (list_length(clause_list) == 1)
-        c = (Node *) linitial(clause_list);
-    else
-        c = (Node *) clause_list;
+	/*
+	 * 边界条件 2: 查询条件为空 (clause_list == NIL)。
+	 * 含义：查询没有 WHERE 子句（全表扫描）。
+	 * 逻辑：全表扫描（True）不能保证满足特定的谓词条件（例如 a > 5）。
+	 *       除非谓词本身也是空的（上面已处理）或恒真。
+	 * 结果：返回 false。
+	 */
+	if (clause_list == NIL)
+		return false;		/* no restriction: implication must fail */
 
-    /* 调用递归函数进行实际的隐含关系检查 */
-    return predicate_implied_by_recurse(c, p, weak);
+	/*
+	 * 优化处理：单元素列表解包。
+	 *
+	 * 如果列表只有一个元素，直接取出该元素作为节点处理。
+	 * 否则，将整个列表视为一个隐式的 AND 结构。
+	 *
+	 * 举例说明：
+	 *   场景:
+	 *     部分索引: CREATE INDEX ... WHERE a > 5;
+	 *     查询: SELECT * FROM t WHERE a > 10 AND b = 20;
+	 *
+	 *   输入:
+	 *     predicate_list: { (a > 5) }  -> 单元素列表
+	 *     clause_list:    { (a > 10), (b = 20) } -> 多元素列表
+	 *
+	 *   处理:
+	 *     p = (Node *) (a > 5);  // 解包，去掉列表外壳
+	 *     c = (Node *) clause_list; // 保持列表，视为 (a > 10) AND (b = 20)
+	 *
+	 *   后续递归:
+	 *     predicate_implied_by_recurse(c, p, weak)
+	 *     将检查: "(a > 10 AND b = 20)" 是否蕴含 "a > 5" ?
+	 *     答案是 True，因为 a > 10 必然意味着 a > 5。
+	 */
+	if (list_length(predicate_list) == 1)
+		p = (Node *) linitial(predicate_list);
+	else
+		p = (Node *) predicate_list;
+
+	if (list_length(clause_list) == 1)
+		c = (Node *) linitial(clause_list);
+	else
+		c = (Node *) clause_list;
+
+	/* 调用递归函数进行实际的隐含关系检查 */
+	return predicate_implied_by_recurse(c, p, weak);
 }
 
 

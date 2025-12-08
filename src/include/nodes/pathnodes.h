@@ -732,7 +732,7 @@ struct IndexOptInfo
 	Oid		   *indexcollations;		/* 索引列的排序规则 OID */
 	Oid		   *opfamily;				/* 索引列的操作符族 OID */
 	Oid		   *opcintype;				/* 索引列的操作符类声明输入类型 OID */
-	Oid		   *sortopfamily;			/* 若可排序，则为 btree 操作符族 OID */
+	Oid		   *sortopfamily;			/* 若可排序，则为 btree 操作符族 OID，否则为 NULL */
 	bool	   *reverse_sort;			/* 是否降序排序？ */
 	bool	   *nulls_first;			/* NULL 是否排在前面？ */
 	bool	   *canreturn;				/* 哪些索引列可用于索引仅扫描？ */

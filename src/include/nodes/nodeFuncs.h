@@ -92,7 +92,7 @@ get_rightop(const void *clause)
 		return NULL;
 }
 
-/* Is clause an AND clause? */
+/* 判断子句是否为 AND 子句 */
 static inline bool
 is_andclause(const void *clause)
 {

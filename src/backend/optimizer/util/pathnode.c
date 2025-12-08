@@ -1011,15 +1011,18 @@ create_index_path(PlannerInfo *root,
 
 /*
  * create_bitmap_heap_path
- *	  Creates a path node for a bitmap scan.
+ *    创建一个位图堆扫描(BitmapHeapScan)路径节点，并返回该节点
  *
- * 'bitmapqual' is a tree of IndexPath, BitmapAndPath, and BitmapOrPath nodes.
- * 'required_outer' is the set of outer relids for a parameterized path.
- * 'loop_count' is the number of repetitions of the indexscan to factor into
- *		estimates of caching behavior.
+ * 参数说明：
+ *    root - 规划器信息结构体指针
+ *    rel - 关联的关系信息结构体指针
+ *    bitmapqual - 位图条件路径（可以是IndexPath、BitmapAndPath或BitmapOrPath的树结构）
+ *    required_outer - 参数化路径所需的外部关系集合
+ *    loop_count - 索引扫描重复次数，用于缓存行为的成本估算
+ *    parallel_degree - 并行工作者数量
  *
- * loop_count should match the value used when creating the component
- * IndexPaths.
+ * 返回值：
+ *    BitmapHeapPath* - 新创建的位图堆扫描路径节点
  */
 BitmapHeapPath *
 create_bitmap_heap_path(PlannerInfo *root,
@@ -1029,25 +1032,25 @@ create_bitmap_heap_path(PlannerInfo *root,
 						double loop_count,
 						int parallel_degree)
 {
-	BitmapHeapPath *pathnode = makeNode(BitmapHeapPath);
+	BitmapHeapPath *pathnode = makeNode(BitmapHeapPath);  // 创建位图堆扫描路径节点
 
-	pathnode->path.pathtype = T_BitmapHeapScan;
-	pathnode->path.parent = rel;
-	pathnode->path.pathtarget = rel->reltarget;
-	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
-														  required_outer);
-	pathnode->path.parallel_aware = parallel_degree > 0 ? true : false;
-	pathnode->path.parallel_safe = rel->consider_parallel;
-	pathnode->path.parallel_workers = parallel_degree;
-	pathnode->path.pathkeys = NIL;	/* always unordered */
+	pathnode->path.pathtype = T_BitmapHeapScan;           // 路径类型为位图堆扫描
+	pathnode->path.parent = rel;                          // 设置所属关系
+	pathnode->path.pathtarget = rel->reltarget;           // 设置目标输出
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel, required_outer); // 参数化信息
+	pathnode->path.parallel_aware = parallel_degree > 0 ? true : false; // 是否支持并行
+	pathnode->path.parallel_safe = rel->consider_parallel;               // 是否并行安全
+	pathnode->path.parallel_workers = parallel_degree;                   // 并行工作者数量
+	pathnode->path.pathkeys = NIL;                                      // 位图堆扫描结果无序
 
-	pathnode->bitmapqual = bitmapqual;
+	pathnode->bitmapqual = bitmapqual;                                  // 设置位图条件路径
 
+	// 计算位图堆扫描的成本
 	cost_bitmap_heap_scan(&pathnode->path, root, rel,
-						  pathnode->path.param_info,
-						  bitmapqual, loop_count);
+						 pathnode->path.param_info,
+						 bitmapqual, loop_count);
 
-	return pathnode;
+	return pathnode;    // 返回创建的路径节点
 }
 
 /*

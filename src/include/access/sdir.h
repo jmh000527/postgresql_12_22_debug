@@ -16,19 +16,22 @@
 
 
 /*
- * ScanDirection was an int8 for no apparent reason. I kept the original
- * values because I'm not sure if I'll break anything otherwise.  -ay 2/95
+ * ScanDirection 原本是 int8 类型，但原因不明。保留原始值以避免潜在问题。-ay 2/95
+ * 扫描方向枚举类型定义：
+ *   BackwardScanDirection      向后扫描
+ *   NoMovementScanDirection    不移动
+ *   ForwardScanDirection       向前扫描
  */
 typedef enum ScanDirection
 {
-	BackwardScanDirection = -1,
-	NoMovementScanDirection = 0,
-	ForwardScanDirection = 1
+	BackwardScanDirection = -1,    // 向后扫描
+	NoMovementScanDirection = 0,   // 不移动
+	ForwardScanDirection = 1       // 向前扫描
 } ScanDirection;
 
 /*
  * ScanDirectionIsValid
- *		True iff scan direction is valid.
+ *		如果扫描方向是有效的，则返回 true。
  */
 #define ScanDirectionIsValid(direction) \
 	((bool) (BackwardScanDirection <= (direction) && \
@@ -36,21 +39,21 @@ typedef enum ScanDirection
 
 /*
  * ScanDirectionIsBackward
- *		True iff scan direction is backward.
+ *      如果扫描方向是 BackwardScanDirection，则返回 true。
  */
 #define ScanDirectionIsBackward(direction) \
 	((bool) ((direction) == BackwardScanDirection))
 
 /*
  * ScanDirectionIsNoMovement
- *		True iff scan direction indicates no movement.
+ *		如果扫描方向是 NoMovementScanDirection，则返回 true。
  */
 #define ScanDirectionIsNoMovement(direction) \
 	((bool) ((direction) == NoMovementScanDirection))
 
 /*
  * ScanDirectionIsForward
- *		True iff scan direction is forward.
+ *		如果扫描方向是 ForwardScanDirection，则返回 true。
  */
 #define ScanDirectionIsForward(direction) \
 	((bool) ((direction) == ForwardScanDirection))
