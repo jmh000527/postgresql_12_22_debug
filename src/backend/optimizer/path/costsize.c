@@ -5000,13 +5000,19 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 
 /*
  * set_subquery_size_estimates
- *		Set the size estimates for a base relation that is a subquery.
+ *	  PostgreSQL 查询优化器中用于估算子查询（Subquery）结果集大小的关键函数。
+ *    当 SQL 语句中包含 FROM (SELECT ...) 这样的子查询时，优化器会将这个子查询视为一个“虚拟表”（RelOptInfo）。
+ * 	  为了给上层查询制定最佳计划，优化器必须知道这个“虚拟表”大概有多少行、每行有多宽。
  *
- * The rel's targetlist and restrictinfo list must have been constructed
- * already, and the Paths for the subquery must have been completed.
- * We look at the subquery's PlannerInfo to extract data.
+ * 前置条件：
+ *   - 该关系的目标列(targetlist)和限制条件(restrictinfo)列表已构建完成
+ *   - 子查询的PlannerInfo已生成并包含所有路径信息
  *
- * We set the same fields as set_baserel_size_estimates.
+ * 主要功能：
+ *   - 从子查询的最终RelOptInfo中获取输出元组数估算
+ *   - 遍历子查询的目标列，为每个输出列设置宽度估算（如果是普通Var则直接继承子查询中的宽度估算）
+ *   - 其余宽度由set_rel_width根据数据类型补全
+ *   - 最后调用set_baserel_size_estimates完成剩余字段的设置
  */
 void
 set_subquery_size_estimates(PlannerInfo *root, RelOptInfo *rel)
@@ -5015,22 +5021,24 @@ set_subquery_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	RelOptInfo *sub_final_rel;
 	ListCell   *lc;
 
-	/* Should only be applied to base relations that are subqueries */
+	/* 只应用于基于子查询的基本关系 */
 	Assert(rel->relid > 0);
 	Assert(planner_rt_fetch(rel->relid, root)->rtekind == RTE_SUBQUERY);
 
 	/*
-	 * Copy raw number of output rows from subquery.  All of its paths should
-	 * have the same output rowcount, so just look at cheapest-total.
+	 * 从子查询的最终RelOptInfo中获取输出元组数估算
+	 * 由于所有路径的输出行数应一致，这里直接取cheapest_total_path的rows
+	 *
+	 * 它直接去问子查询的优化器（subroot）：“你算出来的最终结果有多少行？”
+	 * 通过 fetch_upper_rel 获取子查询的最终关系对象，然后读取其最优路径（cheapest_total_path）的 rows 属性。
 	 */
 	sub_final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
 	rel->tuples = sub_final_rel->cheapest_total_path->rows;
 
 	/*
-	 * Compute per-output-column width estimates by examining the subquery's
-	 * targetlist.  For any output that is a plain Var, get the width estimate
-	 * that was made while planning the subquery.  Otherwise, we leave it to
-	 * set_rel_width to fill in a datatype-based default estimate.
+	 * 遍历子查询的目标列，估算列宽 (Column Width)
+	 * 如果是普通Var，直接继承子查询中对应列的宽度估算
+	 * 其它情况留给set_rel_width用类型信息补全
 	 */
 	foreach(lc, subroot->parse->targetList)
 	{
@@ -5038,31 +5046,23 @@ set_subquery_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 		Node	   *texpr = (Node *) te->expr;
 		int32		item_width = 0;
 
-		/* junk columns aren't visible to upper query */
+		/* 跳过junk列（不可见列） */
 		if (te->resjunk)
 			continue;
 
-		/*
-		 * The subquery could be an expansion of a view that's had columns
-		 * added to it since the current query was parsed, so that there are
-		 * non-junk tlist columns in it that don't correspond to any column
-		 * visible at our query level.  Ignore such columns.
-		 */
+		/* 跳过不在本层可见范围内的列（如视图扩展导致的多余列） */
 		if (te->resno < rel->min_attr || te->resno > rel->max_attr)
 			continue;
 
 		/*
-		 * XXX This currently doesn't work for subqueries containing set
-		 * operations, because the Vars in their tlists are bogus references
-		 * to the first leaf subquery, which wouldn't give the right answer
-		 * even if we could still get to its PlannerInfo.
+		 * 仅当目标列是普通Var且子查询不包含集合操作时，才继承宽度估算
+		 * 否则留给set_rel_width处理
 		 *
-		 * Also, the subquery could be an appendrel for which all branches are
-		 * known empty due to constraint exclusion, in which case
-		 * set_append_rel_pathlist will have left the attr_widths set to zero.
+		 * 如果子查询只是简单地把底层表的某一列拿出来（SELECT col FROM table），
+		 * 那么这一列的宽度信息可以直接从底层表的统计数据（pg_statistic）中继承过来。这比盲目猜测要准确得多。
 		 *
-		 * In either case, we just leave the width estimate zero until
-		 * set_rel_width fixes it.
+		 * 如果子查询包含 UNION 等集合操作，或者输出的是表达式（a + b），则这里暂时设为 0，
+		 * 留给后续函数去根据数据类型做通用估算
 		 */
 		if (IsA(texpr, Var) &&
 			subroot->parse->setOperations == NULL)
@@ -5070,12 +5070,17 @@ set_subquery_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 			Var		   *var = (Var *) texpr;
 			RelOptInfo *subrel = find_base_rel(subroot, var->varno);
 
+			/* 如果子查询直接输出某个表的列，直接继承那个表的统计信息 */
 			item_width = subrel->attr_widths[var->varattno - subrel->min_attr];
 		}
 		rel->attr_widths[te->resno - rel->min_attr] = item_width;
 	}
 
-	/* Now estimate number of output rows, etc */
+	/*
+	 * 最后调用通用的 set_baserel_size_estimates。它会利用刚才填入的 tuples 和部分 attr_widths，
+	 * 并结合 WHERE 子句中的过滤条件（如果有的话），
+	 * 计算出最终的行数估算（rows）和总宽度（reltarget->width）。
+	 */
 	set_baserel_size_estimates(root, rel);
 }
 

@@ -58,11 +58,19 @@ typedef struct pullup_replace_vars_context
 	Node	  **rv_cache;		/* cache for results with PHVs */
 } pullup_replace_vars_context;
 
+/*
+ * reduce_outer_joins_state 结构体
+ * 用于在外连接简化(reduce_outer_joins)的第一遍遍历中收集每个连接子树的信息。
+ *
+ * - relids: 当前子树包含的所有基表的 RT index 集合（Relids 类型为位图集合）。
+ * - contains_outer: 当前子树是否包含外连接（true 表示包含至少一个外连接）。
+ * - sub_states: 子树各个分支的状态列表（每个元素为 reduce_outer_joins_state*）。
+ */
 typedef struct reduce_outer_joins_state
 {
-	Relids		relids;			/* base relids within this subtree */
-	bool		contains_outer; /* does subtree contain outer join(s)? */
-	List	   *sub_states;		/* List of states for subtree components */
+	Relids		relids;			/* 当前子树包含的基表 RT index 集合 */
+	bool		contains_outer; /* 当前子树是否包含外连接 */
+	List	   *sub_states;		/* 子树各分支的状态列表 */
 } reduce_outer_joins_state;
 
 static Node *pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
@@ -651,61 +659,47 @@ inline_set_returning_functions(PlannerInfo *root)
 
 /*
  * pull_up_subqueries
- *		Look for subqueries in the rangetable that can be pulled up into
- *		the parent query.  If the subquery has no special features like
- *		grouping/aggregation then we can merge it into the parent's jointree.
- *		Also, subqueries that are simple UNION ALL structures can be
- *		converted into "append relations".
+ *		在范围表中查找可以提升到父查询中的子查询。
+ *		如果子查询没有分组/聚合等特殊功能，我们可以将其合并到父查询的连接树中。
+ *		此外，简单的 UNION ALL 结构的子查询可以转换为“追加关系”（append relations）。
  */
 void
 pull_up_subqueries(PlannerInfo *root)
 {
-	/* Top level of jointree must always be a FromExpr */
+	/* 连接树的顶层必须始终是一个 FromExpr */
 	Assert(IsA(root->parse->jointree, FromExpr));
-	/* Recursion starts with no containing join nor appendrel */
+	/* 递归开始时没有包含连接或追加关系 */
 	root->parse->jointree = (FromExpr *)
 		pull_up_subqueries_recurse(root, (Node *) root->parse->jointree,
 								   NULL, NULL, NULL);
-	/* We should still have a FromExpr */
+	/* 我们应该仍然有一个 FromExpr */
 	Assert(IsA(root->parse->jointree, FromExpr));
 }
 
 /*
  * pull_up_subqueries_recurse
- *		Recursive guts of pull_up_subqueries.
+ *		pull_up_subqueries 的递归核心部分。
  *
- * This recursively processes the jointree and returns a modified jointree.
+ * 此函数递归处理连接树并返回修改后的连接树。
  *
- * If this jointree node is within either side of an outer join, then
- * lowest_outer_join references the lowest such JoinExpr node; otherwise
- * it is NULL.  We use this to constrain the effects of LATERAL subqueries.
+ * 如果此连接树节点位于外部连接的任一侧，则 lowest_outer_join 引用最低的此类 JoinExpr 节点；
+ * 否则为 NULL。我们使用它来限制 LATERAL 子查询的影响。
  *
- * If this jointree node is within the nullable side of an outer join, then
- * lowest_nulling_outer_join references the lowest such JoinExpr node;
- * otherwise it is NULL.  This forces use of the PlaceHolderVar mechanism for
- * references to non-nullable targetlist items, but only for references above
- * that join.
+ * 如果此连接树节点位于外部连接的可空侧，则 lowest_nulling_outer_join 引用最低的此类 JoinExpr 节点；
+ * 否则为 NULL。这强制对非可空目标列表项的引用使用 PlaceHolderVar 机制，但仅针对该连接之上的引用。
  *
- * If we are looking at a member subquery of an append relation,
- * containing_appendrel describes that relation; else it is NULL.
- * This forces use of the PlaceHolderVar mechanism for all non-Var targetlist
- * items, and puts some additional restrictions on what can be pulled up.
+ * 如果我们正在查看追加关系（append relation）的成员子查询，则 containing_appendrel 描述该关系；
+ * 否则为 NULL。这强制对所有非 Var 目标列表项使用 PlaceHolderVar 机制，并对可以提升的内容施加一些额外限制。
  *
- * A tricky aspect of this code is that if we pull up a subquery we have
- * to replace Vars that reference the subquery's outputs throughout the
- * parent query, including quals attached to jointree nodes above the one
- * we are currently processing!  We handle this by being careful to maintain
- * validity of the jointree structure while recursing, in the following sense:
- * whenever we recurse, all qual expressions in the tree must be reachable
- * from the top level, in case the recursive call needs to modify them.
+ * 此代码的一个棘手方面是，如果我们提升子查询，我们必须替换整个父查询中引用子查询输出的 Vars，
+ * 包括附加到我们当前正在处理的节点之上的连接树节点的 quals！
+ * 我们通过在递归时小心维护连接树结构的有效性来处理这个问题，具体如下：
+ * 每当我们递归时，树中的所有 qual 表达式必须从顶层可达，以防递归调用需要修改它们。
  *
- * Notice also that we can't turn pullup_replace_vars loose on the whole
- * jointree, because it'd return a mutated copy of the tree; we have to
- * invoke it just on the quals, instead.  This behavior is what makes it
- * reasonable to pass lowest_outer_join and lowest_nulling_outer_join as
- * pointers rather than some more-indirect way of identifying the lowest
- * OJs.  Likewise, we don't replace append_rel_list members but only their
- * substructure, so the containing_appendrel reference is safe to use.
+ * 还要注意，我们不能对整个连接树随意使用 pullup_replace_vars，因为它会返回树的变异副本；
+ * 我们必须仅对 quals 调用它。这种行为使得将 lowest_outer_join 和 lowest_nulling_outer_join
+ * 作为指针传递是合理的，而不是使用某种更间接的方式来标识最低的 OJs。
+ * 同样，我们不替换 append_rel_list 成员，只替换它们的子结构，因此 containing_appendrel 引用是安全使用的。
  */
 static Node *
 pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
@@ -713,9 +707,9 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 						   JoinExpr *lowest_nulling_outer_join,
 						   AppendRelInfo *containing_appendrel)
 {
-	/* Since this function recurses, it could be driven to stack overflow. */
+	/* 由于此函数递归调用，可能会导致堆栈溢出。 */
 	check_stack_depth();
-	/* Also, since it's a bit expensive, let's check for query cancel. */
+	/* 此外，由于它有点昂贵，让我们检查查询取消。 */
 	CHECK_FOR_INTERRUPTS();
 
 	Assert(jtnode != NULL);
@@ -725,11 +719,9 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 		RangeTblEntry *rte = rt_fetch(varno, root->parse->rtable);
 
 		/*
-		 * Is this a subquery RTE, and if so, is the subquery simple enough to
-		 * pull up?
+		 * 这是一个子查询 RTE 吗？如果是，子查询是否简单到可以提升？
 		 *
-		 * If we are looking at an append-relation member, we can't pull it up
-		 * unless is_safe_append_member says so.
+		 * 如果我们正在查看追加关系成员，除非 is_safe_append_member 允许，否则我们不能提升它。
 		 */
 		if (rte->rtekind == RTE_SUBQUERY &&
 			is_simple_subquery(root, rte->subquery, rte, lowest_outer_join) &&
@@ -741,23 +733,20 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 										   containing_appendrel);
 
 		/*
-		 * Alternatively, is it a simple UNION ALL subquery?  If so, flatten
-		 * into an "append relation".
+		 * 或者，它是一个简单的 UNION ALL 子查询吗？如果是，将其展平为“追加关系”。
 		 *
-		 * It's safe to do this regardless of whether this query is itself an
-		 * appendrel member.  (If you're thinking we should try to flatten the
-		 * two levels of appendrel together, you're right; but we handle that
-		 * in set_append_rel_pathlist, not here.)
+		 * 无论此查询本身是否为追加关系成员，这样做都是安全的。
+		 * （如果你认为我们应该尝试将两层追加关系展平在一起，你是对的；
+		 * 但我们在 set_append_rel_pathlist 中处理这个问题，而不是在这里。）
 		 */
 		if (rte->rtekind == RTE_SUBQUERY &&
 			is_simple_union_all(rte->subquery))
 			return pull_up_simple_union_all(root, jtnode, rte);
 
 		/*
-		 * Or perhaps it's a simple VALUES RTE?
+		 * 或者也许它是一个简单的 VALUES RTE？
 		 *
-		 * We don't allow VALUES pullup below an outer join nor into an
-		 * appendrel (such cases are impossible anyway at the moment).
+		 * 我们不允许 VALUES 提升到外部连接下方或追加关系中（目前这些情况无论如何都是不可能的）。
 		 */
 		if (rte->rtekind == RTE_VALUES &&
 			lowest_outer_join == NULL &&
@@ -765,7 +754,7 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 			is_simple_values(root, rte))
 			return pull_up_simple_values(root, jtnode, rte);
 
-		/* Otherwise, do nothing at this node. */
+		/* 否则，在此节点不做任何操作。 */
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
@@ -773,7 +762,7 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 		ListCell   *l;
 
 		Assert(containing_appendrel == NULL);
-		/* Recursively transform all the child nodes */
+		/* 递归转换所有子节点 */
 		foreach(l, f->fromlist)
 		{
 			lfirst(l) = pull_up_subqueries_recurse(root, lfirst(l),
@@ -787,7 +776,7 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 		JoinExpr   *j = (JoinExpr *) jtnode;
 
 		Assert(containing_appendrel == NULL);
-		/* Recurse, being careful to tell myself when inside outer join */
+		/* 递归，小心地告诉自己何时在外部连接内部 */
 		switch (j->jointype)
 		{
 			case JOIN_INNER:
@@ -2368,40 +2357,29 @@ flatten_simple_union_all(PlannerInfo *root)
 
 /*
  * reduce_outer_joins
- *		Attempt to reduce outer joins to plain inner joins.
+ *		尝试将外连接简化为普通内连接。
  *
- * The idea here is that given a query like
+ * 这里的思想是，对于如下查询：
  *		SELECT ... FROM a LEFT JOIN b ON (...) WHERE b.y = 42;
- * we can reduce the LEFT JOIN to a plain JOIN if the "=" operator in WHERE
- * is strict.  The strict operator will always return NULL, causing the outer
- * WHERE to fail, on any row where the LEFT JOIN filled in NULLs for b's
- * columns.  Therefore, there's no need for the join to produce null-extended
- * rows in the first place --- which makes it a plain join not an outer join.
- * (This scenario may not be very likely in a query written out by hand, but
- * it's reasonably likely when pushing quals down into complex views.)
+ * 如果 WHERE 子句中的 "=" 操作符是严格的（strict），那么当 LEFT JOIN 为 b 的列填充 NULL 时，
+ * 严格操作符总会返回 NULL，导致外层 WHERE 失败。因此，连接无需产生 null 扩展的行，
+ * 这就等价于普通的内连接（plain join）而不是外连接。
+ * （这种场景在手写 SQL 时可能不常见，但在将 quals 下推到复杂视图时很常见。）
  *
- * More generally, an outer join can be reduced in strength if there is a
- * strict qual above it in the qual tree that constrains a Var from the
- * nullable side of the join to be non-null.  (For FULL joins this applies
- * to each side separately.)
+ * 更一般地说，如果在 qual 树中有严格的条件约束了外连接可空侧的 Var 非空，
+ * 那么外连接可以被弱化（reduced）为更强的连接类型（如内连接）。
+ * （对于 FULL JOIN，这一规则分别适用于两侧。）
  *
- * Another transformation we apply here is to recognize cases like
+ * 此外，我们还识别如下场景：
  *		SELECT ... FROM a LEFT JOIN b ON (a.x = b.y) WHERE b.y IS NULL;
- * If the join clause is strict for b.y, then only null-extended rows could
- * pass the upper WHERE, and we can conclude that what the query is really
- * specifying is an anti-semijoin.  We change the join type from JOIN_LEFT
- * to JOIN_ANTI.  The IS NULL clause then becomes redundant, and must be
- * removed to prevent bogus selectivity calculations, but we leave it to
- * distribute_qual_to_rels to get rid of such clauses.
+ * 如果连接条件对 b.y 是严格的，则只有 null 扩展的行才能通过外层 WHERE，
+ * 这实际上等价于反半连接（anti-semijoin）。我们将连接类型从 JOIN_LEFT 改为 JOIN_ANTI。
+ * IS NULL 条件变得多余，必须移除以避免错误的选择率估算，但实际移除工作交由 distribute_qual_to_rels 完成。
  *
- * Also, we get rid of JOIN_RIGHT cases by flipping them around to become
- * JOIN_LEFT.  This saves some code here and in some later planner routines,
- * but the main reason to do it is to not need to invent a JOIN_REVERSE_ANTI
- * join type.
+ * 同时，我们会将 JOIN_RIGHT 反转为 JOIN_LEFT。这样可以简化本函数和后续规划器代码，
+ * 主要原因是避免引入 JOIN_REVERSE_ANTI 这种新的连接类型。
  *
- * To ease recognition of strict qual clauses, we require this routine to be
- * run after expression preprocessing (i.e., qual canonicalization and JOIN
- * alias-var expansion).
+ * 为了便于识别严格的 qual 子句，要求本函数在表达式预处理（如 qual 规范化和 JOIN 别名变量展开）之后运行。
  */
 void
 reduce_outer_joins(PlannerInfo *root)
@@ -2409,17 +2387,34 @@ reduce_outer_joins(PlannerInfo *root)
 	reduce_outer_joins_state *state;
 
 	/*
-	 * To avoid doing strictness checks on more quals than necessary, we want
-	 * to stop descending the jointree as soon as there are no outer joins
-	 * below our current point.  This consideration forces a two-pass process.
-	 * The first pass gathers information about which base rels appear below
-	 * each side of each join clause, and about whether there are outer
-	 * join(s) below each side of each join clause. The second pass examines
-	 * qual clauses and changes join types as it descends the tree.
+	 * 为了避免对过多的 quals 进行严格性检查，我们希望一旦当前 jointree 下没有外连接就停止递归。
+	 * 这需要两遍处理：第一遍收集每个连接子树下有哪些基表、是否包含外连接等信息；
+	 * 第二遍再结合 quals 递归处理 jointree 并修改连接类型。
+	 *
+	 * 举例说明:
+	 * 1. 外连接消除 (Outer Join Reduction):
+	 *    查询: SELECT * FROM a LEFT JOIN b ON a.x = b.y WHERE b.z = 42;
+	 *    由于 WHERE 子句对 b.z 是严格的(strict)，即 b.z 为 NULL 时 WHERE 为假，
+	 *    因此 LEFT JOIN 生成的 NULL 补全行会被过滤掉。
+	 *    优化: 将 LEFT JOIN 转换为 INNER JOIN。
+	 *
+	 * 2. 转换为反连接 (Anti Join Conversion):
+	 *    查询: SELECT * FROM a LEFT JOIN b ON a.x = b.y WHERE b.y IS NULL;
+	 *    如果连接条件对 b.y 是严格的，那么只有当 b 中没有匹配行(生成 NULL)时，
+	 *    WHERE 子句才为真。
+	 *    优化: 将 LEFT JOIN 转换为 ANTI JOIN (JOIN_ANTI)。
+	 *
+	 * 关于“严格性”(Strictness)的定义:
+	 * 如果一个表达式(通常是 WHERE 子句)引用的某个变量为 NULL 时，该表达式的计算结果
+	 * 必然为 FALSE 或 NULL (即不可能为 TRUE)，则称该表达式对该变量是“严格的”。
+	 * - 严格的例子: "x = 5", "x > 10"。如果 x 为 NULL，结果为 NULL (假)。
+	 * - 不严格的例子: "x IS NULL"。如果 x 为 NULL，结果为 TRUE。
+	 * 正是利用这一属性，如果上层 WHERE 对右表列是严格的，我们就能确定 LEFT JOIN
+	 * 产生的 NULL 补全行会被丢弃，从而安全地将其转换为 INNER JOIN。
 	 */
 	state = reduce_outer_joins_pass1((Node *) root->parse->jointree);
 
-	/* planner.c shouldn't have called me if no outer joins */
+	/* 如果没有外连接，planner.c 不应该调用本函数 */
 	if (state == NULL || !state->contains_outer)
 		elog(ERROR, "so where are the outer joins?");
 
@@ -2428,31 +2423,45 @@ reduce_outer_joins(PlannerInfo *root)
 }
 
 /*
- * reduce_outer_joins_pass1 - phase 1 data collection
+ * reduce_outer_joins_pass1 - 第一阶段数据收集
  *
- * Returns a state node describing the given jointree node.
+ * 返回一个描述给定 jointree 节点的 state 节点。
+ * 这个函数的主要目的是自底向上遍历连接树，收集每个节点包含的基表集合(relids)
+ * 以及该子树中是否包含外连接(contains_outer)。
  */
 static reduce_outer_joins_state *
 reduce_outer_joins_pass1(Node *jtnode)
 {
 	reduce_outer_joins_state *result;
 
-	result = (reduce_outer_joins_state *)
-		palloc(sizeof(reduce_outer_joins_state));
+	/* 分配并初始化 state 结构 */
+	result = (reduce_outer_joins_state*)palloc(sizeof(reduce_outer_joins_state));
 	result->relids = NULL;
 	result->contains_outer = false;
 	result->sub_states = NIL;
 
+	/* 空节点直接返回空状态 */
 	if (jtnode == NULL)
 		return result;
+
+	/* 处理 RangeTblRef (基表引用) */
 	if (IsA(jtnode, RangeTblRef))
 	{
+		/*
+		 * 如果是基表引用(RangeTblRef)，则记录该表的 RT index。
+		 * 基表本身不包含外连接。
+		 */
 		int			varno = ((RangeTblRef *) jtnode)->rtindex;
 
 		result->relids = bms_make_singleton(varno);
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
+		/*
+		 * 如果是 FromExpr (通常对应 SQL 中的 FROM 子句列表)，
+		 * 则递归处理 fromlist 中的每个子节点。
+		 * 结果是所有子节点的并集。
+		 */
 		FromExpr   *f = (FromExpr *) jtnode;
 		ListCell   *l;
 
@@ -2469,19 +2478,29 @@ reduce_outer_joins_pass1(Node *jtnode)
 	}
 	else if (IsA(jtnode, JoinExpr))
 	{
+		/*
+		 * 如果是 JoinExpr (连接表达式)，递归处理左右子树。
+		 */
 		JoinExpr   *j = (JoinExpr *) jtnode;
 		reduce_outer_joins_state *sub_state;
 
-		/* join's own RT index is not wanted in result->relids */
+		/* 
+		 * join 自己的 RT index 不需要包含在 result->relids 中，
+		 * 因为我们只关心基表。
+		 * 
+		 * 检查当前连接本身是否是外连接。
+		 */
 		if (IS_OUTER_JOIN(j->jointype))
 			result->contains_outer = true;
 
+		/* 处理左子树 */
 		sub_state = reduce_outer_joins_pass1(j->larg);
 		result->relids = bms_add_members(result->relids,
 										 sub_state->relids);
 		result->contains_outer |= sub_state->contains_outer;
 		result->sub_states = lappend(result->sub_states, sub_state);
 
+		/* 处理右子树 */
 		sub_state = reduce_outer_joins_pass1(j->rarg);
 		result->relids = bms_add_members(result->relids,
 										 sub_state->relids);
@@ -2495,14 +2514,14 @@ reduce_outer_joins_pass1(Node *jtnode)
 }
 
 /*
- * reduce_outer_joins_pass2 - phase 2 processing
+ * reduce_outer_joins_pass2 - 第二阶段处理
  *
- *	jtnode: current jointree node
- *	state: state data collected by phase 1 for this node
- *	root: toplevel planner state
- *	nonnullable_rels: set of base relids forced non-null by upper quals
- *	nonnullable_vars: list of Vars forced non-null by upper quals
- *	forced_null_vars: list of Vars forced null by upper quals
+ *	jtnode: 当前连接树节点
+ *	state: 第一阶段收集的状态数据
+ *	root: 顶层 PlannerInfo
+ *	nonnullable_rels: 由上层 quals 强制非空的基表 relids 集合
+ *	nonnullable_vars: 由上层 quals 强制非空的 Vars 列表
+ *	forced_null_vars: 由上层 quals 强制为 NULL 的 Vars 列表
  */
 static void
 reduce_outer_joins_pass2(Node *jtnode,
@@ -2513,8 +2532,7 @@ reduce_outer_joins_pass2(Node *jtnode,
 						 List *forced_null_vars)
 {
 	/*
-	 * pass 2 should never descend as far as an empty subnode or base rel,
-	 * because it's only called on subtrees marked as contains_outer.
+	 * 第二阶段不应递归到空节点或基表节点，只处理包含外连接的子树
 	 */
 	if (jtnode == NULL)
 		elog(ERROR, "reached empty jointree");
@@ -2522,25 +2540,60 @@ reduce_outer_joins_pass2(Node *jtnode,
 		elog(ERROR, "reached base rel");
 	else if (IsA(jtnode, FromExpr))
 	{
-		FromExpr   *f = (FromExpr *) jtnode;
+		/* 处理 FromExpr 节点 */
+		FromExpr* f = (FromExpr*)jtnode;
 		ListCell   *l;
 		ListCell   *s;
 		Relids		pass_nonnullable_rels;
 		List	   *pass_nonnullable_vars;
 		List	   *pass_forced_null_vars;
 
-		/* Scan quals to see if we can add any constraints */
+		/*
+		 * 扫描 quals，收集本层可加的约束
+		 * 收集当前层级（FromExpr）的 WHERE 条件（quals）所带来的约束信息，
+		 * 并将这些信息与上层传递下来的约束合并，以便传递给子节点继续处理。
+		 */
+		/* 
+		 * 合并非空表 relids
+		 * find_nonnullable_rels(f->quals): 分析当前层的 WHERE 条件。
+		 * 如果条件是 tableA.col = 5，那么 tableA 就被标记为“非空表”。
+		 * 这意味着如果下层有 LEFT JOIN 生成了 tableA 的全 NULL 行，这些行会被杀掉。
+		 *
+		 * 作用：
+		 * 用于将 LEFT JOIN 简化为 INNER JOIN。
+		 * 如果一个 LEFT JOIN 的右表出现在这个集合里，说明该 LEFT JOIN 可以被消除。
+		 */
 		pass_nonnullable_rels = find_nonnullable_rels(f->quals);
 		pass_nonnullable_rels = bms_add_members(pass_nonnullable_rels,
 												nonnullable_rels);
-		/* NB: we rely on list_concat to not damage its second argument */
+		/*
+		 * 合并非空变量列表
+		 * 哪些具体的列（变量）被当前的 WHERE 条件严格约束了。
+		 * find_nonnullable_vars: 找出那些一旦为 NULL 就会导致条件为 False 的变量。
+		 * 例如 WHERE a.x > 10，那么 a.x 就是非空变量。
+		 *
+		 * 作用: 这是更细粒度的约束信息，主要用于辅助判断。
+		 * 在某些复杂的嵌套连接场景下，仅靠表级信息可能不够精确，需要知道具体是哪个列被约束了。
+		 */
 		pass_nonnullable_vars = find_nonnullable_vars(f->quals);
 		pass_nonnullable_vars = list_concat(pass_nonnullable_vars,
 											nonnullable_vars);
+		/*
+		 * 合并强制为 NULL 的变量列表
+		 * 哪些变量被 WHERE 条件强制要求必须是 NULL。
+		 * find_forced_null_vars: 寻找形如 WHERE col IS NULL 的条件。如果存在，col 就被加入这个列表。
+		 *
+		 * 作用：
+		 * 这是反连接（Anti Join）转换的核心依据。
+		 * 如果下层有一个 LEFT JOIN，且其连接条件对某个变量是严格的。
+		 * 同时，这个变量出现在 pass_forced_null_vars 列表中（即上层要求它必须是 NULL）。
+		 * 那么优化器就会触发 Anti Join 转换。
+		 */
 		pass_forced_null_vars = find_forced_null_vars(f->quals);
 		pass_forced_null_vars = list_concat(pass_forced_null_vars,
 											forced_null_vars);
-		/* And recurse --- but only into interesting subtrees */
+
+		/* 递归处理有外连接的子树 */
 		Assert(list_length(f->fromlist) == list_length(state->sub_states));
 		forboth(l, f->fromlist, s, state->sub_states)
 		{
@@ -2553,52 +2606,131 @@ reduce_outer_joins_pass2(Node *jtnode,
 										 pass_forced_null_vars);
 		}
 		bms_free(pass_nonnullable_rels);
-		/* can't so easily clean up var lists, unfortunately */
+		/* var 列表无法方便地释放内存 */
 	}
 	else if (IsA(jtnode, JoinExpr))
 	{
 		JoinExpr   *j = (JoinExpr *) jtnode;
 		int			rtindex = j->rtindex;
 		JoinType	jointype = j->jointype;
-		reduce_outer_joins_state *left_state = linitial(state->sub_states);
+
+		/* 获取左右子树的状态 */
+		reduce_outer_joins_state* left_state = linitial(state->sub_states);
 		reduce_outer_joins_state *right_state = lsecond(state->sub_states);
-		List	   *local_nonnullable_vars = NIL;
+
+		/* 
+		 * 收集当前连接的非空变量列表
+		 * 分析当前连接的 quals，找出哪些变量一旦为 NULL 就会导致条件为 False。
+		 * 这些变量就是当前连接的“非空变量”。
+		 *
+		 * 作用：
+		 * 用于判断当前连接是否可以被简化为内连接（INNER JOIN）。
+		 * 如果一个 LEFT JOIN 的右表出现在这个集合里，说明该 LEFT JOIN 可以被消除。
+		 */
+		List		*local_nonnullable_vars = NIL;
 		bool		computed_local_nonnullable_vars = false;
 
-		/* Can we simplify this join? */
+		/* 
+		 * 1. 尝试简化连接类型 (Outer Join Reduction)
+		 * 检查上层传递下来的非空表集合(nonnullable_rels)是否与当前连接的左右子树有重叠。
+		 * 如果有重叠，说明上层 WHERE 条件要求该子树必须非空，因此可以将外连接简化为内连接。
+		 */
 		switch (jointype)
 		{
 			case JOIN_INNER:
 				break;
 			case JOIN_LEFT:
+				/* 
+				 * 如果右表被上层约束为非空，LEFT JOIN -> INNER JOIN 
+				 * 
+				 * "上层"(Upper Level)指的是在查询树中位于当前 JOIN 节点之上的操作，
+				 * 通常对应 SQL 中的 WHERE 子句或更高层的 JOIN 条件。
+				 * 
+				 * 逻辑:
+				 * 1. LEFT JOIN 会生成包含 NULL 的行(当右表不匹配时)。
+				 * 2. "上层约束为非空"意味着 WHERE 子句会过滤掉右表为 NULL 的行。
+				 * 3. 既然这些 NULL 行注定要被上层杀掉，不如直接用 INNER JOIN，
+				 *    根本不生成这些行。
+				 */
 				if (bms_overlap(nonnullable_rels, right_state->relids))
 					jointype = JOIN_INNER;
 				break;
 			case JOIN_RIGHT:
+				/* 如果左表被上层约束为非空，RIGHT JOIN -> INNER JOIN */
 				if (bms_overlap(nonnullable_rels, left_state->relids))
 					jointype = JOIN_INNER;
 				break;
 			case JOIN_FULL:
+				/* 
+				 * FULL JOIN 两边都可能产生 NULL，需分别检查 
+				 * 
+				 * FULL JOIN = (A left join B) UNION (A right join B)
+				 * 它可能生成：
+				 * 1. 左边为 NULL 的行 (右表有，左表无)
+				 * 2. 右边为 NULL 的行 (左表有，右表无)
+				 * 
+				 * 举例: A={1,2}, B={1,3}
+				 * SQL: SELECT * FROM A FULL JOIN B ON A.id = B.id
+				 * FULL JOIN 结果: (1,1), (2,NULL), (NULL,3)
+				 */
 				if (bms_overlap(nonnullable_rels, left_state->relids))
 				{
+					/* 
+					 * 上层约束要求左表必须非空 (例如 WHERE A.id IS NOT NULL)。
+					 * 这意味着所有"左边为 NULL"的行((NULL,3))都会被过滤掉。
+					 * 剩下的行是 (1,1) 和 (2,NULL)。
+					 * 这正是 LEFT JOIN 的行为。
+					 * 
+					 * 优化后 SQL: SELECT * FROM A LEFT JOIN B ON A.id = B.id WHERE A.id IS NOT NULL
+					 */
 					if (bms_overlap(nonnullable_rels, right_state->relids))
-						jointype = JOIN_INNER;
+					{
+						/* 
+						 * 上层同时要求右表也必须非空 (例如 WHERE B.id IS NOT NULL)。
+						 * 那么"右边为 NULL"的行((2,NULL))也会被过滤掉。
+						 * 剩下的行只有 (1,1)。
+						 * 既不能左边空，也不能右边空 -> 只能是 INNER JOIN。
+						 * 
+						 * 优化后 SQL: SELECT * FROM A INNER JOIN B ON A.id = B.id WHERE ...
+						 */
+						jointype = JOIN_INNER; /* 两边都非空 -> INNER */
+					}
 					else
-						jointype = JOIN_LEFT;
+					{
+						/* 只有左边被约束非空 -> 消除左NULL行 -> 降级为 LEFT JOIN */
+						jointype = JOIN_LEFT;  /* 只有左边非空 -> LEFT */
+					}
 				}
 				else
 				{
 					if (bms_overlap(nonnullable_rels, right_state->relids))
-						jointype = JOIN_RIGHT;
+					{
+						/* 
+						 * 上层只要求右表必须非空 (例如 WHERE B.id IS NOT NULL)。
+						 * 消除"右边为 NULL"的行((2,NULL))。
+						 * 剩下的行是 (1,1) 和 (NULL,3)。
+						 * 这正是 RIGHT JOIN 的行为。
+						 * 
+						 * 优化后 SQL: SELECT * FROM A RIGHT JOIN B ON A.id = B.id WHERE B.id IS NOT NULL
+						 */
+						jointype = JOIN_RIGHT; /* 只有右边非空 -> RIGHT */
+					}
 				}
 				break;
 			case JOIN_SEMI:
 			case JOIN_ANTI:
-
-				/*
-				 * These could only have been introduced by pull_up_sublinks,
-				 * so there's no way that upper quals could refer to their
-				 * righthand sides, and no point in checking.
+				/* 
+				 * 这些类型通常由子查询提升(pull_up_sublinks)引入。
+				 * 上层 quals 不可能引用 RHS 的变量(因为它们对上层不可见)，
+				 * 所以无法通过上层约束来简化这些连接。
+				 * 因为 SEMI/ANTI JOIN 的结果集里只有左表（LHS）的列，右表（RHS）的列在连接完成后就被丢弃了。
+				 * 所以，上层的 WHERE 子句根本无法引用右表的列。
+				 *
+				 * 为什么说“由 pull_up_sublinks 引入”？
+				 * 在 PostgreSQL 的查询优化流程中，
+				 * JOIN_SEMI 和 JOIN_ANTI 通常不是用户直接写在 SQL 里的（SQL 标准里没有 SEMI JOIN 关键字），
+				 * 而是优化器在处理 EXISTS 或 NOT EXISTS 子查询时，
+				 * 通过 pull_up_sublinks 步骤将子查询“提升”上来转换而成的。
 				 */
 				break;
 			default:
@@ -2608,11 +2740,9 @@ reduce_outer_joins_pass2(Node *jtnode,
 		}
 
 		/*
-		 * Convert JOIN_RIGHT to JOIN_LEFT.  Note that in the case where we
-		 * reduced JOIN_FULL to JOIN_RIGHT, this will mean the JoinExpr no
-		 * longer matches the internal ordering of any CoalesceExpr's built to
-		 * represent merged join variables.  We don't care about that at
-		 * present, but be wary of it ...
+		 * 2. 规范化: 将 JOIN_RIGHT 转换为 JOIN_LEFT
+		 * 这样后续处理只需要考虑 LEFT JOIN，减少代码复杂度。
+		 * 同时交换左右子树和对应的状态。
 		 */
 		if (jointype == JOIN_RIGHT)
 		{
@@ -2621,42 +2751,77 @@ reduce_outer_joins_pass2(Node *jtnode,
 			tmparg = j->larg;
 			j->larg = j->rarg;
 			j->rarg = tmparg;
+
 			jointype = JOIN_LEFT;
 			right_state = linitial(state->sub_states);
 			left_state = lsecond(state->sub_states);
 		}
 
 		/*
-		 * See if we can reduce JOIN_LEFT to JOIN_ANTI.  This is the case if
-		 * the join's own quals are strict for any var that was forced null by
-		 * higher qual levels.  NOTE: there are other ways that we could
-		 * detect an anti-join, in particular if we were to check whether Vars
-		 * coming from the RHS must be non-null because of table constraints.
-		 * That seems complicated and expensive though (in particular, one
-		 * would have to be wary of lower outer joins). For the moment this
-		 * seems sufficient.
+		 * 3. 尝试转换为反连接 (Anti Join Conversion)
+		 * 仅针对 JOIN_LEFT。
+		 * 逻辑: 如果连接条件(j->quals)对某些变量是严格的(local_nonnullable_vars)，
+		 * 且这些变量在上层被强制要求为 NULL (forced_null_vars)，
+		 * 并且这些变量确实来自右表(RHS)，
+		 * 那么可以将 LEFT JOIN 转换为 ANTI JOIN。
+		 * 
+		 * 举例:
+		 * SQL: SELECT * FROM A LEFT JOIN B ON A.id = B.id WHERE B.id IS NULL
+		 * 
+		 * 推导过程:
+		 * 1. 连接条件 "A.id = B.id" 对 B.id 是严格的。这意味着如果 B.id 为 NULL (数据本身为 NULL)，
+		 *    连接条件不成立，该行不会匹配成功。
+		 * 2. 因此，LEFT JOIN 结果集中 B.id 为 NULL 的行，只能是"匹配失败"后由系统自动补全的 NULL。
+		 * 3. 上层 WHERE 子句 "B.id IS NULL" 专门筛选这些行。
+		 * 4. 结论: 查询意图是"找出 A 中在 B 里没有匹配的行"。这正是 ANTI JOIN 的定义。
 		 */
 		if (jointype == JOIN_LEFT)
 		{
 			List	   *overlap;
 
+			/*
+			 * j->quals 是 ON 子句的条件
+			 * find_nonnullable_vars 找出那些“如果为 NULL 则条件必不成立”的变量。
+			 */
 			local_nonnullable_vars = find_nonnullable_vars(j->quals);
 			computed_local_nonnullable_vars = true;
 
-			/*
-			 * It's not sufficient to check whether local_nonnullable_vars and
-			 * forced_null_vars overlap: we need to know if the overlap
-			 * includes any RHS variables.
+			/* 
+			 * 检查连接条件的严格变量与上层强制 NULL 变量的交集。
+			 * 必须确认交集中的变量属于右表(right_state->relids)。
+			 * forced_null_vars 来自上层的 WHERE 子句，包含形如 WHERE col IS NULL 的变量。
+			 * 代码检查：连接条件里的严格变量，是否出现在了上层的“强制 NULL”列表中。
 			 */
 			overlap = list_intersection(local_nonnullable_vars,
 										forced_null_vars);
+
+			/*
+			 * 确认这个既严格又被要求为 NULL 的变量，确实是来自 LEFT JOIN 的右侧表。
+			 * 举例：
+			 * SELECT *
+			 * FROM A LEFT JOIN B ON A.id = B.id
+			 * WHERE B.id IS NULL;
+			 *
+			 * 连接条件: A.id = B.id。对 B.id 是严格的。
+			 * 上层约束: WHERE B.id IS NULL。B.id 在 forced_null_vars 中
+			 * 交集: B.id 既是严格变量，又被要求为 NULL。
+			 * 归属: B.id 属于右表 B。
+			 * 转换: LEFT JOIN -> ANTI JOIN。
+			 *
+			 * 数据库不再执行完整的 LEFT JOIN（生成所有行再过滤），
+			 * 而是直接使用高效的 Anti Join 算法（如 Hash Anti Join），
+			 * 一旦找到匹配就丢弃，只保留没匹配的，效率大幅提升。
+			 */
 			if (overlap != NIL &&
 				bms_overlap(pull_varnos(root, (Node *) overlap),
 							right_state->relids))
 				jointype = JOIN_ANTI;
 		}
 
-		/* Apply the jointype change, if any, to both jointree node and RTE */
+		/* 
+		 * 4. 应用连接类型变更
+		 * 如果 jointype 发生了变化，需要更新 JoinExpr 节点和对应的 RTE。
+		 */
 		if (rtindex && jointype != j->jointype)
 		{
 			RangeTblEntry *rte = rt_fetch(rtindex, root->parse->rtable);
@@ -2667,7 +2832,18 @@ reduce_outer_joins_pass2(Node *jtnode,
 		}
 		j->jointype = jointype;
 
-		/* Only recurse if there's more to do below here */
+		/* 
+		 * 5. 递归处理子节点
+		 * 只有当子树中包含外连接时才需要递归(通过 contains_outer 快速判断)。
+		 * 这个分支（递归处理子节点）只有在连接树（Join Tree）是多层嵌套结构时才会进入。
+		 * 简单来说，就是你的 SQL 里有多个 JOIN，或者 JOIN 里面套了子查询。
+		 * 例如：
+		 * SELECT *
+		 * FROM t1
+		 * LEFT JOIN (t2 LEFT JOIN t3 ON t2.id = t3.id)
+		 * ON t1.id = t2.id
+		 * WHERE t3.val IS NOT NULL;
+		 */
 		if (left_state->contains_outer || right_state->contains_outer)
 		{
 			Relids		local_nonnullable_rels;
@@ -2677,35 +2853,25 @@ reduce_outer_joins_pass2(Node *jtnode,
 			List	   *pass_forced_null_vars;
 
 			/*
-			 * If this join is (now) inner, we can add any constraints its
-			 * quals provide to those we got from above.  But if it is outer,
-			 * we can pass down the local constraints only into the nullable
-			 * side, because an outer join never eliminates any rows from its
-			 * non-nullable side.  Also, there is no point in passing upper
-			 * constraints into the nullable side, since if there were any
-			 * we'd have been able to reduce the join.  (In the case of upper
-			 * forced-null constraints, we *must not* pass them into the
-			 * nullable side --- they either applied here, or not.) The upshot
-			 * is that we pass either the local or the upper constraints,
-			 * never both, to the children of an outer join.
-			 *
-			 * Note that a SEMI join works like an inner join here: it's okay
-			 * to pass down both local and upper constraints.  (There can't be
-			 * any upper constraints affecting its inner side, but it's not
-			 * worth having a separate code path to avoid passing them.)
-			 *
-			 * At a FULL join we just punt and pass nothing down --- is it
-			 * possible to be smarter?
+			 * 准备向下传递的约束信息。
+			 * 
+			 * 规则:
+			 * - INNER/SEMI: 连接条件是严格的，可以将本层的约束(j->quals)与上层约束合并传递。
+			 * - LEFT/ANTI: 连接条件对左表不严格(左表总是保留)，所以不能将本层约束传给左表，
+			 *              也不能将上层约束传给右表(因为右表可能补 NULL)。
+			 *              但本层的约束可以传给右表(因为如果右表不满足连接条件，就会补 NULL)。
+			 * - FULL: 不产生任何有用的约束传递，所以直接跳过。
 			 */
 			if (jointype != JOIN_FULL)
 			{
 				local_nonnullable_rels = find_nonnullable_rels(j->quals);
+
 				if (!computed_local_nonnullable_vars)
 					local_nonnullable_vars = find_nonnullable_vars(j->quals);
 				local_forced_null_vars = find_forced_null_vars(j->quals);
+
 				if (jointype == JOIN_INNER || jointype == JOIN_SEMI)
 				{
-					/* OK to merge upper and local constraints */
 					local_nonnullable_rels = bms_add_members(local_nonnullable_rels,
 															 nonnullable_rels);
 					local_nonnullable_vars = list_concat(local_nonnullable_vars,
@@ -2716,30 +2882,34 @@ reduce_outer_joins_pass2(Node *jtnode,
 			}
 			else
 			{
-				/* no use in calculating these */
 				local_nonnullable_rels = NULL;
 				local_forced_null_vars = NIL;
 			}
 
+			/* 递归处理左子树 */
 			if (left_state->contains_outer)
 			{
 				if (jointype == JOIN_INNER || jointype == JOIN_SEMI)
 				{
-					/* pass union of local and upper constraints */
+					/* INNER/SEMI: 传递合并后的所有约束 */
 					pass_nonnullable_rels = local_nonnullable_rels;
 					pass_nonnullable_vars = local_nonnullable_vars;
 					pass_forced_null_vars = local_forced_null_vars;
 				}
-				else if (jointype != JOIN_FULL) /* ie, LEFT or ANTI */
+				else if (jointype != JOIN_FULL) /* LEFT/ANTI */
 				{
-					/* can't pass local constraints to non-nullable side */
+					/* 
+					 * LEFT/ANTI: 左子树是保留侧(preserved side)。
+					 * 本层的连接条件(j->quals)不能约束左表(因为即使不满足也会保留行)。
+					 * 但上层的约束(nonnullable_rels)依然有效。
+					 */
 					pass_nonnullable_rels = nonnullable_rels;
 					pass_nonnullable_vars = nonnullable_vars;
 					pass_forced_null_vars = forced_null_vars;
 				}
 				else
 				{
-					/* no constraints pass through JOIN_FULL */
+					/* FULL: 无法传递任何约束 */
 					pass_nonnullable_rels = NULL;
 					pass_nonnullable_vars = NIL;
 					pass_forced_null_vars = NIL;
@@ -2750,18 +2920,24 @@ reduce_outer_joins_pass2(Node *jtnode,
 										 pass_forced_null_vars);
 			}
 
+			/* 递归处理右子树 */
 			if (right_state->contains_outer)
 			{
-				if (jointype != JOIN_FULL)	/* ie, INNER/LEFT/SEMI/ANTI */
+				if (jointype != JOIN_FULL)	/* INNER/LEFT/SEMI/ANTI */
 				{
-					/* pass appropriate constraints, per comment above */
+					/*
+					 * 对于 INNER/SEMI，传递合并后的约束。
+					 * 对于 LEFT/ANTI，右子树是空值生成侧(nullable side)。
+					 * 本层的连接条件(j->quals)对右表是有效的约束(不满足则补 NULL)。
+					 * 所以这里传递的是 local_... (包含了本层约束)。
+					 * 注意: 对于 LEFT/ANTI，local_... 并没有包含上层约束(见上方 if 逻辑)。
+					 */
 					pass_nonnullable_rels = local_nonnullable_rels;
 					pass_nonnullable_vars = local_nonnullable_vars;
 					pass_forced_null_vars = local_forced_null_vars;
 				}
 				else
 				{
-					/* no constraints pass through JOIN_FULL */
 					pass_nonnullable_rels = NULL;
 					pass_nonnullable_vars = NIL;
 					pass_forced_null_vars = NIL;

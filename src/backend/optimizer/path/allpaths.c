@@ -351,6 +351,8 @@ set_base_rel_sizes(PlannerInfo *root)
  *
  * 这个函数是PostgreSQL查询优化器路径生成阶段的起点，负责初始化所有基表
  * 的访问路径。优化器后续会基于这些路径进行连接路径的构建和选择。
+ *
+ * 遍历查询中涉及的所有“基表”（Base Relations），并为每一个基表生成所有可能的访问路径（Access Paths）。
  */
 static void
 set_base_rel_pathlists(PlannerInfo *root) /* 规划器全局信息结构，包含查询的所有优化信息 */
@@ -367,14 +369,26 @@ set_base_rel_pathlists(PlannerInfo *root) /* 规划器全局信息结构，包�
         /* 获取当前索引对应的关系优化信息结构体 */
         RelOptInfo *rel = root->simple_rel_array[rti];
 
-        /* 可能有对应非基表 RTE 的空槽，跳过 */
+        /*
+         * 可能有对应非基表 RTE 的空槽，跳过。
+         * 例如：SELECT * FROM t1 JOIN t2 ON t1.id = t2.id;
+         * 解析器会生成3个RTE：t1(RTI 1), t2(RTI 2), JOIN(RTI 3)。
+         * 其中RTI 3是RTE_JOIN类型，不是基表，在simple_rel_array中对应位置为NULL。
+         */
         if (rel == NULL)
             continue;
 
         /* 数组一致性断言：确保关系ID与数组索引一致 */
         Assert(rel->relid == rti);
 
-        /* 忽略被标记为 "other rels" 的 RTE，只处理基表 */
+        /*
+         * 忽略被标记为 "other rels" 的 RTE，只处理基表。
+         * 这种情况主要出现在继承或分区表中。
+         * 例如：SELECT * FROM parent_tb; (child_tb INHERITS parent_tb)
+         * RTI 1 (parent_tb) 是 RELOPT_BASEREL，会被处理。
+         * RTI 2 (child_tb) 是 RELOPT_OTHER_MEMBER_REL，会被跳过。
+         * 子表的路径生成由父表在处理 Append 路径时触发，不在此处独立进行。
+         */
         if (rel->reloptkind != RELOPT_BASEREL)
             continue;
 

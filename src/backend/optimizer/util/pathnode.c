@@ -2772,6 +2772,11 @@ apply_projection_to_path(PlannerInfo *root,
     /*
      * 如果给定路径不支持投影功能，我们可能需要创建一个Result节点，
      * 因此调用create_projection_path创建单独的ProjectionPath
+     *
+     * [场景 2：必须包装]
+     * 例子：SELECT a + b FROM (SELECT * FROM t ORDER BY a) s;
+     * 如果子查询使用 Sort 路径，通常无法执行计算（a+b）。
+     * 我们必须用 Result 节点（ProjectionPath）包装它来处理计算。
      */
     if (!is_projection_capable_path(path))
         return (Path *) create_projection_path(root, rel, path, target);
@@ -2779,6 +2784,11 @@ apply_projection_to_path(PlannerInfo *root,
     /*
      * 如果路径支持投影功能，我们可以直接将所需的目标列表替换到现有路径中，
      * 同时确保适当地更新其成本估算
+     *
+     * [场景 1：原地修改]
+     * 例子：SELECT a + 100 FROM t_large_table;
+     * 如果使用 Seq Scan，它可以在扫描时计算 a+100。
+     * 我们直接更新目标列表并调整成本（计算的 CPU 成本）。
      */
     oldcost = path->pathtarget->cost;  // 保存原成本信息
     path->pathtarget = target;         // 替换目标投影
@@ -2792,7 +2802,31 @@ apply_projection_to_path(PlannerInfo *root,
     /*
      * 如果路径是Gather或GatherMerge类型，我们希望安排其子路径返回所需的目标列表，
      * 以便工作进程可以协助执行投影操作。但前提是目标表达式中的所有内容都必须是并行安全的。
-     */
+     *
+     * [场景 3：并行查询下推]
+     * 核心思想：将计算任务（投影）下推到 Worker 进程，减轻 Leader 负担。
+     *
+     * 例子：SELECT md5(log_content) FROM t_logs; (CPU 密集型)
+     *
+     * 1. 优化前（无下推）：
+     *    Worker 只负责扫描并发送原始 log_content 给 Leader。
+     *    Leader 独自计算 1亿次 md5()，成为单点瓶颈。
+	 *    IPC 开销大（传输长字符串）。
+	 *
+	 * Result (计算 md5)  <-- 只有 Leader 在干活，累死
+	 *  -> Gather
+	 *     -> Parallel Seq Scan (只扫描，不计算)
+	 *
+     * 2. 优化后（有下推）：
+     *    代码检测到 GatherPath 且 md5() 是并行安全的。
+     *    将 Result 节点（计算 md5）下推到 subpath (Worker 执行路径)。
+     *    Worker 扫描后立即计算 md5，发送短字符串给 Leader。
+	 *    Leader 只负责收集，CPU 负载均衡，性能大幅提升。
+	 *
+	 * Gather (只负责收集)
+	 *  -> Result (计算 md5)  <-- Worker 在干活，人多力量大
+	 *     -> Parallel Seq Scan
+	 */
     if ((IsA(path, GatherPath) || IsA(path, GatherMergePath)) &&
         is_parallel_safe(root, (Node *) target->exprs))
     {

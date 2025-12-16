@@ -3286,8 +3286,10 @@ restore_stack_base(pg_stack_base_t base)
 void
 check_stack_depth(void)
 {
+	/* 调用底层函数检查是否越界 */
 	if (stack_is_too_deep())
 	{
+		/* 如果越界，使用 ereport 抛出异常，中断当前事务，而不是让进程崩溃 */
 		ereport(ERROR,
 				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
 				 errmsg("stack depth limit exceeded"),

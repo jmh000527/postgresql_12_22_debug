@@ -1807,9 +1807,24 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 	FinalPathExtraData extra;
 	ListCell   *lc;
 
-	/* 如果存在 LIMIT/OFFSET, 调整调用者提供的 tuple_fraction */
+	/*
+	 * 处理查询中的 LIMIT 和 OFFSET 子句，
+	 * 并据此调整优化器的“元组获取比例”（tuple_fraction），以便生成更优的执行计划。
+	 * 如果存在 LIMIT/OFFSET, 调整调用者提供的 tuple_fraction
+	 *
+	 * tuple_fraction 是一个 0 到 1 之间的浮点数，表示用户期望获取结果集中多少比例的数据。
+	 * -- 0.0 表示需要所有数据（例如 SELECT * FROM table）。
+	 * -- > 0.0 表示只需要部分数据（例如游标或 LIMIT）。
+	 * 逻辑：如果查询包含 LIMIT 或 OFFSET，优化器需要知道这一点，因为这会极大地影响计划的选择。
+	 * 例如，如果只需要前 10 行，优化器可能会选择索引扫描而不是全表扫描。
+	 */
 	if (parse->limitCount || parse->limitOffset)
 	{
+		/*
+		 * 估算 LIMIT 和 OFFSET 的具体数值（如果它们是常量表达式），并计算出一个新的 tuple_fraction。
+		 * offset_est：估算的跳过行数。
+		 * count_est：估算的返回行数。
+		 */
 		tuple_fraction = preprocess_limit(root, tuple_fraction,
 										  &offset_est, &count_est);
 
@@ -1827,14 +1842,17 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 	if (parse->setOperations)
 	{
 		/*
-		 * 如果存在顶层 ORDER BY，则假定必须获取所有元组。
-		 * 虽然下面有很多为避免排序而做的特殊处理，但在此处作此简化。
-		 * tuple_fraction = 0 表示我们预计检索所有元组。
+		 * 如果查询最外层有 ORDER BY 子句，优化器假设必须获取所有结果行才能完成排序。
+		 * 将 tuple_fraction 设置为 0.0（表示需要 100% 的数据），
+		 * 防止优化器错误地选择只优化前几行返回速度的计划（如使用索引扫描但总成本较高的计划），
+		 * 因为无论如何都需要全量数据来排序。
 		 */
 		if (parse->sortClause)
 			root->tuple_fraction = 0.0;
 
 		/*
+		 * 这是处理集合操作的关键函数。它会递归地规划整个集合操作树（例如 A UNION (B INTERSECT C)）。
+		 * 返回一个 RelOptInfo 对象（current_rel），其中包含了执行该集合操作的各种可能路径（Paths）。
 		 * 为集合操作构造 Paths。结果通常只需一个顶层排序和/或 LIMIT。
 		 * 注意：递归 union 的特殊工作由 plan_set_operations 负责。
 		 */
@@ -1847,7 +1865,11 @@ grouping_planner(PlannerInfo *root, bool inheritance_update,
 		 */
 		Assert(parse->commandType == CMD_SELECT);
 
-		/* 为安全起见，复制 processed_tlist 而不是直接修改 */
+		/*
+		 * postprocess_setop_tlist 会将生成的列表与原始查询的 targetList 进行匹配，
+		 * 确保输出列的名称、排序键信息等与用户查询一致。
+		 * 为安全起见，复制 processed_tlist 而不是直接修改
+		 */
 		root->processed_tlist =
 			postprocess_setop_tlist(copyObject(root->processed_tlist),
 									parse->targetList);
@@ -5814,7 +5836,9 @@ make_sort_input_target(PlannerInfo *root,
 
 /*
  * get_cheapest_fractional_path
- *	  查找在给定关系中检索指定比例元组时最便宜的路径。
+ *	  这个函数会根据 tuple_fraction 来挑选最划算的路径。这在优化 LIMIT 查询或 EXISTS 子查询时非常关键。
+ *	  如果需要所有行，它通常会选总代价（Total Cost）最低的路径。
+ *	  如果只需要前几行，它可能会选启动代价（Startup Cost）较低的路径（例如索引扫描），即使总代价较高。
  *
  * tuple_fraction 的解释方式与 grouping_planner 相同。
  *
@@ -5830,13 +5854,25 @@ get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction)
 	/* If there is no cheapest_total_path, return NULL */
 	if (best_path == NULL)
 		return NULL;
+	
+	/*
+	 * 如果 tuple_fraction <= 0.0（表示需要读取所有行），那么总代价最低的路径确实就是最好的，直接返回。
+	 */
 	if (tuple_fraction <= 0.0)
 		return best_path;
 
-	/* 如果 tuple_fraction 是绝对数量，则转换为比例；无需限制在 0..1 范围 */
+	/*
+	 * 如果 tuple_fraction 是绝对数量，则转换为比例；无需限制在 0..1 范围
+	 * tuple_fraction 可以是比例（0.0 - 1.0），也可以是具体的行数（>= 1.0）。
+	 * 如果是行数（例如 LIMIT 10），这里把它转换为比例（10 / 总行数），方便后续统一计算。
+	 */
 	if (tuple_fraction >= 1.0 && best_path->rows > 0)
 		tuple_fraction /= best_path->rows;
-
+	
+	/*
+	 * 遍历 rel 的所有路径，找出在给定 tuple_fraction 下成本最低的路径。
+	 * compare_fractional_path_costs() 会根据 tuple_fraction 计算每条路径的实际成本。
+	 */
 	foreach(l, rel->pathlist)
 	{
 		Path	   *path = (Path *) lfirst(l);

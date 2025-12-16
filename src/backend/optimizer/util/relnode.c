@@ -84,8 +84,10 @@ setup_simple_rel_arrays(PlannerInfo *root)
 
     /* 
      * 数组使用RT索引访问（1..N）
-     * 设置数组大小为range table长度+1，+1是因为RT索引从1开始计数而不是从0开始
-     */
+	 * 设置数组大小为range table长度+1，+1是因为RT索引从1开始计数而不是从0开始
+	 * root->parse->rtable: 这是解析树中的“范围表”（Range Table）。
+	 * 它是一个链表，包含了查询中引用的所有表、子查询、函数等。
+	 */
     root->simple_rel_array_size = list_length(root->parse->rtable) + 1;
 
     /* 
@@ -128,6 +130,36 @@ setup_simple_rel_arrays(PlannerInfo *root)
  *    填充append_rel_array数组，以允许通过子关系ID直接查找AppendRelInfo结构。
  *
  * 如果没有AppendRelInfo结构，数组将保持未分配状态。
+ * 它将一个链表（append_rel_list）转换成一个数组（append_rel_array），
+ * 以便可以通过子表的 ID（child_relid）直接 O(1) 找到对应的父子映射信息（AppendRelInfo）。
+ *
+ * 在 PostgreSQL 优化器中，
+ * 继承表（分区表） 和 被展平的 UNION ALL 在内部都被统一视为 “追加关系”（Append Relation）。
+ *
+ * 例如：
+ * SELECT * FROM
+ *		(SELECT a FROM t1
+ * 		UNION ALL
+ * 		SELECT b FROM t2) AS sub;
+ *
+ * 解析器会生成一个范围表（Range Table, rtable），大概长这样：
+ *  - RTE 1: sub (子查询，逻辑上的“父表”)
+ *  - RTE 2: t1 (UNION 的第一个分支)
+ *  - RTE 3: t2 (UNION 的第二个分支)
+ * 2. 优化阶段（展平）：
+ * 优化器发现这是一个简单的 UNION ALL，于是决定将其展平。它会创建 AppendRelInfo 节点来记录映射关系：
+ *  - 映射 1: 父表 sub (ID=1) <--- 子表 t1 (ID=2)。列 a 映射到 sub 的输出列。
+ *  - 映射 2: 父表 sub (ID=1) <--- 子表 t2 (ID=3)。列 b 映射到 sub 的输出列。
+ * 这两个映射节点会被放入 root->append_rel_list 链表中。
+ * 
+ * 3. setup_append_rel_array 的工作：
+ * 这个函数会将上述链表转换为数组 root->append_rel_array：
+ *  - Index 1 (sub): NULL (因为它不是别人的子表，它是父表)。
+ *  - Index 2 (t1): 指向 映射 1 的指针。
+ *  - Index 3 (t2): 指向 映射 2 的指针。
+ * 为什么要这么做？
+ * 当优化器后续处理 t1 (RTE 2) 时，它需要知道：“我生成的列 a 最终要对应到父查询的哪一列？”
+ * 它只需要查 root->append_rel_array[2]，就能立刻找到映射信息，而不需要去遍历整个 UNION ALL 结构。
  */
 void
 setup_append_rel_array(PlannerInfo *root)
@@ -221,20 +253,20 @@ expand_planner_arrays(PlannerInfo *root, int add_size)
 
 /*
  * build_simple_rel
- *	  Construct a new RelOptInfo for a base relation or 'other' relation.
+ *	  为基本关系或“其他”关系构造一个新的 RelOptInfo。
  */
 RelOptInfo *
-build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
+build_simple_rel(PlannerInfo* root, int relid, RelOptInfo* parent)
 {
-	RelOptInfo *rel;
-	RangeTblEntry *rte;
+	RelOptInfo* rel;
+	RangeTblEntry* rte;
 
-	/* Rel should not exist already */
+	/* 关系不应已存在 */
 	Assert(relid > 0 && relid < root->simple_rel_array_size);
 	if (root->simple_rel_array[relid] != NULL)
 		elog(ERROR, "rel %d already exists", relid);
 
-	/* Fetch RTE for relation */
+	/* 获取关系的 RTE */
 	rte = root->simple_rte_array[relid];
 	Assert(rte != NULL);
 
@@ -242,10 +274,10 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->reloptkind = parent ? RELOPT_OTHER_MEMBER_REL : RELOPT_BASEREL;
 	rel->relids = bms_make_singleton(relid);
 	rel->rows = 0;
-	/* cheap startup cost is interesting iff not all tuples to be retrieved */
+	/* 仅当不需要检索所有元组时，廉价的启动成本才有趣 */
 	rel->consider_startup = (root->tuple_fraction > 0);
-	rel->consider_param_startup = false;	/* might get changed later */
-	rel->consider_parallel = false; /* might get changed later */
+	rel->consider_param_startup = false;	/* 稍后可能会更改 */
+	rel->consider_parallel = false; /* 稍后可能会更改 */
 	rel->reltarget = create_empty_pathtarget();
 	rel->pathlist = NIL;
 	rel->ppilist = NIL;
@@ -256,7 +288,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->cheapest_parameterized_paths = NIL;
 	rel->relid = relid;
 	rel->rtekind = rte->rtekind;
-	/* min_attr, max_attr, attr_needed, attr_widths are set below */
+	/* min_attr, max_attr, attr_needed, attr_widths 在下面设置 */
 	rel->lateral_vars = NIL;
 	rel->indexlist = NIL;
 	rel->statlist = NIL;
@@ -265,7 +297,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->allvisfrac = 0;
 	rel->subroot = NULL;
 	rel->subplan_params = NIL;
-	rel->rel_parallel_workers = -1; /* set up in get_relation_info */
+	rel->rel_parallel_workers = -1; /* 在 get_relation_info 中设置 */
 	rel->serverid = InvalidOid;
 	rel->userid = rte->checkAsUser;
 	rel->useridiscurrent = false;
@@ -279,7 +311,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->baserestrict_min_security = UINT_MAX;
 	rel->joininfo = NIL;
 	rel->has_eclass_joins = false;
-	rel->consider_partitionwise_join = false;	/* might get changed later */
+	rel->consider_partitionwise_join = false;	/* 稍后可能会更改 */
 	rel->part_scheme = NULL;
 	rel->nparts = 0;
 	rel->boundinfo = NULL;
@@ -290,13 +322,11 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->partitioned_child_rels = NIL;
 
 	/*
-	 * Pass assorted information down the inheritance hierarchy.
+	 * 将各种信息向下传递到继承层次结构。
 	 */
-	if (parent)
-	{
+	if (parent) {
 		/*
-		 * Each direct or indirect child wants to know the relids of its
-		 * topmost parent.
+		 * 每个直接或间接子级都想知道其最顶层父级的 relids。
 		 */
 		if (parent->top_parent_relids)
 			rel->top_parent_relids = parent->top_parent_relids;
@@ -304,93 +334,85 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 			rel->top_parent_relids = bms_copy(parent->relids);
 
 		/*
-		 * Also propagate lateral-reference information from appendrel parent
-		 * rels to their child rels.  We intentionally give each child rel the
-		 * same minimum parameterization, even though it's quite possible that
-		 * some don't reference all the lateral rels.  This is because any
-		 * append path for the parent will have to have the same
-		 * parameterization for every child anyway, and there's no value in
-		 * forcing extra reparameterize_path() calls.  Similarly, a lateral
-		 * reference to the parent prevents use of otherwise-movable join rels
-		 * for each child.
+		 * 还要将横向引用信息从 appendrel 父级关系传播到其子级关系。
+		 * 我们有意为每个子级关系提供相同的最小参数化，即使某些子级可能
+		 * 不引用所有横向关系也是如此。这是因为父级的任何追加路径无论如何
+		 * 都必须对每个子级具有相同的参数化，并且强制额外的 reparameterize_path()
+		 * 调用没有任何价值。同样，对父级的横向引用会阻止对每个子级使用
+		 * 否则可移动的连接关系。
 		 *
-		 * It's possible for child rels to have their own children, in which
-		 * case the topmost parent's lateral info propagates all the way down.
+		 * 子级关系可能有自己的子级，在这种情况下，最顶层父级的横向信息
+		 * 会一直向下传播。
 		 */
 		rel->direct_lateral_relids = parent->direct_lateral_relids;
 		rel->lateral_relids = parent->lateral_relids;
 		rel->lateral_referencers = parent->lateral_referencers;
 	}
-	else
-	{
+	else {
 		rel->top_parent_relids = NULL;
 		rel->direct_lateral_relids = NULL;
 		rel->lateral_relids = NULL;
 		rel->lateral_referencers = NULL;
 	}
 
-	/* Check type of rtable entry */
-	switch (rte->rtekind)
-	{
-		case RTE_RELATION:
-			/* Table --- retrieve statistics from the system catalogs */
-			get_relation_info(root, rte->relid, rte->inh, rel);
-			break;
-		case RTE_SUBQUERY:
-		case RTE_FUNCTION:
-		case RTE_TABLEFUNC:
-		case RTE_VALUES:
-		case RTE_CTE:
-		case RTE_NAMEDTUPLESTORE:
+	/* 检查 rtable 条目的类型 */
+	switch (rte->rtekind) {
+	case RTE_RELATION:
+		/* 表 --- 从系统目录检索统计信息 */
+		get_relation_info(root, rte->relid, rte->inh, rel);
+		break;
+	case RTE_SUBQUERY:
+	case RTE_FUNCTION:
+	case RTE_TABLEFUNC:
+	case RTE_VALUES:
+	case RTE_CTE:
+	case RTE_NAMEDTUPLESTORE:
 
-			/*
-			 * Subquery, function, tablefunc, values list, CTE, or ENR --- set
-			 * up attr range and arrays
-			 *
-			 * Note: 0 is included in range to support whole-row Vars
-			 */
-			rel->min_attr = 0;
-			rel->max_attr = list_length(rte->eref->colnames);
-			rel->attr_needed = (Relids *)
-				palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(Relids));
-			rel->attr_widths = (int32 *)
-				palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(int32));
-			break;
-		case RTE_RESULT:
-			/* RTE_RESULT has no columns, nor could it have whole-row Var */
-			rel->min_attr = 0;
-			rel->max_attr = -1;
-			rel->attr_needed = NULL;
-			rel->attr_widths = NULL;
-			break;
-		default:
-			elog(ERROR, "unrecognized RTE kind: %d",
-				 (int) rte->rtekind);
-			break;
+		/*
+		 * 子查询、函数、tablefunc、值列表、CTE 或 ENR --- 设置
+		 * 属性范围和数组
+		 *
+		 * 注意：0 包含在范围内以支持整行 Vars
+		 */
+		rel->min_attr = 0;
+		rel->max_attr = list_length(rte->eref->colnames);
+		rel->attr_needed = (Relids*)
+			palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(Relids));
+		rel->attr_widths = (int32*)
+			palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(int32));
+		break;
+	case RTE_RESULT:
+		/* RTE_RESULT 没有列，也不可能有整行 Var */
+		rel->min_attr = 0;
+		rel->max_attr = -1;
+		rel->attr_needed = NULL;
+		rel->attr_widths = NULL;
+		break;
+	default:
+		elog(ERROR, "unrecognized RTE kind: %d",
+			(int)rte->rtekind);
+		break;
 	}
 
 	/*
-	 * Copy the parent's quals to the child, with appropriate substitution of
-	 * variables.  If any constant false or NULL clauses turn up, we can mark
-	 * the child as dummy right away.  (We must do this immediately so that
-	 * pruning works correctly when recursing in expand_partitioned_rtentry.)
+	 * 将父级的 quals 复制到子级，并适当替换变量。
+	 * 如果出现任何常量 false 或 NULL 子句，我们可以立即将子级标记为 dummy。
+	 * （我们必须立即这样做，以便在 expand_partitioned_rtentry 中递归时修剪正常工作。）
 	 */
-	if (parent)
-	{
-		AppendRelInfo *appinfo = root->append_rel_array[relid];
+	if (parent) {
+		AppendRelInfo* appinfo = root->append_rel_array[relid];
 
 		Assert(appinfo != NULL);
-		if (!apply_child_basequals(root, parent, rel, rte, appinfo))
-		{
+		if (!apply_child_basequals(root, parent, rel, rte, appinfo)) {
 			/*
-			 * Some restriction clause reduced to constant FALSE or NULL after
-			 * substitution, so this child need not be scanned.
+			 * 某些限制子句在替换后简化为常量 FALSE 或 NULL，
+			 * 因此无需扫描此子级。
 			 */
 			mark_dummy_rel(rel);
 		}
 	}
 
-	/* Save the finished struct in the query's simple_rel_array */
+	/* 将完成的结构保存在查询的 simple_rel_array 中 */
 	root->simple_rel_array[relid] = rel;
 
 	return rel;

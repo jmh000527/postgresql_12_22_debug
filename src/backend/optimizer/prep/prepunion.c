@@ -128,6 +128,28 @@ plan_set_operations(PlannerInfo *root)
 	Assert(parse->distinctClause == NIL);           /* 确保没有DISTINCT子句 */
 
 	/*
+	 * Find the leftmost component query.  We need to use its column names
+	 * for all the targetlists (else SELECT INTO won't work right).
+	 *
+	 * We do this before setup_simple_rel_arrays so that we can propagate
+	 * hints before any planning happens.
+	 */
+	node = topop->larg;                             /* 从顶层集合操作的左侧开始 */
+	while (node && IsA(node, SetOperationStmt))     /* 如果当前节点仍然是集合操作，则继续向左遍历 */
+		node = ((SetOperationStmt *) node)->larg;
+	Assert(node && IsA(node, RangeTblRef));         /* 断言找到的节点是RangeTblRef类型 */
+
+	leftmostRTE = rt_fetch(((RangeTblRef*)node)->rtindex, parse->rtable); /* 获取最左侧RTE */
+	leftmostQuery = leftmostRTE->subquery;          /* 获取最左侧子查询 */
+	Assert(leftmostQuery != NULL);                  /* 断言子查询存在 */
+
+	/*
+	 * Propagate hint from leftmost query to all other queries.
+	 */
+	if (leftmostQuery->hint)
+		propagate_hint_to_queries(root, (Node *) topop, leftmostQuery->hint);
+
+	/*
 	 * 为每个叶级子查询（它们是此查询中的RTE_SUBQUERY类型的范围表条目）
 	 * 构建RelOptInfos结构。为此，我们需要准备索引数组。
 	 */
@@ -137,18 +159,6 @@ plan_set_operations(PlannerInfo *root)
 	 * 填充append_rel_array数组，存储每个AppendRelInfo，以便通过子关系ID直接查找
 	 */
 	setup_append_rel_array(root);
-
-	/*
-	 * 找到最左侧的组件查询。我们需要使用它的列名来生成所有目标列表
-	 * （否则SELECT INTO操作将无法正常工作）。
-	 */
-	node = topop->larg;                             /* 从顶层集合操作的左侧开始 */
-	while (node && IsA(node, SetOperationStmt))     /* 如果当前节点仍然是集合操作，则继续向左遍历 */
-		node = ((SetOperationStmt *) node)->larg;
-	Assert(node && IsA(node, RangeTblRef));         /* 断言找到的节点是RangeTblRef类型 */
-	leftmostRTE = root->simple_rte_array[((RangeTblRef *) node)->rtindex]; /* 获取最左侧RTE */
-	leftmostQuery = leftmostRTE->subquery;          /* 获取最左侧子查询 */
-	Assert(leftmostQuery != NULL);                  /* 断言子查询存在 */
 
 	/*
 	 * 如果顶层节点是递归UNION，需要特殊处理
@@ -234,7 +244,7 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		/* 确保当前查询级别中plan_params未被使用 */
 		Assert(root->plan_params == NIL);
 
-		/* 为子查询生成子根节点和执行路径 */
+		/* 为子查询调用优化器，生成该子查询的执行计划 */
 		subroot = rel->subroot = subquery_planner(root->glob, subquery,
 						  root,
 						  false,
@@ -243,11 +253,29 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		/*
 		 * 检查子查询是否有对集合操作树中其他原始查询的跨引用
 		 * 这应该是不可能的，如果存在则报错
+		 *
+		 * 在 PostgreSQL 优化器中，plan_params 列表用于收集当前查询层级中引用的外部参数（Outer References）。
+		 * 例如：SELECT * FROM t1 WHERE t1.id = (SELECT t2.id FROM t2 WHERE t2.x = t1.x);
+		 * 在这个例子中，子查询引用了外部查询的 t1.x，这会导致 plan_params 非空。
+		 * 但是，在集合操作的子查询中，不允许这种跨引用，因为集合操作的语义要求各个子查询独立。
 		 */
 		if (root->plan_params)
 			elog(ERROR, "unexpected outer reference in set operation subquery");
 
-		/* 为子查询确定适当的目标列表 */
+		/*
+		 * 标准化子查询的输出列，使其符合集合操作的要求
+		 * 为子查询确定适当的目标列表
+		 *
+		 * 输入参数:
+		 * colTypes, colCollations: 集合操作要求的列类型和排序规则（由最左侧查询决定）。
+		 * subroot->processed_tlist: 当前子查询原本计划输出的列。
+		 *
+		 * 功能:
+		 * 类型转换: 如果子查询输出 int，但集合操作要求 bigint，这里会插入一个类型转换表达式。
+		 * 列对齐: 确保第 N 列对应第 N 列。
+		 * 添加标识列: 如果 flag 参数有效（通常用于 INTERSECT/EXCEPT），它会添加一个隐藏的“标识列”（flag column），
+		 * 用于在执行阶段区分这一行数据来自哪个分支（左边还是右边）。
+		 */
 		tlist = generate_setop_tlist(colTypes, colCollations,
 						 flag,
 						 rtr->rtindex,
@@ -267,11 +295,14 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 
 		/*
 		 * 由于可能需要为该关系添加部分路径，必须正确设置consider_parallel标志
+		 * 将子查询的并行执行能力“传递”给上层的集合操作节点。
+		 * 这是为了支持 并行集合操作，比如 Parallel Append。
 		 */
 		final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
 		rel->consider_parallel = final_rel->consider_parallel;
 
 		/*
+		 * 从子查询中选择一条“最优”路径，作为集合操作（如 UNION）的一个输入分支。
 		 * 暂时只为子查询考虑单个路径
 		 * 这部分未来可能会更改（使其更像set_subquery_pathlist）
 		 */
@@ -283,7 +314,14 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		 *
 		 * 由于子查询的输出排序在集合操作结果中不会被保留，
 		 * 所以简单地将SubqueryScanPath标记为nil pathkeys
+		 * 通常集合操作（如 UNION）会打乱顺序，或者上层并不关心子查询的原始顺序。
 		 * （XXX这部分将来也可能更改）
+		 *
+		 * Append  (对应 UNION ALL)
+  		 *   ->  Subquery Scan on "*SELECT* 1"  <-- 这就是 create_subqueryscan_path 创建的节点
+		 *   		->  Seq Scan on t_users_a   <-- 这就是 subpath
+  		 *   ->  Subquery Scan on "*SELECT* 2"
+		 *         ->  Seq Scan on t_users_b    <-- 这就是 subpath
 		 */
 		path = (Path *) create_subqueryscan_path(root, rel, subpath,
 						 NIL, NULL);
@@ -291,8 +329,14 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		add_path(rel, path);
 
 		/*
+		 * 为集合操作（如 UNION）构建并行的子查询扫描路径。
 		 * 如果子关系有部分路径，可以用它来构建该关系的部分路径
 		 * 但只考虑最便宜的路径
+		 *
+		 * 条件：
+		 * - rel->consider_parallel：当前关系（集合操作节点）被标记为“可以考虑并行”
+		 * - bms_is_empty(rel->lateral_relids)：当前关系没有LATERAL 依赖
+		 * - final_rel->partial_pathlist != NIL：子查询的最终关系有部分路径
 		 */
 		if (rel->consider_parallel && bms_is_empty(rel->lateral_relids) &&
 			final_rel->partial_pathlist != NIL)
@@ -330,7 +374,25 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 	{
 		SetOperationStmt *op = (SetOperationStmt *) setOp;
 
-		/* UNION与INTERSECT/EXCEPT的处理方式有很大不同 */
+		/*
+		 * UNION与INTERSECT/EXCEPT的处理方式有很大不同
+		 * 例如：
+		 * -- 简单的 UNION 操作
+		 * 	SELECT user_id, username FROM active_users
+		 * 	UNION
+		 * 	SELECT user_id, username FROM archived_users;
+		 * 优化器会调用 generate_union_paths。
+		 * 通常这会生成一个 Append 路径（如果是 UNION ALL）或者 Append 后跟 Unique / Aggregate 路径（如果是 UNION 去重）。
+		 *
+		 * 当 SQL 中使用 INTERSECT (交集) 或 EXCEPT (差集) 时，会进入 else 分支。
+		 * 例如：
+		 * -- EXCEPT 操作（找出在 active_users 但不在 vip_users 中的人）
+		 * 	SELECT user_id FROM active_users
+		 * 	EXCEPT
+		 * 	SELECT user_id FROM vip_users;
+		 * 优化器会调用 generate_nonunion_paths。
+		 * 这通常比 UNION 复杂，可能需要对两个数据集进行排序（Sort）然后合并，或者使用哈希（Hash）算法来计算差集或交集。
+		 */
 		if (op->op == SETOP_UNION)
 			rel = generate_union_paths(op, root,
 						   refnames_tlist,
@@ -344,6 +406,17 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 
 		/*
 		 * 如有必要，添加Result节点来投影调用者请求的输出列
+		 * 用于处理类型不匹配或需要类型转换的情况。
+		 * 例如：
+		 * CREATE TABLE t_int (a int);
+		 * CREATE TABLE t_float (b float);
+		 *
+		 * -- int 和 float 进行 UNION，结果类型会统一为 float
+		 * SELECT a FROM t_int
+		 * UNION
+		 * SELECT b FROM t_float;
+		 *
+		 * 
 		 */
 		if (flag >= 0 ||
 			!tlist_same_datatypes(*pTargetList, colTypes, junkOK) ||
@@ -352,7 +425,11 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 			PathTarget *target;
 			ListCell   *lc;
 
-			/* 生成新的目标列表，使用varno 0 */
+			/*
+			 * 生成新的目标列表，使用varno 0
+			 * 当发现子路径输出的数据类型、排序规则与上层要求不一致时，
+			 * 需要准备一个“模具”（即 TargetList），用来生成一个 Result 节点（投影节点）进行格式转换。
+			 */
 			*pTargetList = generate_setop_tlist(colTypes, colCollations,
 						 flag,
 						 0,
@@ -361,7 +438,10 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 						 refnames_tlist);
 			target = create_pathtarget(root, *pTargetList);
 
-			/* 对每个路径应用投影 */
+			/*
+			 * 对每个路径应用投影
+			 * 于是执行 apply_projection_to_path，在路径上方添加一个 Result 节点，负责将 int 转换为 float 类型
+			 */
 			foreach(lc, rel->pathlist)
 			{
 				Path	   *subpath = (Path *) lfirst(lc);
@@ -375,7 +455,16 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 					lfirst(lc) = path;
 			}
 
-			/* 对每个部分路径应用投影 */
+			/*
+			 * 对每个部分路径应用投影
+			 * Gather  (收集节点)
+  			 * Output: bigint  <-- 主进程接收到的是 bigint
+  			 * Workers Planned: 2
+  			 * ->  Result  (投影节点，对应 create_projection_path)
+			 * 		 Output: bigint  <-- 在这里将 int 转为 bigint
+			 * 		 ->  Parallel Seq Scan on t_huge_int
+			 * 		 	  Output: int  <-- 原始扫描输出 int
+			 */
 			foreach(lc, rel->partial_pathlist)
 			{
 				Path	   *subpath = (Path *) lfirst(lc);
@@ -1216,15 +1305,21 @@ choose_hashed_setop(PlannerInfo *root, List *groupClauses,
 
 
 /*
- * Generate targetlist for a set-operation plan node
+ * generate_setop_tlist
+ * 	为集合操作（UNION/INTERSECT/EXCEPT）的某个分支生成标准化的输出列表（TargetList）。
+ *	因为集合操作要求所有分支的列数相同、对应列的数据类型兼容，所以必须对每个分支的原始输出进行“整形”。
  *
- * colTypes: OID list of set-op's result column datatypes
- * colCollations: OID list of set-op's result column collations
- * flag: -1 if no flag column needed, 0 or 1 to create a const flag column
- * varno: varno to use in generated Vars
- * hack_constants: true to copy up constants (see comments in code)
- * input_tlist: targetlist of this node's input node
- * refnames_tlist: targetlist to take column names from
+ * 参数说明：
+ * - colTypes: 集合操作结果列的数据类型 OID 列表
+ * - colCollations: 集合操作结果列的排序规则 OID 列表
+ * - flag: 如果为 -1 表示不需要标志列，0 或 1 时生成常量标志列
+ * - varno: 生成 Var 时使用的 varno
+ * - hack_constants: 若为 true，则直接上移常量（见代码注释）
+ * - input_tlist: 本节点输入的目标列表
+ * - refnames_tlist: 用于获取列名的目标列表
+ *
+ * 返回值：
+ *   返回生成的目标列表（List 结构）
  */
 static List *
 generate_setop_tlist(List *colTypes, List *colCollations,
@@ -1234,8 +1329,8 @@ generate_setop_tlist(List *colTypes, List *colCollations,
 					 List *input_tlist,
 					 List *refnames_tlist)
 {
-	List	   *tlist = NIL;
-	int			resno = 1;
+	List	   *tlist = NIL;	/* 最终目标列表 */
+	int			resno = 1;		/* 当前列序号 */
 	ListCell   *ctlc,
 			   *cclc,
 			   *itlc,
@@ -1243,6 +1338,15 @@ generate_setop_tlist(List *colTypes, List *colCollations,
 	TargetEntry *tle;
 	Node	   *expr;
 
+	/*
+	 * 遍历每一列，生成对应的目标列表条目
+	 *
+	 * 这是一个四路并行遍历宏。它同时遍历：
+	 * colTypes: 集合操作最终决定的列类型列表（标准）。
+	 * colCollations: 集合操作最终决定的排序规则列表（标准）。
+	 * input_tlist: 当前分支子查询的原始输出列表（输入）。
+	 * refnames_tlist: 用于提供列名的参考列表（通常来自最左侧查询）。
+	 */
 	forfour(ctlc, colTypes, cclc, colCollations,
 			itlc, input_tlist, rtlc, refnames_tlist)
 	{
@@ -1257,79 +1361,77 @@ generate_setop_tlist(List *colTypes, List *colCollations,
 		Assert(!reftle->resjunk);
 
 		/*
-		 * Generate columns referencing input columns and having appropriate
-		 * data types and column names.  Insert datatype coercions where
-		 * necessary.
+		 * 生成引用输入列的表达式，并保证数据类型和列名正确。
+		 * 如有必要，插入类型转换。
 		 *
-		 * HACK: constants in the input's targetlist are copied up as-is
-		 * rather than being referenced as subquery outputs.  This is mainly
-		 * to ensure that when we try to coerce them to the output column's
-		 * datatype, the right things happen for UNKNOWN constants.  But do
-		 * this only at the first level of subquery-scan plans; we don't want
-		 * phony constants appearing in the output tlists of upper-level
-		 * nodes!
+		 * HACK: 如果输入目标列表中的表达式是常量且 hack_constants 为真，
+		 * 则直接复制常量上来，而不是引用子查询输出。
+		 * 这样做主要是为了处理 UNKNOWN 类型常量的类型转换。
+		 * 但仅在最底层的 subquery-scan 计划中这样做，避免上层出现伪常量。
 		 */
 		if (hack_constants && inputtle->expr && IsA(inputtle->expr, Const))
-			expr = (Node *) inputtle->expr;
+			/* 如果子查询输出的是一个常量（比如 SELECT 'a' ...），且允许 hack，则直接把常量拿上来，而不是生成 Var。*/
+			expr = (Node*)inputtle->expr;
 		else
-			expr = (Node *) makeVar(varno,
+			/* 创建一个 Var 节点，引用子查询的第 N 列。*/
+			expr = (Node*)makeVar(varno,
 									inputtle->resno,
 									exprType((Node *) inputtle->expr),
 									exprTypmod((Node *) inputtle->expr),
 									exprCollation((Node *) inputtle->expr),
 									0);
 
+		/*
+		 * 如有必要，进行类型转换
+		 * 当前分支的列类型 (exprType) 是否与集合操作要求的标准类型 (colType) 一致？
+		 * 如果不一致，插入类型转换节点。
+		 * 例如: 分支输出 int，标准要求 bigint。这里会包裹一层转换，变成 CAST(subquery.colN AS bigint)。
+		 */
 		if (exprType(expr) != colType)
 		{
 			/*
-			 * Note: it's not really cool to be applying coerce_to_common_type
-			 * here; one notable point is that assign_expr_collations never
-			 * gets run on any generated nodes.  For the moment that's not a
-			 * problem because we force the correct exposed collation below.
-			 * It would likely be best to make the parser generate the correct
-			 * output tlist for every set-op to begin with, though.
+			 * 注意：这里直接调用 coerce_to_common_type 进行类型转换。
+			 * assign_expr_collations 不会被调用，但我们会在下方强制设置正确的排序规则。
 			 */
-			expr = coerce_to_common_type(NULL,	/* no UNKNOWNs here */
+			expr = coerce_to_common_type(NULL,	/* 这里不会有 UNKNOWN 类型 */
 										 expr,
 										 colType,
 										 "UNION/INTERSECT/EXCEPT");
 		}
 
 		/*
-		 * Ensure the tlist entry's exposed collation matches the set-op. This
-		 * is necessary because plan_set_operations() reports the result
-		 * ordering as a list of SortGroupClauses, which don't carry collation
-		 * themselves but just refer to tlist entries.  If we don't show the
-		 * right collation then planner.c might do the wrong thing in
-		 * higher-level queries.
+		 * 当前表达式的排序规则是否符合要求？
+		 * 由于 plan_set_operations() 只通过 SortGroupClause 传递排序信息，
+		 * 必须保证目标列表中的排序规则正确，否则上层查询可能出错。
+		 * 这里用 RelabelType 而不是 CollateExpr，因为表达式会直接传递到执行器。
 		 *
-		 * Note we use RelabelType, not CollateExpr, since this expression
-		 * will reach the executor without any further processing.
+		 * 如果不符合，使用 RelabelType 强制指定排序规则。
+		 * 这对于字符串比较非常重要（例如区分大小写 vs 不区分大小写）。
 		 */
 		if (exprCollation(expr) != colColl)
 			expr = applyRelabelType(expr,
 									exprType(expr), exprTypmod(expr), colColl,
 									COERCE_IMPLICIT_CAST, -1, false);
 
+		/* 创建一个新的 TargetEntry，包含处理好的表达式。*/
 		tle = makeTargetEntry((Expr *) expr,
 							  (AttrNumber) resno++,
 							  pstrdup(reftle->resname),
 							  false);
 
 		/*
-		 * By convention, all non-resjunk columns in a setop tree have
-		 * ressortgroupref equal to their resno.  In some cases the ref isn't
-		 * needed, but this is a cleaner way than modifying the tlist later.
+		 * 约定：集合操作树中所有非 resjunk 列的 ressortgroupref 等于其 resno。
+		 * 有些情况下不需要该属性，但统一设置更规范。
 		 */
 		tle->ressortgroupref = tle->resno;
 
 		tlist = lappend(tlist, tle);
 	}
 
+	/* 如需要，添加 resjunk 标志列 */
 	if (flag >= 0)
 	{
-		/* Add a resjunk flag column */
-		/* flag value is the given constant */
+		/* 添加一个常量标志列，值为 flag */
 		expr = (Node *) makeConst(INT4OID,
 								  -1,
 								  InvalidOid,

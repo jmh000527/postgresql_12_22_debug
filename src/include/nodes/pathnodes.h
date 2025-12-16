@@ -2047,35 +2047,26 @@ struct SpecialJoinInfo
 /*
  * Append-relation info.
  *
- * When we expand an inheritable table or a UNION-ALL subselect into an
- * "append relation" (essentially, a list of child RTEs), we build an
- * AppendRelInfo for each child RTE.  The list of AppendRelInfos indicates
- * which child RTEs must be included when expanding the parent, and each node
- * carries information needed to translate Vars referencing the parent into
- * Vars referencing that child.
+ * 当我们将一个可继承表或 UNION-ALL 子查询展开为“追加关系”（append relation，
+ * 本质上是一组子 RTE）时，我们会为每个子 RTE 构建一个 AppendRelInfo。
+ * AppendRelInfo 列表指示在展开父级时必须包含哪些子 RTE，并且每个节点都携带
+ * 将引用父级的 Vars 转换为引用该子级的 Vars 所需的信息。
  *
- * These structs are kept in the PlannerInfo node's append_rel_list.
- * Note that we just throw all the structs into one list, and scan the
- * whole list when desiring to expand any one parent.  We could have used
- * a more complex data structure (eg, one list per parent), but this would
- * be harder to update during operations such as pulling up subqueries,
- * and not really any easier to scan.  Considering that typical queries
- * will not have many different append parents, it doesn't seem worthwhile
- * to complicate things.
+ * 这些结构保存在 PlannerInfo 节点的 append_rel_list 中。
+ * 注意，我们将所有结构都放入一个列表中，并在需要展开任何一个父级时扫描整个列表。
+ * 我们本可以使用更复杂的数据结构（例如，每个父级一个列表），但这在执行诸如
+ * 提升子查询之类的操作时会更难更新，而且扫描起来也不见得更容易。
+ * 考虑到典型的查询不会有很多不同的追加父级，让事情变得复杂似乎不值得。
  *
- * Note: after completion of the planner prep phase, any given RTE is an
- * append parent having entries in append_rel_list if and only if its
- * "inh" flag is set.  We clear "inh" for plain tables that turn out not
- * to have inheritance children, and (in an abuse of the original meaning
- * of the flag) we set "inh" for subquery RTEs that turn out to be
- * flattenable UNION ALL queries.  This lets us avoid useless searches
- * of append_rel_list.
+ * 注意：在规划器准备阶段完成后，任何给定的 RTE 只有在其“inh”标志被设置时，
+ * 才是 append_rel_list 中有条目的追加父级。
+ * 对于结果证明没有继承子级的普通表，我们会清除“inh”，而对于结果证明是
+ * 可展平的 UNION ALL 查询的子查询 RTE，我们会设置“inh”（这是对该标志原始含义的滥用）。
+ * 这使我们可以避免对 append_rel_list 进行无用的搜索。
  *
- * Note: the data structure assumes that append-rel members are single
- * baserels.  This is OK for inheritance, but it prevents us from pulling
- * up a UNION ALL member subquery if it contains a join.  While that could
- * be fixed with a more complex data structure, at present there's not much
- * point because no improvement in the plan could result.
+ * 注意：该数据结构假设追加关系成员是单个基本关系（baserels）。
+ * 这对于继承是可以的，但它阻止了我们提升包含连接的 UNION ALL 成员子查询。
+ * 虽然这可以通过更复杂的数据结构来解决，但目前没有太大意义，因为这不会带来计划上的改进。
  */
 
 typedef struct AppendRelInfo
@@ -2083,47 +2074,40 @@ typedef struct AppendRelInfo
 	NodeTag		type;
 
 	/*
-	 * These fields uniquely identify this append relationship.  There can be
-	 * (in fact, always should be) multiple AppendRelInfos for the same
-	 * parent_relid, but never more than one per child_relid, since a given
-	 * RTE cannot be a child of more than one append parent.
+	 * 这些字段唯一标识此追加关系。
+	 * 对于同一个 parent_relid，可以有（实际上总是应该有）多个 AppendRelInfo，
+	 * 但对于每个 child_relid 绝不会超过一个，因为给定的 RTE 不能是多个追加父级的子级。
 	 */
-	Index		parent_relid;	/* RT index of append parent rel */
-	Index		child_relid;	/* RT index of append child rel */
+	Index		parent_relid;	/* 追加父级关系的 RT 索引 */
+	Index		child_relid;	/* 追加子级关系的 RT 索引 */
 
 	/*
-	 * For an inheritance appendrel, the parent and child are both regular
-	 * relations, and we store their rowtype OIDs here for use in translating
-	 * whole-row Vars.  For a UNION-ALL appendrel, the parent and child are
-	 * both subqueries with no named rowtype, and we store InvalidOid here.
+	 * 对于继承追加关系，父级和子级都是普通关系，我们在此存储它们的行类型 OID，
+	 * 以用于转换整行 Vars。对于 UNION-ALL 追加关系，父级和子级都是没有命名行类型的子查询，
+	 * 我们在此存储 InvalidOid。
 	 */
-	Oid			parent_reltype; /* OID of parent's composite type */
-	Oid			child_reltype;	/* OID of child's composite type */
+	Oid			parent_reltype; /* 父级复合类型的 OID */
+	Oid			child_reltype;	/* 子级复合类型的 OID */
 
 	/*
-	 * The N'th element of this list is a Var or expression representing the
-	 * child column corresponding to the N'th column of the parent. This is
-	 * used to translate Vars referencing the parent rel into references to
-	 * the child.  A list element is NULL if it corresponds to a dropped
-	 * column of the parent (this is only possible for inheritance cases, not
-	 * UNION ALL).  The list elements are always simple Vars for inheritance
-	 * cases, but can be arbitrary expressions in UNION ALL cases.
+	 * 此列表的第 N 个元素是表示对应于父级第 N 列的子级列的 Var 或表达式。
+	 * 这用于将引用父级关系的 Vars 转换为对子级的引用。
+	 * 如果列表元素对应于父级的已删除列，则该元素为 NULL（这仅可能发生在继承情况下，
+	 * 而不是 UNION ALL）。对于继承情况，列表元素始终是简单的 Vars，
+	 * 但在 UNION ALL 情况下可以是任意表达式。
 	 *
-	 * Notice we only store entries for user columns (attno > 0).  Whole-row
-	 * Vars are special-cased, and system columns (attno < 0) need no special
-	 * translation since their attnos are the same for all tables.
+	 * 注意，我们只存储用户列（attno > 0）的条目。整行 Vars 是特殊情况，
+	 * 系统列（attno < 0）不需要特殊转换，因为它们的 attnos 对于所有表都是相同的。
 	 *
-	 * Caution: the Vars have varlevelsup = 0.  Be careful to adjust as needed
-	 * when copying into a subquery.
+	 * 注意：Vars 的 varlevelsup = 0。在复制到子查询中时，请务必根据需要进行调整。
 	 */
-	List	   *translated_vars;	/* Expressions in the child's Vars */
+	List	   *translated_vars;	/* 子级 Vars 中的表达式 */
 
 	/*
-	 * We store the parent table's OID here for inheritance, or InvalidOid for
-	 * UNION ALL.  This is only needed to help in generating error messages if
-	 * an attempt is made to reference a dropped parent column.
+	 * 对于继承，我们在此存储父表的 OID，对于 UNION ALL 则存储 InvalidOid。
+	 * 这仅用于在尝试引用已删除的父列时帮助生成错误消息。
 	 */
-	Oid			parent_reloid;	/* OID of parent relation */
+	Oid			parent_reloid;	/* 父关系的 OID */
 } AppendRelInfo;
 
 /*

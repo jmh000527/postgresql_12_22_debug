@@ -1583,34 +1583,31 @@ contain_leaked_vars_walker(Node *node, void *context)
 
 /*
  * find_nonnullable_rels
- *		Determine which base rels are forced nonnullable by given clause.
+ *		确定给定子句强制为非空的基表集合。
  *
- * Returns the set of all Relids that are referenced in the clause in such
- * a way that the clause cannot possibly return TRUE if any of these Relids
- * is an all-NULL row.  (It is OK to err on the side of conservatism; hence
- * the analysis here is simplistic.)
+ * 返回在子句中以某种方式被引用的所有 Relids 的集合，
+ * 这些引用保证如果这些 Relids 中的任意一个为全 NULL 行，
+ * 则该子句不可能返回 TRUE。（可以适当保守，因而这里的分析是简化的。）
  *
- * The semantics here are subtly different from contain_nonstrict_functions:
- * that function is concerned with NULL results from arbitrary expressions,
- * but here we assume that the input is a Boolean expression, and wish to
- * see if NULL inputs will provably cause a FALSE-or-NULL result.  We expect
- * the expression to have been AND/OR flattened and converted to implicit-AND
- * format.
+ * 这里的语义和 contain_nonstrict_functions 有细微差别：
+ * contain_nonstrict_functions 关注任意表达式的 NULL 结果，
+ * 而这里我们假设输入是布尔表达式，并希望判断 NULL 输入是否必然导致 FALSE 或 NULL 结果。
+ * 我们期望表达式已经经过 AND/OR 扁平化并转换为隐式 AND 格式。
  *
- * Note: this function is largely duplicative of find_nonnullable_vars().
- * The reason not to simplify this function into a thin wrapper around
- * find_nonnullable_vars() is that the tested conditions really are different:
- * a clause like "t1.v1 IS NOT NULL OR t1.v2 IS NOT NULL" does not prove
- * that either v1 or v2 can't be NULL, but it does prove that the t1 row
- * as a whole can't be all-NULL.  Also, the behavior for PHVs is different.
+ * 注意：该函数与 find_nonnullable_vars() 很大程度上是重复的。
+ * 之所以不将其简化为 find_nonnullable_vars() 的简单封装，
+ * 是因为两者的判断条件确实不同：
+ * 例如 "t1.v1 IS NOT NULL OR t1.v2 IS NOT NULL" 不能证明 v1 或 v2 不能为 NULL，
+ * 但可以证明 t1 这一整行不可能全为 NULL。
+ * 此外，PHV（PlaceHolderVar）的处理也不同。
  *
- * top_level is true while scanning top-level AND/OR structure; here, showing
- * the result is either FALSE or NULL is good enough.  top_level is false when
- * we have descended below a NOT or a strict function: now we must be able to
- * prove that the subexpression goes to NULL.
+ * top_level 在扫描顶层 AND/OR 结构时为 true；
+ * 此时，只需证明结果为 FALSE 或 NULL 即可。
+ * 当我们递归到 NOT 或严格函数内部时，top_level 为 false，
+ * 此时必须能够证明子表达式结果为 NULL。
  *
- * We don't use expression_tree_walker here because we don't want to descend
- * through very many kinds of nodes; only the ones we can be sure are strict.
+ * 这里没有使用 expression_tree_walker，
+ * 因为我们不希望递归进入太多类型的节点，只递归那些我们能确定是严格的节点。
  */
 Relids
 find_nonnullable_rels(Node *clause)
@@ -1618,6 +1615,15 @@ find_nonnullable_rels(Node *clause)
 	return find_nonnullable_rels_walker(clause, true);
 }
 
+/*
+ * find_nonnullable_rels_walker
+ *		递归查找表达式中哪些基表（rel）被强制为非空。
+ *
+ * top_level 在扫描顶层 AND/OR 结构时为 true；
+ * 此时，只需证明结果为 FALSE 或 NULL 即可。
+ * 当我们递归到 NOT 或严格函数内部时，top_level 为 false，
+ * 此时必须能够证明子表达式结果为 NULL。
+ */
 static Relids
 find_nonnullable_rels_walker(Node *node, bool top_level)
 {
@@ -1630,19 +1636,16 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 	{
 		Var		   *var = (Var *) node;
 
+		/* 只处理当前查询层级的 Var */
 		if (var->varlevelsup == 0)
 			result = bms_make_singleton(var->varno);
 	}
 	else if (IsA(node, List))
 	{
 		/*
-		 * At top level, we are examining an implicit-AND list: if any of the
-		 * arms produces FALSE-or-NULL then the result is FALSE-or-NULL. If
-		 * not at top level, we are examining the arguments of a strict
-		 * function: if any of them produce NULL then the result of the
-		 * function must be NULL.  So in both cases, the set of nonnullable
-		 * rels is the union of those found in the arms, and we pass down the
-		 * top_level flag unmodified.
+		 * 顶层时，处理隐式 AND 列表：只要有一个分支为 FALSE 或 NULL，整体就为 FALSE 或 NULL。
+		 * 非顶层时，处理严格函数参数：只要有一个参数为 NULL，函数结果就为 NULL。
+		 * 两种情况下都对所有分支做并集。
 		 */
 		foreach(l, (List *) node)
 		{
@@ -1655,6 +1658,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 	{
 		FuncExpr   *expr = (FuncExpr *) node;
 
+		/* 只递归严格函数的参数 */
 		if (func_strict(expr->funcid))
 			result = find_nonnullable_rels_walker((Node *) expr->args, false);
 	}
@@ -1680,7 +1684,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 		switch (expr->boolop)
 		{
 			case AND_EXPR:
-				/* At top level we can just recurse (to the List case) */
+				/* 顶层直接递归（等价于 List 情况） */
 				if (top_level)
 				{
 					result = find_nonnullable_rels_walker((Node *) expr->args,
@@ -1689,19 +1693,16 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 				}
 
 				/*
-				 * Below top level, even if one arm produces NULL, the result
-				 * could be FALSE (hence not NULL).  However, if *all* the
-				 * arms produce NULL then the result is NULL, so we can take
-				 * the intersection of the sets of nonnullable rels, just as
-				 * for OR.  Fall through to share code.
+				 * 非顶层时，AND 只有所有分支都为 NULL，结果才为 NULL，
+				 * 因此取所有分支的交集（与 OR 情况相同）。
 				 */
 				/* FALL THRU */
 			case OR_EXPR:
 
 				/*
-				 * OR is strict if all of its arms are, so we can take the
-				 * intersection of the sets of nonnullable rels for each arm.
-				 * This works for both values of top_level.
+				 * OR 只有所有分支都为 NULL，结果才为 NULL，
+				 * 因此取所有分支的交集。
+				 * 适用于顶层和非顶层。
 				 */
 				foreach(l, expr->args)
 				{
@@ -1709,21 +1710,18 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 
 					subresult = find_nonnullable_rels_walker(lfirst(l),
 															 top_level);
-					if (result == NULL) /* first subresult? */
+					if (result == NULL) /* 第一次赋值 */
 						result = subresult;
 					else
 						result = bms_int_members(result, subresult);
 
-					/*
-					 * If the intersection is empty, we can stop looking. This
-					 * also justifies the test for first-subresult above.
-					 */
+					/* 交集为空可提前结束 */
 					if (bms_is_empty(result))
 						break;
 				}
 				break;
 			case NOT_EXPR:
-				/* NOT will return null if its arg is null */
+				/* NOT 的参数为 NULL 时，NOT 结果也为 NULL */
 				result = find_nonnullable_rels_walker((Node *) expr->args,
 													  false);
 				break;
@@ -1740,21 +1738,21 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 	}
 	else if (IsA(node, CoerceViaIO))
 	{
-		/* not clear this is useful, but it can't hurt */
+		/* 理论上没用，但递归也无妨 */
 		CoerceViaIO *expr = (CoerceViaIO *) node;
 
 		result = find_nonnullable_rels_walker((Node *) expr->arg, top_level);
 	}
 	else if (IsA(node, ArrayCoerceExpr))
 	{
-		/* ArrayCoerceExpr is strict at the array level; ignore elemexpr */
+		/* 只递归数组整体，忽略 elemexpr */
 		ArrayCoerceExpr *expr = (ArrayCoerceExpr *) node;
 
 		result = find_nonnullable_rels_walker((Node *) expr->arg, top_level);
 	}
 	else if (IsA(node, ConvertRowtypeExpr))
 	{
-		/* not clear this is useful, but it can't hurt */
+		/* 理论上没用，但递归也无妨 */
 		ConvertRowtypeExpr *expr = (ConvertRowtypeExpr *) node;
 
 		result = find_nonnullable_rels_walker((Node *) expr->arg, top_level);
@@ -1767,7 +1765,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 	}
 	else if (IsA(node, NullTest))
 	{
-		/* IS NOT NULL can be considered strict, but only at top level */
+		/* 只有顶层 IS NOT NULL（且不是行）才可视为严格 */
 		NullTest   *expr = (NullTest *) node;
 
 		if (top_level && expr->nulltesttype == IS_NOT_NULL && !expr->argisrow)
@@ -1775,7 +1773,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 	}
 	else if (IsA(node, BooleanTest))
 	{
-		/* Boolean tests that reject NULL are strict at top level */
+		/* 只处理顶层 IS TRUE/IS FALSE/IS NOT UNKNOWN */
 		BooleanTest *expr = (BooleanTest *) node;
 
 		if (top_level &&
@@ -1789,19 +1787,13 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
 
 		/*
-		 * If the contained expression forces any rels non-nullable, so does
-		 * the PHV.
+		 * 如果 PHV 内部表达式强制某些 rel 非空，则 PHV 也如此。
 		 */
 		result = find_nonnullable_rels_walker((Node *) phv->phexpr, top_level);
 
 		/*
-		 * If the PHV's syntactic scope is exactly one rel, it will be forced
-		 * to be evaluated at that rel, and so it will behave like a Var of
-		 * that rel: if the rel's entire output goes to null, so will the PHV.
-		 * (If the syntactic scope is a join, we know that the PHV will go to
-		 * null if the whole join does; but that is AND semantics while we
-		 * need OR semantics for find_nonnullable_rels' result, so we can't do
-		 * anything with the knowledge.)
+		 * 如果 PHV 的语法作用域正好是一个 rel，则它的行为等同于该 rel 的 Var。
+		 * （如果作用域是 join，则不能直接用 OR 语义合并。）
 		 */
 		if (phv->phlevelsup == 0 &&
 			bms_membership(phv->phrels) == BMS_SINGLETON)
