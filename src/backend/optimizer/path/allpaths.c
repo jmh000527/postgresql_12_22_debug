@@ -1371,19 +1371,37 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * set_append_rel_pathlist
- *	  Build access paths for an "append relation"
+ *	  为“追加关系”（append relation）构建访问路径
  */
 static void
 set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 						Index rti, RangeTblEntry *rte)
 {
-	int			parentRTindex = rti;
-	List	   *live_childrels = NIL;
+	/* 假设有如下查询
+     *
+	 * CREATE TABLE sales (
+	 * 	id int,
+	 * 	sale_date date,
+	 * 	amount int
+	 * ) PARTITION BY RANGE (sale_date);
+	 * 
+	 * CREATE TABLE sales_2023 PARTITION OF sales
+	 * 	FOR VALUES FROM ('2023-01-01') TO ('2024-01-01');
+ 	 * 
+	 * CREATE TABLE sales_2024 PARTITION OF sales
+	 * 	FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+ 	 * 
+	 * 查询父表 -> 触发 set_append_rel_pathlist
+	 * SELECT * FROM sales WHERE sale_date >= '2023-06-01';
+	 */
+
+	int			parentRTindex = rti;	/* 父关系的范围表索引 */
+	List	   *live_childrels = NIL; 	/* 存储非 dummy（非空）的子关系 */
 	ListCell   *l;
 
 	/*
-	 * Generate access paths for each member relation, and remember the
-	 * non-dummy children.
+	 * 为每个成员关系生成访问路径，并记住非 dummy（非空）的子关系。
+	 * root->append_rel_list 存储了父子关系的映射信息。循环会遍历所有追加关系。
 	 */
 	foreach(l, root->append_rel_list)
 	{
@@ -1392,62 +1410,72 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		RangeTblEntry *childRTE;
 		RelOptInfo *childrel;
 
-		/* append_rel_list contains all append rels; ignore others */
+		/*
+		 * append_rel_list 包含所有追加关系；忽略其他的
+		 * 只有当 appinfo->parent_relid 等于当前处理的父表的范围表索引时，才继续处理。
+		 */
 		if (appinfo->parent_relid != parentRTindex)
 			continue;
 
-		/* Re-locate the child RTE and RelOptInfo */
+		/*
+		 * 获取子表的范围表索引和 RTE、RelOptInfo
+		 * 重新定位子 RTE 和 RelOptInfo
+		 */
 		childRTindex = appinfo->child_relid;
 		childRTE = root->simple_rte_array[childRTindex];
 		childrel = root->simple_rel_array[childRTindex];
 
 		/*
-		 * If set_append_rel_size() decided the parent appendrel was
-		 * parallel-unsafe at some point after visiting this child rel, we
-		 * need to propagate the unsafety marking down to the child, so that
-		 * we don't generate useless partial paths for it.
+		 * 并行安全性传播
+		 * 如果 set_append_rel_size() 在访问此子关系后的某个时刻判定父 appendrel
+		 * 是并行不安全的，我们需要将这种不安全性标记向下传播给子关系，
+		 * 以便我们不会为其生成无用的部分路径（partial paths）。
 		 */
 		if (!rel->consider_parallel)
 			childrel->consider_parallel = false;
 
 		/*
-		 * Compute the child's access paths.
+		 * 计算子关系的访问路径。
+		 * 这将设置 childrel->pathlist 和 childrel->partial_pathlist。
+		 * 这将为子关系生成 SeqScan、IndexScan 等路径。
 		 */
 		set_rel_pathlist(root, childrel, childRTindex, childRTE);
 
 		/*
-		 * If child is dummy, ignore it.
+		 * 如果子关系是 dummy（空的），忽略它。
 		 */
 		if (IS_DUMMY_REL(childrel))
 			continue;
 
-		/* Bubble up childrel's partitioned children. */
+		/* 向上冒泡 childrel 的分区子关系。 */
 		if (rel->part_scheme)
 			rel->partitioned_child_rels =
 				list_concat(rel->partitioned_child_rels,
 							list_copy(childrel->partitioned_child_rels));
 
 		/*
-		 * Child is live, so add it to the live_childrels list for use below.
+		 * 子关系是活跃的（live），因此将其添加到 live_childrels 列表中以供下面使用。
 		 */
 		live_childrels = lappend(live_childrels, childrel);
 	}
 
-	/* Add paths to the append relation. */
+	/*
+	 * 循环结束后，live_childrels 列表里有了 [sales_2023, sales_2024]。
+	 * 向追加关系添加路径。
+	 * 这个函数会创建一个 Append Path（或者 MergeAppend Path），
+	 * 把这两个子表的最佳路径“缝合”在一起，作为父表 sales 的访问路径。
+	 */
 	add_paths_to_append_rel(root, rel, live_childrels);
 }
 
 
 /*
  * add_paths_to_append_rel
- *		Generate paths for the given append relation given the set of non-dummy
- *		child rels.
+ *		为给定的 append 关系（追加关系）生成路径，基于非 dummy（非空）的子关系集合。
  *
- * The function collects all parameterizations and orderings supported by the
- * non-dummy children. For every such parameterization or ordering, it creates
- * an append path collecting one path from each non-dummy child with given
- * parameterization or ordering. Similarly it collects partial paths from
- * non-dummy children to create partial append paths.
+ * 该函数收集非 dummy 子关系支持的所有参数化和排序。对于每一种这样的参数化或排序，
+ * 它创建一个 append 路径，该路径从每个非 dummy 子关系中收集一个具有给定参数化或排序的路径。
+ * 同样，它从非 dummy 子关系中收集部分路径（partial paths）以创建部分 append 路径。
  */
 void
 add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
@@ -1466,24 +1494,40 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	List	   *partitioned_rels = NIL;
 	double		partial_rows = -1;
 
-	/* If appropriate, consider parallel append */
+	/*
+	 * 场景设定：
+	 * 父表：orders（按年份分区）。
+	 *
+	 * 子表1：orders_2023（历史数据，较小，无并行扫描路径）。
+	 * 路径 A：SeqScan（代价 100，无序）。
+	 * 路径 B：IndexScan on order_date（代价 150，有序）
+	 *
+	 * 子表2：orders_2024（热点数据，巨大，支持并行扫描）。
+	 * 路径 C：SeqScan（代价 500，无序）。
+	 * 路径 D：Parallel SeqScan（代价 300，无序，部分路径）。
+	 * 路径 E：IndexScan on order_date（代价 600，有序）。
+	 *
+	 * 查询：SELECT * FROM orders WHERE amount > 100 ORDER BY order_date;
+	 */
+
+	/*
+	 * 如果合适，考虑并行 append
+	 * 检查开关 enable_parallel_append 是否开启，且 orders 表本身是否允许并行（例如没有调用非并行安全的函数）。
+	 * 如果都为真，我们就有机会生成一个“并行 Append”计划，让多个 Worker 进程同时处理不同的分区。
+	 */
 	pa_subpaths_valid = enable_parallel_append && rel->consider_parallel;
 
 	/*
-	 * AppendPath generated for partitioned tables must record the RT indexes
-	 * of partitioned tables that are direct or indirect children of this
-	 * Append rel.
+	 * 收集分区信息 (Partition Info)
+	 * 为分区表生成的 AppendPath 必须记录作为此 Append 关系直接或间接子级的
+	 * 分区表的 RT 索引。
 	 *
-	 * AppendPath may be for a sub-query RTE (UNION ALL), in which case, 'rel'
-	 * itself does not represent a partitioned relation, but the child sub-
-	 * queries may contain references to partitioned relations.  The loop
-	 * below will look for such children and collect them in a list to be
-	 * passed to the path creation function.  (This assumes that we don't need
-	 * to look through multiple levels of subquery RTEs; if we ever do, we
-	 * could consider stuffing the list we generate here into sub-query RTE's
-	 * RelOptInfo, just like we do for partitioned rels, which would be used
-	 * when populating our parent rel with paths.  For the present, that
-	 * appears to be unnecessary.)
+	 * AppendPath 可能是针对子查询 RTE（UNION ALL），在这种情况下，'rel' 本身
+	 * 并不代表一个分区关系，但子查询可能包含对分区关系的引用。下面的循环将查找
+	 * 此类子级并将它们收集到一个列表中，以便传递给路径创建函数。（这假设我们
+	 * 不需要查看多层子查询 RTE；如果我们确实需要这样做，我们可以考虑将我们在此处
+	 * 生成的列表填充到子查询 RTE 的 RelOptInfo 中，就像我们对分区关系所做的那样，
+	 * 这将在填充父关系的路径时使用。目前看来，这似乎是不必要的。）
 	 */
 	if (rel->part_scheme != NULL)
 	{
@@ -1495,8 +1539,8 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			List	   *partrels = NIL;
 
 			/*
-			 * For a partitioned joinrel, concatenate the component rels'
-			 * partitioned_child_rels lists.
+			 * 对于分区连接关系（partitioned joinrel），连接组件关系的
+			 * partitioned_child_rels 列表。
 			 */
 			while ((relid = bms_next_member(rel->relids, relid)) >= 0)
 			{
@@ -1518,9 +1562,9 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * For every non-dummy child, remember the cheapest path.  Also, identify
-	 * all pathkeys (orderings) and parameterizations (required_outer sets)
-	 * available for the non-dummy member relations.
+	 * 核心循环：遍历子表；现在开始遍历 orders_2023 和 orders_2024。
+	 * 对于每个非 dummy 子关系，记住最便宜的路径。此外，识别非 dummy 成员关系
+	 * 可用的所有 pathkeys（排序）和参数化（required_outer 集合）。
 	 */
 	foreach(l, live_childrels)
 	{
@@ -1529,20 +1573,24 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		Path	   *cheapest_partial_path = NULL;
 
 		/*
-		 * For UNION ALLs with non-empty partitioned_child_rels, accumulate
-		 * the Lists of child relations.
+		 * 对于具有非空 partitioned_child_rels 的 UNION ALL，累积子关系列表。
 		 */
 		if (rel->rtekind == RTE_SUBQUERY && childrel->partitioned_child_rels != NIL)
 			partitioned_rels = lappend(partitioned_rels,
 									   childrel->partitioned_child_rels);
 
 		/*
-		 * If child has an unparameterized cheapest-total path, add that to
-		 * the unparameterized Append path we are constructing for the parent.
-		 * If not, there's no workable unparameterized path.
+		 * 如果子关系有一个无参数化的最便宜总成本路径（cheapest-total path），
+		 * 将其添加到我们正在为父关系构建的无参数化 Append 路径中。
+		 * 如果没有，则不存在可行的无参数化路径。
 		 *
-		 * With partitionwise aggregates, the child rel's pathlist may be
-		 * empty, so don't assume that a path exists here.
+		 * 对于分区聚合（partitionwise aggregates），子关系的 pathlist 可能为空，
+		 * 所以不要假设这里存在路径。
+		 *
+		 * 场景代入：
+		 * 对于 orders_2023，最便宜的是 路径 A (SeqScan, 100)。加入 subpaths。
+		 * 对于 orders_2024，最便宜的完整路径是 路径 C (SeqScan, 500)。加入 subpaths。
+		 * 结果：subpaths 列表准备好用于构建最基础的 Append 节点（总代价 100+500=600）。
 		 */
 		if (childrel->pathlist != NIL &&
 			childrel->cheapest_total_path->param_info == NULL)
@@ -1551,7 +1599,15 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		else
 			subpaths_valid = false;
 
-		/* Same idea, but for a partial plan. */
+		/*
+		 * 同样的想法，但是针对部分计划（partial plan）。
+		 *
+		 * 场景代入：
+		 * orders_2023 太小，没有部分路径。partial_subpaths_valid 变为 false。
+		 * orders_2024 有 路径 D (Parallel SeqScan, 300)。
+		 * 结果：因为有一个子表不支持并行，纯粹的“部分路径 Append”在这里可能无法构建
+		 * （取决于具体逻辑，通常要求所有子表都有部分路径才能构建完美的 Parallel Append，或者退化为混合模式）。
+		 */
 		if (childrel->partial_pathlist != NIL)
 		{
 			cheapest_partial_path = linitial(childrel->partial_pathlist);
@@ -1562,8 +1618,13 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			partial_subpaths_valid = false;
 
 		/*
-		 * Same idea, but for a parallel append mixing partial and non-partial
-		 * paths.
+		 * 同样的想法，但是针对混合了部分路径和非部分路径的并行 append。
+		 *
+		 * 场景代入：这是一个很聪明的逻辑。
+		 * 对于 orders_2023，只有非并行路径 A。它被放入 pa_nonpartial_subpaths。
+		 * 对于 orders_2024，并行路径 D (300) 比非并行路径 C (500) 便宜。路径 D 被放入 pa_partial_subpaths。
+		 *
+		 * 结果：我们收集到了一个混合方案——Worker 进程可以去扫 orders_2024，而 Leader 进程（或空闲 Worker）去扫 orders_2023。
 		 */
 		if (pa_subpaths_valid)
 		{
@@ -1574,14 +1635,14 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 
 			if (cheapest_partial_path == NULL && nppath == NULL)
 			{
-				/* Neither a partial nor a parallel-safe path?  Forget it. */
+				/* 既不是部分路径也不是并行安全路径？算了吧。 */
 				pa_subpaths_valid = false;
 			}
 			else if (nppath == NULL ||
 					 (cheapest_partial_path != NULL &&
 					  cheapest_partial_path->total_cost < nppath->total_cost))
 			{
-				/* Partial path is cheaper or the only option. */
+				/* 部分路径更便宜或者是唯一的选择。 */
 				Assert(cheapest_partial_path != NULL);
 				accumulate_append_subpath(cheapest_partial_path,
 										  &pa_partial_subpaths,
@@ -1591,17 +1652,12 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			else
 			{
 				/*
-				 * Either we've got only a non-partial path, or we think that
-				 * a single backend can execute the best non-partial path
-				 * faster than all the parallel backends working together can
-				 * execute the best partial path.
+				 * 要么我们只有一个非部分路径，要么我们认为单个后端执行最佳非部分路径的速度
+				 * 比所有并行后端协同工作执行最佳部分路径的速度更快。
 				 *
-				 * It might make sense to be more aggressive here.  Even if
-				 * the best non-partial path is more expensive than the best
-				 * partial path, it could still be better to choose the
-				 * non-partial path if there are several such paths that can
-				 * be given to different workers.  For now, we don't try to
-				 * figure that out.
+				 * 在这里更激进一点可能是有意义的。即使最佳非部分路径比最佳部分路径更昂贵，
+				 * 如果有多个这样的路径可以分配给不同的工作进程，选择非部分路径可能仍然更好。
+				 * 目前，我们不尝试弄清楚这一点。
 				 */
 				accumulate_append_subpath(nppath,
 										  &pa_nonpartial_subpaths,
@@ -1610,10 +1666,15 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		}
 
 		/*
-		 * Collect lists of all the available path orderings and
-		 * parameterizations for all the children.  We use these as a
-		 * heuristic to indicate which sort orderings and parameterizations we
-		 * should build Append and MergeAppend paths for.
+		 * 收集排序和参数化信息 (Pathkeys & Outer)
+		 * 收集所有子关系可用的所有路径排序和参数化的列表。我们使用这些作为启发式方法，
+		 * 来指示我们应该为哪些排序顺序和参数化构建 Append 和 MergeAppend 路径。
+		 *
+		 * 场景代入：
+		 * orders_2023 有 路径 B (IndexScan)，提供 order_date 排序。
+		 * orders_2024 有 路径 E (IndexScan)，提供 order_date 排序。
+		 * 结果：all_child_pathkeys 列表中记录下：我们有机会利用 order_date 的排序！
+		 * 这为后续生成 MergeAppend 埋下伏笔。
 		 */
 		foreach(lcp, childrel->pathlist)
 		{
@@ -1621,13 +1682,13 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			List	   *childkeys = childpath->pathkeys;
 			Relids		childouter = PATH_REQ_OUTER(childpath);
 
-			/* Unsorted paths don't contribute to pathkey list */
+			/* 未排序的路径不贡献 pathkey 列表 */
 			if (childkeys != NIL)
 			{
 				ListCell   *lpk;
 				bool		found = false;
 
-				/* Have we already seen this ordering? */
+				/* 我们已经见过这种排序了吗？ */
 				foreach(lpk, all_child_pathkeys)
 				{
 					List	   *existing_pathkeys = (List *) lfirst(lpk);
@@ -1641,19 +1702,19 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 				}
 				if (!found)
 				{
-					/* No, so add it to all_child_pathkeys */
+					/* 没有，所以将其添加到 all_child_pathkeys */
 					all_child_pathkeys = lappend(all_child_pathkeys,
 												 childkeys);
 				}
 			}
 
-			/* Unparameterized paths don't contribute to param-set list */
+			/* 无参数化的路径不贡献 param-set 列表 */
 			if (childouter)
 			{
 				ListCell   *lco;
 				bool		found = false;
 
-				/* Have we already seen this param set? */
+				/* 我们已经见过这个参数集了吗？ */
 				foreach(lco, all_child_outers)
 				{
 					Relids		existing_outers = (Relids) lfirst(lco);
@@ -1666,7 +1727,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 				}
 				if (!found)
 				{
-					/* No, so add it to all_child_outers */
+					/* 没有，所以将其添加到 all_child_outers */
 					all_child_outers = lappend(all_child_outers,
 											   childouter);
 				}
@@ -1675,9 +1736,15 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * If we found unparameterized paths for all children, build an unordered,
-	 * unparameterized Append path for the rel.  (Note: this is correct even
-	 * if we have zero or one live subpath due to constraint exclusion.)
+	 * 生成标准 Append 路径
+	 * 如果我们为所有子关系找到了无参数化路径，则为该关系构建一个无序、无参数化的
+	 * Append 路径。（注意：即使由于约束排除导致我们有零个或一个有效子路径，这也是正确的。）
+	 *
+	 * 场景代入：
+	 * orders_2023 有 路径 A (SeqScan)。
+	 * orders_2024 有 路径 C (SeqScan)。
+	 * 动作：创建一个包含 [路径 A, 路径 C] 的 Append 节点。
+	 * 特点：无序，总代价 600。
 	 */
 	if (subpaths_valid)
 		add_path(rel, (Path *) create_append_path(root, rel, subpaths, NIL,
@@ -1685,8 +1752,11 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 												  partitioned_rels, -1));
 
 	/*
-	 * Consider an append of unordered, unparameterized partial paths.  Make
-	 * it parallel-aware if possible.
+	 * 生成并行 Append 路径
+	 * 考虑一个无序、无参数化部分路径的 append。如果可能，使其具有并行感知能力（parallel-aware）。
+	 *
+	 * 动作：如果所有子表都有部分路径，这里会生成一个完全并行的 Append。
+	 * 在我们的例子中，因为 orders_2023 没有部分路径，这里可能跳过。
 	 */
 	if (partial_subpaths_valid && partial_subpaths != NIL)
 	{
@@ -1694,7 +1764,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		ListCell   *lc;
 		int			parallel_workers = 0;
 
-		/* Find the highest number of workers requested for any subpath. */
+		/* 找出任何子路径请求的最大工作进程数。 */
 		foreach(lc, partial_subpaths)
 		{
 			Path	   *path = lfirst(lc);
@@ -1704,13 +1774,10 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		Assert(parallel_workers > 0);
 
 		/*
-		 * If the use of parallel append is permitted, always request at least
-		 * log2(# of children) workers.  We assume it can be useful to have
-		 * extra workers in this case because they will be spread out across
-		 * the children.  The precise formula is just a guess, but we don't
-		 * want to end up with a radically different answer for a table with N
-		 * partitions vs. an unpartitioned table with the same data, so the
-		 * use of some kind of log-scaling here seems to make some sense.
+		 * 如果允许使用并行 append，则始终请求至少 log2(子关系数量) 个工作进程。
+		 * 我们假设在这种情况下拥有额外的工作进程是有用的，因为它们将分散在子关系中。
+		 * 精确的公式只是一个猜测，但我们不希望对于具有 N 个分区的表与具有相同数据的
+		 * 未分区表得出截然不同的答案，因此在这里使用某种对数缩放似乎是有意义的。
 		 */
 		if (enable_parallel_append)
 		{
@@ -1721,27 +1788,29 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		}
 		Assert(parallel_workers > 0);
 
-		/* Generate a partial append path. */
+		/* 生成部分 append 路径。 */
 		appendpath = create_append_path(root, rel, NIL, partial_subpaths,
 										NIL, NULL, parallel_workers,
 										enable_parallel_append,
 										partitioned_rels, -1);
 
 		/*
-		 * Make sure any subsequent partial paths use the same row count
-		 * estimate.
+		 * 确保任何后续的部分路径使用相同的行数估计。
 		 */
 		partial_rows = appendpath->path.rows;
 
-		/* Add the path. */
+		/* 添加路径。 */
 		add_partial_path(rel, (Path *) appendpath);
 	}
 
 	/*
-	 * Consider a parallel-aware append using a mix of partial and non-partial
-	 * paths.  (This only makes sense if there's at least one child which has
-	 * a non-partial path that is substantially cheaper than any partial path;
-	 * otherwise, we should use the append path added in the previous step.)
+	 * 生成混合并行 Append 路径
+	 * 考虑使用混合了部分路径和非部分路径的并行感知 append。（这只有在至少有一个子关系
+	 * 拥有比任何部分路径都便宜得多的非部分路径时才有意义；否则，我们应该使用在上一步中
+	 * 添加的 append 路径。）
+	 *
+	 * 动作：创建一个 Parallel Append 节点，包含 [路径 A (非并行), 路径 D (并行)]。
+	 * 特点：这是 PostgreSQL 强大的地方。它允许并行查询中包含非并行安全的子计划。
 	 */
 	if (pa_subpaths_valid && pa_nonpartial_subpaths != NIL)
 	{
@@ -1750,8 +1819,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		int			parallel_workers = 0;
 
 		/*
-		 * Find the highest number of workers requested for any partial
-		 * subpath.
+		 * 找出任何部分子路径请求的最大工作进程数。
 		 */
 		foreach(lc, pa_partial_subpaths)
 		{
@@ -1761,9 +1829,8 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		}
 
 		/*
-		 * Same formula here as above.  It's even more important in this
-		 * instance because the non-partial paths won't contribute anything to
-		 * the planned number of parallel workers.
+		 * 这里使用与上面相同的公式。在这个实例中更为重要，因为非部分路径不会对
+		 * 计划的并行工作进程数量做出任何贡献。
 		 */
 		parallel_workers = Max(parallel_workers,
 							   fls(list_length(live_childrels)));
@@ -1779,8 +1846,17 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * Also build unparameterized ordered append paths based on the collected
-	 * list of child pathkeys.
+	 * 生成有序 Append / MergeAppend 路径
+	 * 此外，根据收集到的子 pathkeys 列表构建无参数化的有序 append 路径。
+	 *
+	 * 场景代入：
+	 * 函数发现 all_child_pathkeys 中包含 order_date。
+	 * 它会去 orders_2023 找 order_date 的路径 -> 找到 路径 B (150)。
+	 * 它会去 orders_2024 找 order_date 的路径 -> 找到 路径 E (600)。
+	 * 它创建一个 MergeAppend 路径，包含 [路径 B, 路径 E]。
+	 *
+	 * 结果：生成了一个保留 order_date 顺序的路径。虽然总代价 (150+600=750) 比标准 Append (600) 高，
+	 * 但因为它满足了查询的 ORDER BY，省去了顶层的 Sort 操作，最终可能会被选中！
 	 */
 	if (subpaths_valid)
 		generate_orderedappend_paths(root, rel, live_childrels,
@@ -1788,24 +1864,27 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 									 partitioned_rels);
 
 	/*
-	 * Build Append paths for each parameterization seen among the child rels.
-	 * (This may look pretty expensive, but in most cases of practical
-	 * interest, the child rels will expose mostly the same parameterizations,
-	 * so that not that many cases actually get considered here.)
+	 * 生成参数化路径 (Parameterized Paths)
+	 * 为子关系中出现的每种参数化构建 Append 路径。
+	 * （这看起来可能相当昂贵，但在大多数实际感兴趣的情况下，子关系将主要暴露
+	 * 相同的参数化，因此实际上并没有那么多情况在这里被考虑。）
 	 *
-	 * The Append node itself cannot enforce quals, so all qual checking must
-	 * be done in the child paths.  This means that to have a parameterized
-	 * Append path, we must have the exact same parameterization for each
-	 * child path; otherwise some children might be failing to check the
-	 * moved-down quals.  To make them match up, we can try to increase the
-	 * parameterization of lesser-parameterized paths.
+	 * Append 节点本身不能强制执行 quals（条件），因此所有 qual 检查必须在
+	 * 子路径中完成。这意味着要拥有一个参数化的 Append 路径，我们必须为每个
+	 * 子路径拥有完全相同的参数化；否则，某些子路径可能无法检查下推的 quals。
+	 * 为了使它们匹配，我们可以尝试增加较少参数化路径的参数化。
+	 *
+	 * 场景代入：如果查询是 SELECT * FROM orders t1 JOIN customers t2 ON t1.customer_id = t2.id。
+	 * 动作：这里会尝试为 orders 生成一个接受 t2.id 作为参数的路径（通常是 IndexScan）。
+	 * 如果所有子表都能支持这种参数化扫描，
+	 * 就会生成一个参数化的 Append 路径，用于 Nested Loop Join 的内表。
 	 */
 	foreach(l, all_child_outers)
 	{
 		Relids		required_outer = (Relids) lfirst(l);
 		ListCell   *lcr;
 
-		/* Select the child paths for an Append with this parameterization */
+		/* 为具有此参数化的 Append 选择子路径 */
 		subpaths = NIL;
 		subpaths_valid = true;
 		foreach(lcr, live_childrels)
@@ -1815,7 +1894,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 
 			if (childrel->pathlist == NIL)
 			{
-				/* failed to make a suitable path for this child */
+				/* 未能为此子关系生成合适的路径 */
 				subpaths_valid = false;
 				break;
 			}
@@ -1825,7 +1904,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 															required_outer);
 			if (subpath == NULL)
 			{
-				/* failed to make a suitable path for this child */
+				/* 未能为此子关系生成合适的路径 */
 				subpaths_valid = false;
 				break;
 			}
@@ -1840,11 +1919,9 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * When there is only a single child relation, the Append path can inherit
-	 * any ordering available for the child rel's path, so that it's useful to
-	 * consider ordered partial paths.  Above we only considered the cheapest
-	 * partial path for each child, but let's also make paths using any
-	 * partial paths that have pathkeys.
+	 * 当只有一个子关系时，Append 路径可以继承子关系路径可用的任何排序，
+	 * 因此考虑有序的部分路径是有用的。上面我们只考虑了每个子关系的最便宜的
+	 * 部分路径，但让我们也使用任何具有 pathkeys 的部分路径来制作路径。
 	 */
 	if (list_length(live_childrels) == 1)
 	{
@@ -1856,8 +1933,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			AppendPath *appendpath;
 
 			/*
-			 * Skip paths with no pathkeys.  Also skip the cheapest partial
-			 * path, since we already used that above.
+			 * 跳过没有 pathkeys 的路径。也跳过最便宜的部分路径，因为我们上面已经使用过它了。
 			 */
 			if (path->pathkeys == NIL ||
 				path == linitial(childrel->partial_pathlist))
@@ -1874,30 +1950,24 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * generate_orderedappend_paths
- *		Generate ordered append paths for an append relation
+ *		为 append 关系生成有序的 append 路径
  *
- * Usually we generate MergeAppend paths here, but there are some special
- * cases where we can generate simple Append paths, because the subpaths
- * can provide tuples in the required order already.
+ * 通常我们在这里生成 MergeAppend 路径，但在某些特殊情况下，我们可以生成简单的
+ * Append 路径，因为子路径已经可以按所需的顺序提供元组。
  *
- * We generate a path for each ordering (pathkey list) appearing in
- * all_child_pathkeys.
+ * 我们为出现在 all_child_pathkeys 中的每种排序（pathkey 列表）生成一个路径。
  *
- * We consider both cheapest-startup and cheapest-total cases, ie, for each
- * interesting ordering, collect all the cheapest startup subpaths and all the
- * cheapest total paths, and build a suitable path for each case.
+ * 我们同时考虑最便宜启动成本（cheapest-startup）和最便宜总成本（cheapest-total）的情况，
+ * 即对于每种感兴趣的排序，收集所有最便宜启动成本的子路径和所有最便宜总成本的路径，
+ * 并为每种情况构建合适的路径。
  *
- * We don't currently generate any parameterized ordered paths here.  While
- * it would not take much more code here to do so, it's very unclear that it
- * is worth the planning cycles to investigate such paths: there's little
- * use for an ordered path on the inside of a nestloop.  In fact, it's likely
- * that the current coding of add_path would reject such paths out of hand,
- * because add_path gives no credit for sort ordering of parameterized paths,
- * and a parameterized MergeAppend is going to be more expensive than the
- * corresponding parameterized Append path.  If we ever try harder to support
- * parameterized mergejoin plans, it might be worth adding support for
- * parameterized paths here to feed such joins.  (See notes in
- * optimizer/README for why that might not ever happen, though.)
+ * 我们目前不在这里生成任何参数化的有序路径。虽然这样做不需要增加太多代码，
+ * 但很不清楚是否值得花费规划周期来研究这些路径：在嵌套循环（nestloop）内部使用
+ * 有序路径几乎没有什么用处。事实上，当前的 add_path 编码很可能会直接拒绝这些路径，
+ * 因为 add_path 不会对参数化路径的排序顺序给予任何信用，而且参数化的 MergeAppend
+ * 将比相应的参数化 Append 路径更昂贵。如果我们以后努力支持参数化的 mergejoin 计划，
+ * 那么在这里添加对参数化路径的支持以供给此类连接可能是值得的。（不过，请参阅
+ * optimizer/README 中的注释，了解为什么这可能永远不会发生。）
  */
 static void
 generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
@@ -1912,12 +1982,33 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 	bool		partition_pathkeys_desc_partial = true;
 
 	/*
-	 * Some partitioned table setups may allow us to use an Append node
-	 * instead of a MergeAppend.  This is possible in cases such as RANGE
-	 * partitioned tables where it's guaranteed that an earlier partition must
-	 * contain rows which come earlier in the sort order.  To detect whether
-	 * this is relevant, build pathkey descriptions of the partition ordering,
-	 * for both forward and reverse scans.
+	 * 场景设定：
+	 * 父表：logs（按月份分区）。
+	 *
+	 * CREATE TABLE logs (
+	 * 	log_time timestamp,
+	 * 	severity int,
+	 * 	message text
+	 * ) PARTITION BY RANGE (log_time);
+ 	 * 
+	 * -- 分区 1：一月数据
+	 * CREATE TABLE logs_jan PARTITION OF logs
+	 * FOR VALUES FROM ('2023-01-01') TO ('2023-02-01');
+ 	 * 
+	 * -- 分区 2：二月数据
+	 * CREATE TABLE logs_feb PARTITION OF logs
+	 * FOR VALUES FROM ('2023-02-01') TO ('2023-03-01');
+	 *
+	 * 并且我们在每个分区上都有索引：
+ 	 * logs_jan 上有 (log_time) 索引和 (severity) 索引。
+	 * logs_feb 上有 (log_time) 索引和 (severity) 索引。
+	 */
+
+	/*
+	 * 某些分区表设置可能允许我们使用 Append 节点而不是 MergeAppend。
+	 * 这在诸如 RANGE 分区表的情况下是可能的，因为它可以保证较早的分区必须包含
+	 * 在排序顺序中较早出现的行。为了检测这是否相关，我们需要构建分区排序的
+	 * pathkey 描述，包括正向和反向扫描。
 	 */
 	if (rel->part_scheme != NULL && IS_SIMPLE_REL(rel) &&
 		partitions_are_ordered(rel->boundinfo, rel->nparts))
@@ -1931,17 +2022,15 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 														   &partition_pathkeys_desc_partial);
 
 		/*
-		 * You might think we should truncate_useless_pathkeys here, but
-		 * allowing partition keys which are a subset of the query's pathkeys
-		 * can often be useful.  For example, consider a table partitioned by
-		 * RANGE (a, b), and a query with ORDER BY a, b, c.  If we have child
-		 * paths that can produce the a, b, c ordering (perhaps via indexes on
-		 * (a, b, c)) then it works to consider the appendrel output as
-		 * ordered by a, b, c.
+		 * 你可能认为我们应该在这里 truncate_useless_pathkeys，但是允许作为查询
+		 * pathkeys 子集的分区键通常是有用的。例如，考虑一个按 RANGE (a, b) 分区的表，
+		 * 以及一个带有 ORDER BY a, b, c 的查询。如果我们有可以产生 a, b, c 排序的
+		 * 子路径（也许通过 (a, b, c) 上的索引），那么将 appendrel 输出视为按 a, b, c
+		 * 排序是可行的。
 		 */
 	}
 
-	/* Now consider each interesting sort ordering */
+	/* 现在考虑每种有趣的排序顺序 */
 	foreach(lcp, all_child_pathkeys)
 	{
 		List	   *pathkeys = (List *) lfirst(lcp);
@@ -1953,13 +2042,15 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 		bool		match_partition_order_desc;
 
 		/*
-		 * Determine if this sort ordering matches any partition pathkeys we
-		 * have, for both ascending and descending partition order.  If the
-		 * partition pathkeys happen to be contained in pathkeys then it still
-		 * works, as described above, providing that the partition pathkeys
-		 * are complete and not just a prefix of the partition keys.  (In such
-		 * cases we'll be relying on the child paths to have sorted the
-		 * lower-order columns of the required pathkeys.)
+		 * 检查是否匹配分区顺序（正向或反向）
+		 * 确定此排序顺序是否与我们拥有的任何分区 pathkeys 匹配（包括升序和降序分区顺序）。
+		 * 如果分区 pathkeys 恰好包含在 pathkeys 中，那么它仍然有效，如上所述，
+		 * 前提是分区 pathkeys 是完整的，而不仅仅是分区键的前缀。（在这种情况下，
+		 * 我们将依赖子路径对所需 pathkeys 的低阶列进行了排序。）
+		 *
+		 * 逻辑：如果 match_partition_order 和 match_partition_order_desc 都为 false，
+		 * 		说明我们无法简单地通过按顺序扫描分区来获得有序结果。
+		 * 结论：必须使用 MergeAppend，利用二叉堆（Heap）算法来动态合并来自各个子表的有序数据流。
 		 */
 		match_partition_order =
 			pathkeys_contained_in(pathkeys, partition_pathkeys) ||
@@ -1971,14 +2062,28 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 			 (!partition_pathkeys_desc_partial &&
 			  pathkeys_contained_in(partition_pathkeys_desc, pathkeys)));
 
-		/* Select the child paths for this ordering... */
+		/*
+		 * 为每个子表挑选“最佳”路径
+		 * 我们将为每个子表选择最便宜的路径（cheapest-startup 和 cheapest-total），
+		 * 并根据是否匹配分区顺序（match_partition_order 或 match_partition_order_desc）
+		 * 来决定是否生成 Append 或 MergeAppend 路径。
+		 */
 		foreach(lcr, live_childrels)
 		{
 			RelOptInfo *childrel = (RelOptInfo *) lfirst(lcr);
 			Path	   *cheapest_startup,
 					   *cheapest_total;
 
-			/* Locate the right paths, if they are available. */
+			/*
+			 * 找到合适的路径（如果可用）。
+			 *
+			 * 尝试找到该子表中，符合 pathkeys 排序要求的路径。
+			 * 
+			 * get_cheapest_path_for_pathkeys 的智能之处：
+			 * 1. 如果子表有索引扫描（IndexScan）能提供该排序，它会返回该路径。
+			 * 2. 如果子表没有索引，它会返回最便宜的扫描路径（如 SeqScan），
+			 *    后续 create_merge_append_path 会自动识别并加上 Sort 节点的代价。
+			 */
 			cheapest_startup =
 				get_cheapest_path_for_pathkeys(childrel->pathlist,
 											   pathkeys,
@@ -1993,62 +2098,107 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 											   false);
 
 			/*
-			 * If we can't find any paths with the right order just use the
-			 * cheapest-total path; we'll have to sort it later.
+			 * 如果我们找不到任何具有正确顺序的路径，就使用最便宜总成本（cheapest-total）路径；
+			 * 我们稍后必须对其进行排序。
 			 */
 			if (cheapest_startup == NULL || cheapest_total == NULL)
 			{
-				cheapest_startup = cheapest_total =
-					childrel->cheapest_total_path;
-				/* Assert we do have an unparameterized path for this child */
+				/*
+				 * 没有符合排序要求的路径，只能使用最便宜的总成本路径。
+				 * 这通常是 SeqScan，但也可能是其他扫描类型（如 IndexScan）。
+				 */
+				cheapest_startup = cheapest_total = childrel->cheapest_total_path;
+				/* 确保这个路径不是参数化路径（MergeAppend 目前不支持参数化路径） */
 				Assert(cheapest_total->param_info == NULL);
 			}
 
 			/*
-			 * Notice whether we actually have different paths for the
-			 * "cheapest" and "total" cases; frequently there will be no point
-			 * in two create_merge_append_path() calls.
+			 * 注意我们是否实际上针对 "cheapest" 和 "total" 情况有不同的路径；
+			 * 通常没有必要进行两次 create_merge_append_path() 调用。
+			 *
+			 * 如果两者相同（大多数情况）：说明无论为了启动快还是总量快，最佳选择都是同一个路径。
+			 * 那么 startup_neq_total 保持为 false。后续我们只需要构建一个 MergeAppend 路径。
+			 *
+			 * 如果两者不同：说明我们有两个候选方案。
+			 * 方案 A：由所有子表的 cheapest_startup 路径组成的 MergeAppend（启动极快）。
+			 * 方案 B：由所有子表的 cheapest_total 路径组成的 MergeAppend（总量极快）。
+			 *
+			 * 此时将 startup_neq_total 设为 true，告诉后续代码：“嘿，记得构建两个不同的 MergeAppend 路径供上层挑选。”
+			 *
+			 * 这是一个去重逻辑。
+			 * 如果为了启动快和为了总量快选出的子路径是一样的，那就没必要浪费内存和 CPU 去构建两个一模一样的 MergeAppend 节点了。
 			 */
 			if (cheapest_startup != cheapest_total)
 				startup_neq_total = true;
 
 			/*
-			 * Collect the appropriate child paths.  The required logic varies
-			 * for the Append and MergeAppend cases.
+			 * 收集适当的子路径。所需的逻辑因 Append 和 MergeAppend 情况而异。
+			 * 这段代码负责将选中的子路径（cheapest_startup 和 cheapest_total）收集到列表中，为后续构建父路径做准备。
+			 * 根据是否利用了分区键的天然顺序，收集方式有三种分支。
+			 *
+			 * 分支 1：匹配正向分区顺序 (match_partition_order)
+			 * 场景：ORDER BY sale_date，且分区是按 sale_date 递增排列的（Jan, Feb, Mar）。
+			 *
+			 * 分支 2：匹配反向分区顺序 (match_partition_order_desc)
+			 * 场景：ORDER BY sale_date DESC，分区依然是按 sale_date 递增排列的（Jan, Feb, Mar）。
+			 *
+			 * 分支 3：不匹配分区顺序 (else) -> MergeAppend
+			 * 场景：ORDER BY amount，与分区键无关。
 			 */
 			if (match_partition_order)
 			{
 				/*
-				 * We're going to make a plain Append path.  We don't need
-				 * most of what accumulate_append_subpath would do, but we do
-				 * want to cut out child Appends or MergeAppends if they have
-				 * just a single subpath (and hence aren't doing anything
-				 * useful).
+				 * 我们将生成一个普通的 Append 路径。我们不需要 accumulate_append_subpath
+				 * 做的大部分工作，但我们确实希望剔除那些只有一个子路径（因此没有做任何有用事情）
+				 * 的子 Append 或 MergeAppend。
+				 */
+
+				/*
+				 * 如果子路径本身就是一个只包含单个子节点的 Append，直接取其内核。
+				 * 避免出现 Append -> Append -> Scan 这种多余的嵌套。
 				 */
 				cheapest_startup = get_singleton_append_subpath(cheapest_startup);
 				cheapest_total = get_singleton_append_subpath(cheapest_total);
 
+				/*
+				 * 将子路径添加到列表中。
+				 * 顺序追加 (lappend)：将子路径加到列表末尾。
+				 * 结果列表顺序：[Jan_Path, Feb_Path, Mar_Path]
+				 */
 				startup_subpaths = lappend(startup_subpaths, cheapest_startup);
 				total_subpaths = lappend(total_subpaths, cheapest_total);
 			}
 			else if (match_partition_order_desc)
 			{
 				/*
-				 * As above, but we need to reverse the order of the children,
-				 * because nodeAppend.c doesn't know anything about reverse
-				 * ordering and will scan the children in the order presented.
+				 * 如上所述，但我们需要反转子路径的顺序，因为 nodeAppend.c 对反向排序
+				 * 一无所知，并将按呈现的顺序扫描子路径。
+				 */
+
+				/*
+				 * 同样地，剔除多余的 Append 层。
 				 */
 				cheapest_startup = get_singleton_append_subpath(cheapest_startup);
 				cheapest_total = get_singleton_append_subpath(cheapest_total);
 
+				/*
+				 * 反向追加 (lcons)：将子路径加到列表前端。
+				 * 结果列表顺序：[Mar_Path, Feb_Path, Jan_Path]
+				 *
+				 * 这确保了执行器按列表顺序执行，即先扫 Mar，再扫 Feb，最后 Jan，天然满足反向排序。
+				 * 这里不仅列表顺序反了，子路径本身也必须是支持反向扫描的（例如 Index Backward Scan）。
+				 */
 				startup_subpaths = lcons(cheapest_startup, startup_subpaths);
 				total_subpaths = lcons(cheapest_total, total_subpaths);
 			}
 			else
 			{
 				/*
-				 * Otherwise, rely on accumulate_append_subpath to collect the
-				 * child paths for the MergeAppend.
+				 * 否则，依靠 accumulate_append_subpath 为 MergeAppend 收集子路径。
+				 *
+				 * 使用 accumulate_append_subpath 进行收集。
+				 * 这个函数比简单的 lappend 更智能，它会处理一些特殊情况（如拉平子 Append）。
+				 * 对于 MergeAppend 来说，子路径在列表中的顺序并不重要，因为堆排序会重新排列数据流。
 				 */
 				accumulate_append_subpath(cheapest_startup,
 										  &startup_subpaths, NULL);
@@ -2057,10 +2207,22 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 			}
 		}
 
-		/* ... and build the Append or MergeAppend paths */
+		/*
+		 * 这段代码是 generate_orderedappend_paths 函数的收尾阶段，负责根据前面收集的信息，正式创建并注册路径节点。
+		 * 根据之前的逻辑，我们已经为每个子关系选择了合适的路径，并将它们收集到了 startup_subpaths 和 total_subpaths 列表中。
+		 * 现在，我们需要根据是否匹配分区顺序，决定是创建 Append 路径还是 MergeAppend 路径。
+		 *
+		 * 分支 1： 匹配分区顺序 (match_partition_order || match_partition_order_desc)
+		 * 场景：ORDER BY sale_date，且分区是按 sale_date 递增排列的（Jan, Feb, Mar）。
+		 * 动作：创建一个 Append 路径，子路径顺序为 Jan, Feb, Mar。
+		 *
+		 * 分支 2：不匹配分区顺序 (else) -> MergeAppend
+		 * 场景：ORDER BY amount，与分区键无关。
+		 * 动作：创建一个 MergeAppend 路径，子路径顺序任意。
+		 */
 		if (match_partition_order || match_partition_order_desc)
 		{
-			/* We only need Append */
+			/* 我们只需要 Append */
 			add_path(rel, (Path *) create_append_path(root,
 													  rel,
 													  startup_subpaths,
@@ -2085,7 +2247,7 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 		}
 		else
 		{
-			/* We need MergeAppend */
+			/* 我们需要 MergeAppend */
 			add_path(rel, (Path *) create_merge_append_path(root,
 															rel,
 															startup_subpaths,
@@ -2249,10 +2411,10 @@ accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths)
 
 /*
  * get_singleton_append_subpath
- *		Returns the single subpath of an Append/MergeAppend, or just
- *		return 'path' if it's not a single sub-path Append/MergeAppend.
+ *		返回 Append/MergeAppend 的单个子路径，如果它不是包含单个子路径的
+ *		Append/MergeAppend，则直接返回 'path'。
  *
- * Note: 'path' must not be a parallel-aware path.
+ * 注意：'path' 必须不是并行感知的路径。
  */
 static Path *
 get_singleton_append_subpath(Path *path)
@@ -3971,12 +4133,10 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 
 /*
  * generate_partitionwise_join_paths
- * 		Create paths representing partitionwise join for given partitioned
- * 		join relation.
+ * 		为给定的分区连接关系创建表示分区级连接（partitionwise join）的路径。
  *
- * This must not be called until after we are done adding paths for all
- * child-joins. Otherwise, add_path might delete a path to which some path
- * generated here has a reference.
+ * 必须在完成为所有子连接添加路径之后才能调用此函数。否则，add_path 可能会删除
+ * 此处生成的某个路径所引用的路径。
  */
 void
 generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
@@ -3986,50 +4146,49 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 	int			num_parts;
 	RelOptInfo **part_rels;
 
-	/* Handle only join relations here. */
+	/* 这里只处理连接关系。 */
 	if (!IS_JOIN_REL(rel))
 		return;
 
-	/* We've nothing to do if the relation is not partitioned. */
+	/* 如果关系未分区，则无需执行任何操作。 */
 	if (!IS_PARTITIONED_REL(rel))
 		return;
 
-	/* The relation should have consider_partitionwise_join set. */
+	/* 该关系应该已设置 consider_partitionwise_join 标志。 */
 	Assert(rel->consider_partitionwise_join);
 
-	/* Guard against stack overflow due to overly deep partition hierarchy. */
+	/* 防止由于分区层次过深导致的栈溢出。 */
 	check_stack_depth();
 
 	num_parts = rel->nparts;
 	part_rels = rel->part_rels;
 
-	/* Collect non-dummy child-joins. */
+	/* 收集非 dummy（非空）的子连接。 */
 	for (cnt_parts = 0; cnt_parts < num_parts; cnt_parts++)
 	{
 		RelOptInfo *child_rel = part_rels[cnt_parts];
 
-		/* If it's been pruned entirely, it's certainly dummy. */
+		/* 如果它已被完全剪枝，那它肯定是 dummy 的。 */
 		if (child_rel == NULL)
 			continue;
 
-		/* Make partitionwise join paths for this partitioned child-join. */
+		/* 为此分区子连接生成分区级连接路径。 */
 		generate_partitionwise_join_paths(root, child_rel);
 
-		/* If we failed to make any path for this child, we must give up. */
+		/* 如果我们未能为此子连接生成任何路径，则必须放弃。 */
 		if (child_rel->pathlist == NIL)
 		{
 			/*
-			 * Mark the parent joinrel as unpartitioned so that later
-			 * functions treat it correctly.
+			 * 将父连接关系标记为未分区，以便后续函数能正确处理它。
 			 */
 			rel->nparts = 0;
 			return;
 		}
 
-		/* Else, identify the cheapest path for it. */
+		/* 否则，确定它的最便宜路径。 */
 		set_cheapest(child_rel);
 
-		/* Dummy children need not be scanned, so ignore those. */
+		/* Dummy 子连接不需要扫描，因此忽略它们。 */
 		if (IS_DUMMY_REL(child_rel))
 			continue;
 
@@ -4040,14 +4199,14 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 		live_children = lappend(live_children, child_rel);
 	}
 
-	/* If all child-joins are dummy, parent join is also dummy. */
+	/* 如果所有子连接都是 dummy 的，则父连接也是 dummy 的。 */
 	if (!live_children)
 	{
 		mark_dummy_rel(rel);
 		return;
 	}
 
-	/* Build additional paths for this rel from child-join paths. */
+	/* 基于子连接路径为此关系构建额外的路径。 */
 	add_paths_to_append_rel(root, rel, live_children);
 	list_free(live_children);
 }

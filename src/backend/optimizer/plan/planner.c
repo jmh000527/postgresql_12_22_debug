@@ -7221,19 +7221,15 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 /*
  * create_partitionwise_grouping_paths
  *
- * If the partition keys of input relation are part of the GROUP BY clause, all
- * the rows belonging to a given group come from a single partition.  This
- * allows aggregation/grouping over a partitioned relation to be broken down
- * into aggregation/grouping on each partition.  This should be no worse, and
- * often better, than the normal approach.
+ * 如果输入关系的分区键是 GROUP BY 子句的一部分，那么属于给定组的所有行都来自
+ * 单个分区。这允许将分区关系上的聚合/分组分解为每个分区上的聚合/分组。
+ * 这种方法应该不比普通方法差，而且通常更好。
  *
- * However, if the GROUP BY clause does not contain all the partition keys,
- * rows from a given group may be spread across multiple partitions. In that
- * case, we perform partial aggregation for each group, append the results,
- * and then finalize aggregation.  This is less certain to win than the
- * previous case.  It may win if the PartialAggregate stage greatly reduces
- * the number of groups, because fewer rows will pass through the Append node.
- * It may lose if we have lots of small groups.
+ * 但是，如果 GROUP BY 子句不包含所有分区键，则给定组的行可能分布在多个分区中。
+ * 在这种情况下，我们对每个组执行部分聚合，追加结果，然后完成聚合。
+ * 这种情况不如前一种情况确定能获胜。如果 PartialAggregate 阶段大大减少了
+ * 组的数量，它可能会获胜，因为通过 Append 节点的行数会更少。
+ * 如果我们有很多小组，它可能会失败。
  */
 static void
 create_partitionwise_grouping_paths(PlannerInfo *root,
@@ -7256,7 +7252,7 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 	Assert(patype != PARTITIONWISE_AGGREGATE_PARTIAL ||
 		   partially_grouped_rel != NULL);
 
-	/* Add paths for partitionwise aggregation/grouping. */
+	/* 为分区聚合/分组添加路径。 */
 	for (cnt_parts = 0; cnt_parts < nparts; cnt_parts++)
 	{
 		RelOptInfo *child_input_rel = input_rel->part_rels[cnt_parts];
@@ -7267,13 +7263,12 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 		RelOptInfo *child_grouped_rel;
 		RelOptInfo *child_partially_grouped_rel;
 
-		/* Pruned or dummy children can be ignored. */
+		/* 可以忽略被修剪或虚拟的子关系。 */
 		if (child_input_rel == NULL || IS_DUMMY_REL(child_input_rel))
 			continue;
 
 		/*
-		 * Copy the given "extra" structure as is and then override the
-		 * members specific to this child.
+		 * 按原样复制给定的 "extra" 结构，然后覆盖特定于此子关系的成员。
 		 */
 		memcpy(&child_extra, extra, sizeof(child_extra));
 
@@ -7285,7 +7280,7 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 								   (Node *) target->exprs,
 								   nappinfos, appinfos);
 
-		/* Translate havingQual and targetList. */
+		/* 转换 havingQual 和 targetList。 */
 		child_extra.havingQual = (Node *)
 			adjust_appendrel_attrs(root,
 								   extra->havingQual,
@@ -7296,22 +7291,20 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 								   nappinfos, appinfos);
 
 		/*
-		 * extra->patype was the value computed for our parent rel; patype is
-		 * the value for this relation.  For the child, our value is its
-		 * parent rel's value.
+		 * extra->patype 是为我们的父关系计算的值；patype 是此关系的值。
+		 * 对于子关系，我们的值是其父关系的值。
 		 */
 		child_extra.patype = patype;
 
 		/*
-		 * Create grouping relation to hold fully aggregated grouping and/or
-		 * aggregation paths for the child.
+		 * 创建分组关系以保存子关系的完全聚合分组和/或聚合路径。
 		 */
 		child_grouped_rel = make_grouping_rel(root, child_input_rel,
 											  child_target,
 											  extra->target_parallel_safe,
 											  child_extra.havingQual);
 
-		/* Create grouping paths for this child relation. */
+		/* 为此子关系创建分组路径。 */
 		create_ordinary_grouping_paths(root, child_input_rel,
 									   child_grouped_rel,
 									   agg_costs, gd, &child_extra,
@@ -7337,13 +7330,11 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 	}
 
 	/*
-	 * Try to create append paths for partially grouped children. For full
-	 * partitionwise aggregation, we might have paths in the partial_pathlist
-	 * if parallel aggregation is possible.  For partial partitionwise
-	 * aggregation, we may have paths in both pathlist and partial_pathlist.
+	 * 尝试为部分分组的子关系创建追加路径。对于完全分区聚合，如果并行聚合是可能的，
+	 * 我们可能在 partial_pathlist 中有路径。对于部分分区聚合，我们可能在
+	 * pathlist 和 partial_pathlist 中都有路径。
 	 *
-	 * NB: We must have a partially grouped path for every child in order to
-	 * generate a partially grouped path for this relation.
+	 * 注意：我们必须为每个子关系都有一个部分分组路径，以便为此关系生成部分分组路径。
 	 */
 	if (partially_grouped_rel && partial_grouping_valid)
 	{
@@ -7353,14 +7344,13 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 								partially_grouped_live_children);
 
 		/*
-		 * We need call set_cheapest, since the finalization step will use the
-		 * cheapest path from the rel.
+		 * 我们需要调用 set_cheapest，因为最终化步骤将使用关系中最便宜的路径。
 		 */
 		if (partially_grouped_rel->pathlist)
 			set_cheapest(partially_grouped_rel);
 	}
 
-	/* If possible, create append paths for fully grouped children. */
+	/* 如果可能，为完全分组的子关系创建追加路径。 */
 	if (patype == PARTITIONWISE_AGGREGATE_FULL)
 	{
 		Assert(grouped_live_children != NIL);

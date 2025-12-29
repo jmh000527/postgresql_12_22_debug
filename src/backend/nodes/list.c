@@ -1153,100 +1153,143 @@ list_free_deep(List *list)
 }
 
 /*
- * Return a shallow copy of the specified list.
+ * list_copy - 创建指定列表的浅拷贝
+ * 
+ * @param oldlist: 要复制的源列表指针
+ * @return: 新创建的列表副本；如果源列表为空（NIL），则返回NIL
+ * 
+ * 注意：这是浅拷贝操作，只复制列表结构和元素引用，不复制元素指向的实际对象
  */
 List *
 list_copy(const List *oldlist)
 {
-	List	   *newlist;
-	ListCell   *newlist_prev;
-	ListCell   *oldlist_cur;
+	List	   *newlist;      /* 新创建的列表指针 */
+	ListCell   *newlist_prev; /* 新列表中当前节点的前一个节点，用于链表构建 */
+	ListCell   *oldlist_cur;  /* 源列表中当前遍历到的节点 */
 
+	/* 边界检查：如果源列表为空，直接返回空列表 */
 	if (oldlist == NIL)
 		return NIL;
 
+	/* 创建一个新的列表结构，使用与源列表相同的类型（T_List、T_IntList或T_OidList） */
 	newlist = new_list(oldlist->type);
+	/* 设置新列表的长度与源列表相同 */
 	newlist->length = oldlist->length;
 
 	/*
-	 * Copy over the data in the first cell; new_list() has already allocated
-	 * the head cell itself
+	 * 复制第一个单元格的数据；new_list()函数已经为新列表分配了头单元格
+	 * 只需要将源列表头单元格的数据复制到新列表头单元格即可
 	 */
 	newlist->head->data = oldlist->head->data;
 
+	/* 初始化遍历指针：
+	 * - newlist_prev：指向新列表的头单元格（已复制数据）
+	 * - oldlist_cur：指向源列表的第二个单元格（第一个单元格已复制）
+	 */
 	newlist_prev = newlist->head;
 	oldlist_cur = oldlist->head->next;
+	
+	/* 遍历源列表中剩余的所有节点并复制 */
 	while (oldlist_cur)
 	{
-		ListCell   *newlist_cur;
+		ListCell   *newlist_cur; /* 新列表中要创建的当前节点 */
 
+		/* 为新节点分配内存空间 */
 		newlist_cur = (ListCell *) palloc(sizeof(*newlist_cur));
+		/* 复制源节点的数据（浅拷贝：只复制指针或值，不复制指向的对象） */
 		newlist_cur->data = oldlist_cur->data;
+		/* 将新节点链接到新列表中，作为前一个节点的下一个节点 */
 		newlist_prev->next = newlist_cur;
 
+		/* 更新遍历指针，准备处理下一个节点 */
 		newlist_prev = newlist_cur;
 		oldlist_cur = oldlist_cur->next;
 	}
 
+	/* 设置新列表的结束标记：最后一个节点的next指针设为NULL */
 	newlist_prev->next = NULL;
+	/* 更新新列表的尾指针，指向最后一个节点 */
 	newlist->tail = newlist_prev;
 
+	/* 验证新列表的结构完整性，确保长度、头指针、尾指针等关系正确 */
 	check_list_invariants(newlist);
+	/* 返回新创建的列表副本 */
 	return newlist;
 }
 
+
 /*
- * Return a shallow copy of the specified list, without the first N elements.
+ * list_copy_tail - 创建列表的浅拷贝，不包含前N个元素
+ * 
+ * @param oldlist: 要复制的源列表
+ * @param nskip: 要跳过的元素数量
+ * @return: 新创建的列表，包含源列表中跳过前nskip个元素后的所有元素；
+ *          如果源列表为空或nskip大于等于列表长度，则返回NIL
  */
 List *
 list_copy_tail(const List *oldlist, int nskip)
 {
-	List	   *newlist;
-	ListCell   *newlist_prev;
-	ListCell   *oldlist_cur;
+	List	   *newlist;      /* 新创建的列表指针 */
+	ListCell   *newlist_prev; /* 新列表中当前节点的前一个节点 */
+	ListCell   *oldlist_cur;  /* 源列表中当前遍历到的节点 */
 
+	/* 确保跳过的元素数量不为负数 */
 	if (nskip < 0)
-		nskip = 0;				/* would it be better to elog? */
+		nskip = 0;              /* 这里可以考虑使用elog报错，但当前选择了容错处理 */
 
+	/* 边界检查：如果源列表为空或跳过的元素数超过列表长度，返回空列表 */
 	if (oldlist == NIL || nskip >= oldlist->length)
 		return NIL;
 
+	/* 创建一个新的列表结构，使用与源列表相同的类型 */
 	newlist = new_list(oldlist->type);
+	/* 设置新列表的长度：源列表长度减去跳过的元素数量 */
 	newlist->length = oldlist->length - nskip;
 
 	/*
-	 * Skip over the unwanted elements.
+	 * 定位到源列表中要开始复制的位置
 	 */
 	oldlist_cur = oldlist->head;
 	while (nskip-- > 0)
 		oldlist_cur = oldlist_cur->next;
 
 	/*
-	 * Copy over the data in the first remaining cell; new_list() has already
-	 * allocated the head cell itself
+	 * 复制第一个剩余元素的数据；new_list()已经分配了新列表的头节点
 	 */
 	newlist->head->data = oldlist_cur->data;
 
+	/* 初始化遍历指针：新列表从头部开始，源列表指向下一个要复制的节点 */
 	newlist_prev = newlist->head;
 	oldlist_cur = oldlist_cur->next;
+	
+	/* 遍历源列表中剩余的所有节点并复制 */
 	while (oldlist_cur)
 	{
-		ListCell   *newlist_cur;
+		ListCell   *newlist_cur; /* 新列表中要创建的当前节点 */
 
+		/* 为新节点分配内存 */
 		newlist_cur = (ListCell *) palloc(sizeof(*newlist_cur));
+		/* 复制源节点的数据（浅拷贝，只复制指针/值，不复制指向的对象） */
 		newlist_cur->data = oldlist_cur->data;
+		/* 将新节点链接到新列表中 */
 		newlist_prev->next = newlist_cur;
 
+		/* 更新遍历指针 */
 		newlist_prev = newlist_cur;
 		oldlist_cur = oldlist_cur->next;
 	}
 
+	/* 设置新列表的结束标记 */
 	newlist_prev->next = NULL;
+	/* 更新新列表的尾指针 */
 	newlist->tail = newlist_prev;
 
+	/* 验证新列表的结构完整性 */
 	check_list_invariants(newlist);
+	/* 返回创建的新列表 */
 	return newlist;
 }
+
 
 /*
  * Sort a list as though by qsort.

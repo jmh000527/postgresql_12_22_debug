@@ -1351,8 +1351,7 @@ append_startup_cost_compare(const void *a, const void *b)
 
 /*
  * create_merge_append_path
- *	  Creates a path corresponding to a MergeAppend plan, returning the
- *	  pathnode.
+ *	  创建一个对应于MergeAppend计划的路径，返回路径节点。
  */
 MergeAppendPath *
 create_merge_append_path(PlannerInfo *root,
@@ -1380,8 +1379,8 @@ create_merge_append_path(PlannerInfo *root,
 	pathnode->subpaths = subpaths;
 
 	/*
-	 * Apply query-wide LIMIT if known and path is for sole base relation.
-	 * (Handling this at this low level is a bit klugy.)
+	 * 如果已知查询范围内的LIMIT，且路径是针对唯一的基准关系，则应用该LIMIT。
+	 * (在这个低层级处理这个问题有点笨拙。)
 	 */
 	if (bms_equal(rel->relids, root->all_baserels))
 		pathnode->limit_tuples = root->limit_tuples;
@@ -1389,7 +1388,7 @@ create_merge_append_path(PlannerInfo *root,
 		pathnode->limit_tuples = -1.0;
 
 	/*
-	 * Add up the sizes and costs of the input paths.
+	 * 累加输入路径的大小和成本。
 	 */
 	pathnode->path.rows = 0;
 	input_startup_cost = 0;
@@ -1404,14 +1403,14 @@ create_merge_append_path(PlannerInfo *root,
 
 		if (pathkeys_contained_in(pathkeys, subpath->pathkeys))
 		{
-			/* Subpath is adequately ordered, we won't need to sort it */
+			/* 子路径已充分排序，我们不需要对其进行排序 */
 			input_startup_cost += subpath->startup_cost;
 			input_total_cost += subpath->total_cost;
 		}
 		else
 		{
-			/* We'll need to insert a Sort node, so include cost for that */
-			Path		sort_path;	/* dummy for result of cost_sort */
+			/* 我们需要插入一个Sort节点，因此包含该节点的成本 */
+			Path		sort_path;	/* 用于存储cost_sort结果的虚拟变量 */
 
 			cost_sort(&sort_path,
 					  root,
@@ -1426,14 +1425,14 @@ create_merge_append_path(PlannerInfo *root,
 			input_total_cost += sort_path.total_cost;
 		}
 
-		/* All child paths must have same parameterization */
+		/* 所有子路径必须具有相同的参数化 */
 		Assert(bms_equal(PATH_REQ_OUTER(subpath), required_outer));
 	}
 
 	/*
-	 * Now we can compute total costs of the MergeAppend.  If there's exactly
-	 * one child path, the MergeAppend is a no-op and will be discarded later
-	 * (in setrefs.c); otherwise we do the normal cost calculation.
+	 * 现在我们可以计算MergeAppend的总成本。如果恰好有一个子路径，
+	 * MergeAppend是一个空操作，稍后将被丢弃（在setrefs.c中）；
+	 * 否则我们进行正常的成本计算。
 	 */
 	if (list_length(subpaths) == 1)
 	{
