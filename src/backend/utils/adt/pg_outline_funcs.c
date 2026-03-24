@@ -17,6 +17,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/table.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -26,6 +27,7 @@
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "optimizer/outline_hints.h"
 #include "parser/analyze.h"
@@ -38,19 +40,89 @@
 #include "utils/syscache.h"
 
 /*
+ * extract_hints_from_outline_data - Extract hints from OceanBase/Oracle style outline data
+ *
+ * This function extracts hints from the format:
+ * / *+
+ * BEGIN_OUTLINE_DATA
+ * hint1
+ * hint2
+ * END_OUTLINE_DATA
+ * * /
+ *
+ * Returns the extracted hints as a plain string with hints separated by newlines.
+ * If the input doesn't match the outline data format, returns the input unchanged.
+ */
+static char *
+extract_hints_from_outline_data(const char *hints_text)
+{
+	const char *begin_marker = "BEGIN_OUTLINE_DATA";
+	const char *end_marker = "END_OUTLINE_DATA";
+	const char *p;
+	const char *begin_pos = NULL;
+	const char *end_pos = NULL;
+	StringInfoData result;
+
+	if (hints_text == NULL)
+		return NULL;
+
+	if (*hints_text == '\0')
+		return pstrdup("");
+
+	/* Look for BEGIN_OUTLINE_DATA marker */
+	p = strstr(hints_text, begin_marker);
+	if (p != NULL)
+	{
+		begin_pos = p + strlen(begin_marker);
+
+		/* Look for END_OUTLINE_DATA marker */
+		end_pos = strstr(begin_pos, end_marker);
+
+		if (end_pos != NULL)
+		{
+			/* Found both markers, extract the content between them */
+			initStringInfo(&result);
+
+			/* Skip leading whitespace after BEGIN_OUTLINE_DATA */
+			while (begin_pos < end_pos && isspace((unsigned char) *begin_pos))
+				begin_pos++;
+
+			/* Copy content, trimming trailing whitespace before END_OUTLINE_DATA */
+			while (begin_pos < end_pos && isspace((unsigned char) *(end_pos - 1)))
+				end_pos--;
+
+			/* Copy the hints */
+			if (begin_pos < end_pos)
+				appendBinaryStringInfo(&result, begin_pos, end_pos - begin_pos);
+
+			/* Return the StringInfo data (empty or not) */
+			return result.data;
+		}
+	}
+
+	/* No outline data markers found, return input as-is */
+	return pstrdup(hints_text);
+}
+
+/*
  * pg_create_outline - Create a new outline
  *
  * Parameters:
  *   outline_name: Name of the outline
  *   query_text: SQL query text
- *   hints_text: Hint string in pg_hint_plan format
+ *   hints_text: Hint string in pg_hint_plan format or OceanBase/Oracle style outline data
+ *
+ * The hints_text can be in either format:
+ * 1. Plain format: "SeqScan(table1) IndexScan(table2 idx)"
+ * 2. OceanBase format: "/ *+ BEGIN_OUTLINE_DATA\nSeqScan(table1)\nIndexScan(table2 idx)\nEND_OUTLINE_DATA * /"
  */
 Datum
 pg_create_outline(PG_FUNCTION_ARGS)
 {
 	char	   *outline_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char	   *query_text = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char	   *hints_text = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char	   *hints_text_raw = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char	   *hints_text;
 	Oid			outline_oid;
 	Relation	rel;
 	HeapTuple	tuple;
@@ -63,6 +135,9 @@ pg_create_outline(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to create outlines")));
+
+	/* Extract hints from OceanBase/Oracle format if present */
+	hints_text = extract_hints_from_outline_data(hints_text_raw);
 
 	/* Get current namespace */
 	nspid = get_namespace_oid("public", false);

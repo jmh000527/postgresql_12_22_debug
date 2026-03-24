@@ -52,9 +52,16 @@ Located in: `src/backend/utils/adt/pg_outline_funcs.c`
 
 Four SQL-callable functions for outline management:
 - `pg_create_outline(name, query, hints)` - Create a new outline
+  - **name**: Outline name
+  - **query**: Normalized SQL query text (supports parameter placeholders $1, $2, etc.)
+  - **hints**: Hint string, supports two formats:
+    1. OceanBase/Oracle format: `/*+ BEGIN_OUTLINE_DATA ... END_OUTLINE_DATA */`
+    2. Traditional format: `E'hint1\nhint2\nhint3'` or `'hint1'` (single hint)
 - `pg_drop_outline(name)` - Drop an existing outline
 - `pg_enable_outline(name)` - Enable an outline
 - `pg_disable_outline(name)` - Disable an outline
+
+**Hint Format Conversion**: When using OceanBase/Oracle format, the system automatically extracts content between `BEGIN_OUTLINE_DATA` and `END_OUTLINE_DATA`, removing the comment wrapper, allowing Outline Data to be used directly for outline creation.
 
 ## Supported Hint Types
 
@@ -90,14 +97,40 @@ SELECT pg_create_outline(
 
 ### Example 2: Create an Outline with Multiple Hints
 
+Two formats are supported for specifying multiple hints:
+
+**Method 1: OceanBase/Oracle Style (Recommended)**
+
 ```sql
--- Force specific scan and join methods
+-- Use OceanBase Outline Data format
 SELECT pg_create_outline(
     'outline_complex_query',
+    'SELECT * FROM customers c JOIN orders o ON c.id = o.customer_id WHERE c.region = $1',
+    '/*+
+    BEGIN_OUTLINE_DATA
+    IndexScan(customers idx_customer_region)
+    HashJoin(customers orders)
+    END_OUTLINE_DATA
+    */'
+);
+```
+
+**Method 2: Traditional E-String Format**
+
+```sql
+-- Use PostgreSQL's E-string syntax
+SELECT pg_create_outline(
+    'outline_complex_query_2',
     'SELECT * FROM customers c JOIN orders o ON c.id = o.customer_id WHERE c.region = $1',
     E'IndexScan(customers idx_customer_region)\nHashJoin(customers orders)'
 );
 ```
+
+**Explanation**:
+- First hint: Use index `idx_customer_region` on the `customers` table
+- Second hint: Use hash join between `customers` and `orders`
+- **OceanBase format is recommended**: More readable and can be directly copied from `outline.display_hints` output
+- Traditional E-string format is still supported for backward compatibility
 
 ### Example 3: Manage Outlines
 

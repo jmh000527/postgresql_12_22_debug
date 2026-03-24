@@ -180,9 +180,16 @@ SELECT pg_create_outline(
 
 提供四个SQL可调用函数用于Outline管理：
 - `pg_create_outline(name, query, hints)` - 创建新的Outline
+  - **name**: Outline名称
+  - **query**: 规范化的SQL查询文本（支持参数占位符$1, $2等）
+  - **hints**: Hint字符串，支持两种格式：
+    1. OceanBase/Oracle格式：`/*+ BEGIN_OUTLINE_DATA ... END_OUTLINE_DATA */`
+    2. 传统格式：`E'hint1\nhint2\nhint3'` 或 `'hint1'`（单个hint）
 - `pg_drop_outline(name)` - 删除现有Outline
 - `pg_enable_outline(name)` - 启用Outline
 - `pg_disable_outline(name)` - 禁用Outline
+
+**Hint格式转换**：当使用OceanBase/Oracle格式时，系统会自动提取`BEGIN_OUTLINE_DATA`和`END_OUTLINE_DATA`之间的内容，去除包裹的注释标记，使Outline Data可以直接用于创建Outline。
 
 ## 支持的Hint类型
 
@@ -220,10 +227,30 @@ SELECT pg_create_outline(
 
 ### 示例2：创建包含多个Hint的Outline
 
+支持两种格式来指定多个Hint：
+
+**方式1：使用OceanBase/Oracle风格（推荐）**
+
 ```sql
--- 强制特定的扫描和连接方法
+-- 使用OceanBase Outline Data格式
 SELECT pg_create_outline(
     'outline_complex_query',
+    'SELECT * FROM customers c JOIN orders o ON c.id = o.customer_id WHERE c.region = $1',
+    '/*+
+    BEGIN_OUTLINE_DATA
+    IndexScan(customers idx_customer_region)
+    HashJoin(customers orders)
+    END_OUTLINE_DATA
+    */'
+);
+```
+
+**方式2：使用传统的E字符串格式**
+
+```sql
+-- 使用PostgreSQL的E字符串语法
+SELECT pg_create_outline(
+    'outline_complex_query_2',
     'SELECT * FROM customers c JOIN orders o ON c.id = o.customer_id WHERE c.region = $1',
     E'IndexScan(customers idx_customer_region)\nHashJoin(customers orders)'
 );
@@ -232,7 +259,8 @@ SELECT pg_create_outline(
 **说明**：
 - 第一个Hint：在customers表上使用idx_customer_region索引
 - 第二个Hint：在customers和orders之间使用哈希连接
-- 使用`E'...\n...'`语法在一个字符串中指定多个Hint
+- **推荐使用OceanBase格式**：更清晰易读，可以直接从`outline.display_hints`的输出复制粘贴
+- 传统E字符串格式仍然兼容支持
 
 ### 示例3：管理Outline
 
