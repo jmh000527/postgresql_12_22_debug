@@ -138,6 +138,279 @@ SELECT pg_create_outline(
 );
 ```
 
+## sr_plan式录制模式（新增）
+
+### 功能说明
+
+录制模式（Recording Mode）是一个强大的新功能，参考了sr_plan的设计理念，允许自动录制和回放SQL执行计划。与手动创建Outline不同，录制模式可以自动捕获执行计划并创建Outline，大大简化了Outline的管理流程。
+
+### 配置参数
+
+#### outline.recording_mode
+
+**类型**: `boolean`
+**默认值**: `off`
+**上下文**: `PGC_USERSET` (可以在会话级别设置)
+**描述**: 启用自动Outline录制模式
+
+当启用录制模式时：
+1. 每个执行的查询都会被自动分析
+2. 从实际执行计划中提取Hint
+3. 自动创建Outline并存储到`pg_outline`表
+4. 为Outline生成唯一名称（格式：`auto_outline_<进程ID>_<计数器>`）
+
+**使用方法**：
+```sql
+-- 启用录制模式
+SET outline.recording_mode = on;
+
+-- 执行查询（计划将被自动录制）
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- 禁用录制模式
+SET outline.recording_mode = off;
+```
+
+### 使用流程
+
+#### 步骤1：启用录制模式
+
+```sql
+-- 开启录制
+SET outline.recording_mode = on;
+```
+
+#### 步骤2：执行SQL（可选择性添加手动Hint）
+
+```sql
+-- 方式1：直接执行SQL，记录默认执行计划
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- 方式2：使用手动Hint强制特定计划，然后录制
+-- （如果需要固定特定的执行策略）
+SET enable_seqscan = off;  -- 强制使用索引
+SELECT * FROM customers WHERE region = 'Asia';
+SET enable_seqscan = on;   -- 恢复默认设置
+
+-- 系统自动提示：
+-- NOTICE:  Created outline "auto_outline_12345_1" for query
+```
+
+#### 步骤3：关闭录制模式
+
+```sql
+SET outline.recording_mode = off;
+```
+
+#### 步骤4：验证Outline已创建
+
+```sql
+-- 查看自动创建的Outline
+SELECT outlinename, outlinequery, outlinehints
+FROM pg_outline
+WHERE outlinename LIKE 'auto_outline%';
+```
+
+#### 步骤5：测试回放
+
+现在，当你再次执行相同的查询时，系统会自动应用录制的Outline：
+
+```sql
+-- 执行相同查询（查询会被规范化匹配）
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- 系统会自动使用之前录制的Outline
+-- 可以用EXPLAIN验证：
+EXPLAIN SELECT * FROM customers WHERE region = 'Asia';
+```
+
+### 查询规范化与匹配
+
+录制模式使用智能查询规范化来匹配查询：
+
+**规范化规则**：
+- 转换为小写（字符串字面量除外）
+- 折叠空白字符（多个空格合并为一个）
+- 去除首尾空白
+- 保留字符串字面量原样
+
+**匹配示例**：
+
+以下查询都会匹配同一个Outline：
+
+```sql
+-- 原始查询
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- 不同大小写（SQL关键字外）
+SELECT * FROM CUSTOMERS WHERE REGION = 'Asia';
+
+-- 不同空白
+SELECT   *   FROM   customers   WHERE   region='Asia';
+
+-- 所有这些都会使用相同的录制Outline！
+```
+
+### 完整示例
+
+#### 示例1：简单查询录制与回放
+
+```sql
+-- 1. 启用录制
+SET outline.recording_mode = on;
+SET outline.display_hints = on;  -- 可选：查看录制的内容
+
+-- 2. 执行查询
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- 输出：
+-- NOTICE:  Outline Data:
+-- /*+
+-- BEGIN_OUTLINE_DATA
+-- IndexScan(customers idx_customer_region)
+-- END_OUTLINE_DATA
+-- */
+-- NOTICE:  Created outline "auto_outline_56789_1" for query
+
+-- 3. 关闭录制
+SET outline.recording_mode = off;
+SET outline.display_hints = off;
+
+-- 4. 验证Outline
+SELECT outlinename, outlinehints FROM pg_outline;
+--      outlinename      |               outlinehints
+-- ----------------------+------------------------------------------
+--  auto_outline_56789_1 | IndexScan(customers idx_customer_region)
+
+-- 5. 测试回放（相同查询会自动使用Outline）
+EXPLAIN SELECT * FROM customers WHERE region = 'Asia';
+-- 应该显示Index Scan using idx_customer_region
+```
+
+#### 示例2：连接查询录制
+
+```sql
+-- 1. 启用录制
+SET outline.recording_mode = on;
+
+-- 2. 强制特定连接方式（可选）
+SET enable_hashjoin = off;  -- 禁用HashJoin
+SET enable_mergejoin = off; -- 禁用MergeJoin
+
+-- 3. 执行连接查询
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'Asia';
+
+-- NOTICE:  Created outline "auto_outline_56789_2" for query
+
+-- 4. 恢复设置并关闭录制
+SET enable_hashjoin = on;
+SET enable_mergejoin = on;
+SET outline.recording_mode = off;
+
+-- 5. 查看录制的Hint
+SELECT outlinename, outlinehints FROM pg_outline
+WHERE outlinename = 'auto_outline_56789_2';
+--      outlinename      |               outlinehints
+-- ----------------------+------------------------------------------
+--  auto_outline_56789_2 | IndexScan(customers idx_customer_region)
+--                       | SeqScan(orders)
+--                       | NestLoop(customers orders)
+
+-- 6. 后续执行会自动使用NestLoop连接
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'Asia';
+```
+
+### 与手动Outline的对比
+
+| 特性 | 手动Outline (`pg_create_outline`) | 录制模式 (`outline.recording_mode`) |
+|------|----------------------------------|-------------------------------------|
+| 创建方式 | 手动调用函数 | 自动创建 |
+| Outline名称 | 用户指定 | 自动生成 |
+| 适用场景 | 需要明确控制的固定Outline | 快速捕获当前执行计划 |
+| 学习成本 | 需要了解Hint语法 | 无需了解Hint语法 |
+| 灵活性 | 高（可精确控制） | 中（基于实际执行计划） |
+| 重复处理 | 允许覆盖 | 自动跳过重复 |
+
+### 最佳实践
+
+1. **录制前准备**
+   - 确保统计信息是最新的：`ANALYZE tables;`
+   - 测试环境与生产环境数据分布相似
+   - 对于关键查询，可能需要手动Hint引导计划
+
+2. **录制时机选择**
+   - 在业务低峰期录制，减少干扰
+   - 确保录制的查询是性能稳定的版本
+   - 如需特定计划，先用GUC参数调整（如`enable_*`系列）
+
+3. **录制后验证**
+   - 使用EXPLAIN检查录制的计划
+   - 在测试环境验证回放效果
+   - 监控查询性能是否符合预期
+
+4. **Outline管理**
+   - 定期检查自动创建的Outline
+   - 重命名重要的auto_outline为有意义的名称
+   - 删除不再需要的Outline
+
+### 故障排查
+
+**问题1：Outline没有被创建**
+- 检查`outline.recording_mode`是否为`on`
+- 确认查询成功执行（没有错误）
+- 查看日志是否有错误信息
+
+**问题2：查询没有使用Outline**
+- 检查Outline是否启用：`SELECT * FROM pg_outline WHERE outlineenabled = false;`
+- 验证查询规范化后是否匹配：使用`EXPLAIN`查看
+- 确认Outline的Hint格式正确
+
+**问题3：重复录制相同查询**
+- 系统会自动检测并跳过已存在的Outline
+- 如果想更新，先删除旧Outline：`SELECT pg_drop_outline('outline_name');`
+
+### 技术实现细节
+
+录制模式的核心实现包括：
+
+1. **查询规范化**：`normalize_query_string()`函数
+   - 处理大小写
+   - 标准化空白
+   - 保留字符串字面量
+
+2. **Outline查找**：`get_hints_for_query()`函数
+   - 规范化查询字符串
+   - 在`pg_outline`中查找匹配项
+   - 解析并应用Hint
+
+3. **自动录制**：`record_outline_for_query()`函数
+   - 检测重复Outline
+   - 生成唯一名称
+   - 插入到系统目录
+
+4. **优化器集成**
+   - 在查询规划前注入Hint
+   - 在查询执行后捕获计划
+   - 通过PostgreSQL optimizer hooks实现
+
+### 与sr_plan的区别
+
+虽然参考了sr_plan的设计理念，但实现方式有本质不同：
+
+| 特性 | sr_plan | 本实现（基于Outline） |
+|------|---------|---------------------|
+| 计划固定方式 | 直接序列化执行计划 | 通过注入Hint影响优化器 |
+| 灵活性 | 固定整个计划树 | 可以部分约束（仅Hint覆盖的部分） |
+| 适应性 | 统计信息变化可能失效 | Hint引导，优化器仍可优化细节 |
+| 实现复杂度 | 需要计划树序列化/反序列化 | 基于现有Hint机制 |
+| 维护成本 | 高（计划格式变化需要适配） | 低（Hint语法相对稳定） |
+
 ## 系统架构
 
 ### 主要组件
