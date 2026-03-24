@@ -48,6 +48,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
+#include "catalog/pg_outline.h"
 #include "catalog/pg_partitioned_table.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_publication.h"
@@ -576,6 +577,28 @@ static const struct cachedesc cacheinfo[] = {
 			0
 		},
 		8
+	},
+	{OutlineRelationId,			/* OUTLINENAMENSP */
+		OutlineNameNspIndexId,
+		2,
+		{
+			Anum_pg_outline_outlinename,
+			Anum_pg_outline_outlinenamespace,
+			0,
+			0
+		},
+		32
+	},
+	{OutlineRelationId,			/* OUTLINEOID */
+		OutlineOidIndexId,
+		1,
+		{
+			Anum_pg_outline_oid,
+			0,
+			0,
+			0
+		},
+		32
 	},
 	{PartitionedRelationId,		/* PARTRELID */
 		PartitionedRelidIndexId,

@@ -1,0 +1,288 @@
+/*-------------------------------------------------------------------------
+ *
+ * outline_plan.c
+ *	  Extract hints from execution plans for outline system
+ *
+ * This file implements the functionality to derive hints from a PlannedStmt
+ * that can be used to recreate the same execution plan later.
+ *
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * IDENTIFICATION
+ *	  src/backend/optimizer/outline/outline_plan.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "optimizer/outline_hints.h"
+#include "nodes/plannodes.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pg_list.h"
+#include "lib/stringinfo.h"
+#include "utils/lsyscache.h"
+#include "catalog/namespace.h"
+
+/* Forward declarations */
+static void extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset);
+static void extract_scan_hints(Scan *scan, StringInfo hints);
+static void extract_join_hints(Join *join, StringInfo hints);
+static char *get_rel_name(Index relid, List *rtable);
+
+/*
+ * Convert a PlannedStmt to a hint string
+ *
+ * This function walks the plan tree and extracts hints that would
+ * reproduce the same plan structure.
+ */
+char *
+plan_to_hints(PlannedStmt *pstmt, const char *query_string)
+{
+	StringInfoData hints;
+
+	if (pstmt == NULL || pstmt->planTree == NULL)
+		return NULL;
+
+	initStringInfo(&hints);
+
+	/* Extract hints from the plan tree */
+	extract_hints_from_plan(pstmt->planTree, &hints, 0);
+
+	if (hints.len == 0)
+	{
+		pfree(hints.data);
+		return NULL;
+	}
+
+	return hints.data;
+}
+
+/*
+ * Recursively extract hints from a plan node
+ */
+static void
+extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset)
+{
+	if (plan == NULL)
+		return;
+
+	/* Extract hints based on node type */
+	switch (nodeTag(plan))
+	{
+		case T_SeqScan:
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+		case T_BitmapIndexScan:
+		case T_BitmapHeapScan:
+		case T_TidScan:
+			extract_scan_hints((Scan *) plan, hints);
+			break;
+
+		case T_NestLoop:
+		case T_MergeJoin:
+		case T_HashJoin:
+			extract_join_hints((Join *) plan, hints);
+			/* Recursively process join inputs */
+			extract_hints_from_plan(plan->lefttree, hints, rtoffset);
+			extract_hints_from_plan(plan->righttree, hints, rtoffset);
+			break;
+
+		case T_Append:
+		case T_MergeAppend:
+		case T_BitmapAnd:
+		case T_BitmapOr:
+			{
+				ListCell   *lc;
+				Append	   *append = (Append *) plan;
+
+				foreach(lc, append->appendplans)
+				{
+					Plan	   *subplan = (Plan *) lfirst(lc);
+
+					extract_hints_from_plan(subplan, hints, rtoffset);
+				}
+			}
+			break;
+
+		case T_SubqueryScan:
+			{
+				SubqueryScan *subscan = (SubqueryScan *) plan;
+
+				extract_hints_from_plan(subscan->subplan, hints,
+									   subscan->scan.scanrelid);
+			}
+			break;
+
+		default:
+			/* Recursively process left and right subtrees */
+			if (plan->lefttree)
+				extract_hints_from_plan(plan->lefttree, hints, rtoffset);
+			if (plan->righttree)
+				extract_hints_from_plan(plan->righttree, hints, rtoffset);
+			break;
+	}
+}
+
+/*
+ * Extract scan method hints from a scan node
+ */
+static void
+extract_scan_hints(Scan *scan, StringInfo hints)
+{
+	RangeTblEntry *rte;
+	char	   *relname;
+
+	/* Get the range table entry */
+	rte = rt_fetch(scan->scanrelid, currentQueryEnv->rtable);
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return;
+
+	/* Get relation name */
+	relname = get_rel_name(rte->relid, NULL);
+	if (relname == NULL)
+		return;
+
+	/* Generate appropriate hint based on scan type */
+	switch (nodeTag(scan))
+	{
+		case T_SeqScan:
+			if (hints->len > 0)
+				appendStringInfoChar(hints, '\n');
+			appendStringInfo(hints, "SeqScan(%s)", relname);
+			break;
+
+		case T_IndexScan:
+			{
+				IndexScan  *iscan = (IndexScan *) scan;
+				char	   *indexname;
+
+				indexname = get_rel_name(iscan->indexid, NULL);
+				if (indexname != NULL)
+				{
+					if (hints->len > 0)
+						appendStringInfoChar(hints, '\n');
+					appendStringInfo(hints, "IndexScan(%s %s)",
+									 relname, indexname);
+				}
+			}
+			break;
+
+		case T_IndexOnlyScan:
+			{
+				IndexOnlyScan *ioscan = (IndexOnlyScan *) scan;
+				char	   *indexname;
+
+				indexname = get_rel_name(ioscan->indexid, NULL);
+				if (indexname != NULL)
+				{
+					if (hints->len > 0)
+						appendStringInfoChar(hints, '\n');
+					appendStringInfo(hints, "IndexOnlyScan(%s %s)",
+									 relname, indexname);
+				}
+			}
+			break;
+
+		case T_BitmapHeapScan:
+			if (hints->len > 0)
+				appendStringInfoChar(hints, '\n');
+			appendStringInfo(hints, "BitmapScan(%s)", relname);
+			break;
+
+		case T_TidScan:
+			if (hints->len > 0)
+				appendStringInfoChar(hints, '\n');
+			appendStringInfo(hints, "TidScan(%s)", relname);
+			break;
+
+		default:
+			/* Other scan types not supported yet */
+			break;
+	}
+}
+
+/*
+ * Extract join method hints from a join node
+ */
+static void
+extract_join_hints(Join *join, StringInfo hints)
+{
+	char	   *outer_rel = NULL;
+	char	   *inner_rel = NULL;
+	Plan	   *outer_plan = join->plan.lefttree;
+	Plan	   *inner_plan = join->plan.righttree;
+
+	/* Try to get relation names from the join inputs */
+	if (IsA(outer_plan, Scan))
+	{
+		Scan	   *scan = (Scan *) outer_plan;
+		RangeTblEntry *rte = rt_fetch(scan->scanrelid, currentQueryEnv->rtable);
+
+		if (rte && rte->rtekind == RTE_RELATION)
+			outer_rel = get_rel_name(rte->relid, NULL);
+	}
+
+	if (IsA(inner_plan, Scan))
+	{
+		Scan	   *scan = (Scan *) inner_plan;
+		RangeTblEntry *rte = rt_fetch(scan->scanrelid, currentQueryEnv->rtable);
+
+		if (rte && rte->rtekind == RTE_RELATION)
+			inner_rel = get_rel_name(rte->relid, NULL);
+	}
+
+	if (outer_rel == NULL || inner_rel == NULL)
+		return;
+
+	/* Generate appropriate hint based on join type */
+	if (hints->len > 0)
+		appendStringInfoChar(hints, '\n');
+
+	switch (nodeTag(join))
+	{
+		case T_NestLoop:
+			appendStringInfo(hints, "NestLoop(%s %s)", outer_rel, inner_rel);
+			break;
+
+		case T_HashJoin:
+			appendStringInfo(hints, "HashJoin(%s %s)", outer_rel, inner_rel);
+			break;
+
+		case T_MergeJoin:
+			appendStringInfo(hints, "MergeJoin(%s %s)", outer_rel, inner_rel);
+			break;
+
+		default:
+			/* Shouldn't happen */
+			break;
+	}
+}
+
+/*
+ * Get the name of a relation given its OID
+ */
+static char *
+get_rel_name(Oid relid, List *rtable)
+{
+	char	   *relname;
+	char	   *nspname;
+	char	   *result;
+
+	/* Get relation and namespace names */
+	relname = get_rel_name(relid);
+	if (relname == NULL)
+		return NULL;
+
+	nspname = get_namespace_name(get_rel_namespace(relid));
+	if (nspname == NULL)
+	{
+		pfree(relname);
+		return NULL;
+	}
+
+	/* For now, just return the relation name without schema qualification */
+	result = pstrdup(relname);
+
+	return result;
+}
