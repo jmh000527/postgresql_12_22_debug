@@ -10676,4 +10676,26 @@
   proname => 'pg_partition_root', prorettype => 'regclass',
   proargtypes => 'regclass', prosrc => 'pg_partition_root' },
 
+
+# outline management functions
+{ oid => '9910', descr => 'create a new outline',
+  proname => 'pg_create_outline', prorettype => 'oid',
+  proargtypes => 'text text text',
+  proargnames => '{outline_name,query_text,hints_text}',
+  prosrc => 'pg_create_outline' },
+{ oid => '9911', descr => 'drop an outline',
+  proname => 'pg_drop_outline', prorettype => 'void',
+  proargtypes => 'text',
+  proargnames => '{outline_name}',
+  prosrc => 'pg_drop_outline' },
+{ oid => '9912', descr => 'enable an outline',
+  proname => 'pg_enable_outline', prorettype => 'void',
+  proargtypes => 'text',
+  proargnames => '{outline_name}',
+  prosrc => 'pg_enable_outline' },
+{ oid => '9913', descr => 'disable an outline',
+  proname => 'pg_disable_outline', prorettype => 'void',
+  proargtypes => 'text',
+  proargnames => '{outline_name}',
+  prosrc => 'pg_disable_outline' },
 ]

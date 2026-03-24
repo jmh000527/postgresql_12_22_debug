@@ -104,6 +104,12 @@ extern void free_hint_state(HintState *hstate);
 extern char *plan_to_hints(PlannedStmt *plan, const char *query_string);
 extern HintState *get_hints_for_query(const char *query_string);
 
+/* Hint state management */
+extern void outline_hints_init(void);
+extern void outline_set_hint_state(HintState *hstate);
+extern HintState *outline_get_hint_state(void);
+extern void outline_clear_hint_state(void);
+
 /* Hook functions for applying hints */
 extern void outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 									Index rti, RangeTblEntry *rte);
