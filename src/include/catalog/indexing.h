@@ -206,6 +206,11 @@ DECLARE_UNIQUE_INDEX(pg_opfamily_am_name_nsp_index, 2754, on pg_opfamily using b
 DECLARE_UNIQUE_INDEX(pg_opfamily_oid_index, 2755, on pg_opfamily using btree(oid oid_ops));
 #define OpfamilyOidIndexId	2755
 
+DECLARE_UNIQUE_INDEX(pg_outline_oid_index, 6200, on pg_outline using btree(oid oid_ops));
+#define OutlineOidIndexId  6200
+DECLARE_UNIQUE_INDEX(pg_outline_name_nsp_index, 6201, on pg_outline using btree(outlinename name_ops, outlinenamespace oid_ops));
+#define OutlineNameNspIndexId  6201
+
 DECLARE_UNIQUE_INDEX(pg_pltemplate_name_index, 1137, on pg_pltemplate using btree(tmplname name_ops));
 #define PLTemplateNameIndexId  1137
 

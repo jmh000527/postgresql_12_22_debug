@@ -63,6 +63,7 @@ DECLARE_TOAST(pg_foreign_table, 4153, 4154);
 DECLARE_TOAST(pg_init_privs, 4155, 4156);
 DECLARE_TOAST(pg_language, 4157, 4158);
 DECLARE_TOAST(pg_namespace, 4163, 4164);
+DECLARE_TOAST(pg_outline, 4187, 4188);
 DECLARE_TOAST(pg_partitioned_table, 4165, 4166);
 DECLARE_TOAST(pg_policy, 4167, 4168);
 DECLARE_TOAST(pg_proc, 2836, 2837);

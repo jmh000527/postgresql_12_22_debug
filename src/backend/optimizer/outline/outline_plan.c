@@ -23,12 +23,13 @@
 #include "lib/stringinfo.h"
 #include "utils/lsyscache.h"
 #include "catalog/namespace.h"
+#include "parser/parsetree.h"
 
 /* Forward declarations */
 static void extract_hints_from_plan(Plan *plan, StringInfo hints, List *rtable, int rtoffset);
 static void extract_scan_hints(Scan *scan, StringInfo hints, List *rtable);
 static void extract_join_hints(Join *join, StringInfo hints, List *rtable);
-static char *get_rel_name(Oid relid, List *rtable);
+static char *get_outline_rel_name(Oid relid, List *rtable);
 
 /*
  * Convert a PlannedStmt to a hint string
@@ -183,7 +184,7 @@ extract_scan_hints(Scan *scan, StringInfo hints, List *rtable)
 		return;
 
 	/* Get relation name */
-	relname = get_rel_name(rte->relid, rtable);
+	relname = get_outline_rel_name(rte->relid, rtable);
 	if (relname == NULL)
 		return;
 
@@ -201,7 +202,7 @@ extract_scan_hints(Scan *scan, StringInfo hints, List *rtable)
 				IndexScan  *iscan = (IndexScan *) scan;
 				char	   *indexname;
 
-				indexname = get_rel_name(iscan->indexid, NULL);
+				indexname = get_outline_rel_name(iscan->indexid, NULL);
 				if (indexname != NULL)
 				{
 					if (hints->len > 0)
@@ -217,7 +218,7 @@ extract_scan_hints(Scan *scan, StringInfo hints, List *rtable)
 				IndexOnlyScan *ioscan = (IndexOnlyScan *) scan;
 				char	   *indexname;
 
-				indexname = get_rel_name(ioscan->indexid, NULL);
+				indexname = get_outline_rel_name(ioscan->indexid, NULL);
 				if (indexname != NULL)
 				{
 					if (hints->len > 0)
@@ -264,7 +265,7 @@ extract_join_hints(Join *join, StringInfo hints, List *rtable)
 		RangeTblEntry *rte = rt_fetch(scan->scanrelid, rtable);
 
 		if (rte && rte->rtekind == RTE_RELATION)
-			outer_rel = get_rel_name(rte->relid, rtable);
+			outer_rel = get_outline_rel_name(rte->relid, rtable);
 	}
 
 	if (IsA(inner_plan, Scan))
@@ -273,7 +274,7 @@ extract_join_hints(Join *join, StringInfo hints, List *rtable)
 		RangeTblEntry *rte = rt_fetch(scan->scanrelid, rtable);
 
 		if (rte && rte->rtekind == RTE_RELATION)
-			inner_rel = get_rel_name(rte->relid, rtable);
+			inner_rel = get_outline_rel_name(rte->relid, rtable);
 	}
 
 	if (outer_rel == NULL || inner_rel == NULL)
@@ -307,7 +308,7 @@ extract_join_hints(Join *join, StringInfo hints, List *rtable)
  * Get the name of a relation given its OID
  */
 static char *
-get_rel_name(Oid relid, List *rtable)
+get_outline_rel_name(Oid relid, List *rtable)
 {
 	char	   *relname;
 	char	   *nspname;

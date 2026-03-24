@@ -12,6 +12,107 @@ Outline系统提供以下核心能力：
 2. **基于Hint的控制**：使用pg_hint_plan兼容的Hint语法进行细粒度控制
 3. **持久化存储**：将Outline持久化存储在`pg_outline`系统表中
 4. **动态管理**：无需修改应用代码即可启用/禁用Outline
+5. **自动生成Hint**：自动从执行计划生成Hint，无需手动编写（新功能）
+
+## 自动Outline生成功能（新增）
+
+### 功能说明
+
+系统现在支持自动从执行计划生成Outline Data（Hint数据），并在每次SQL执行后自动显示在终端。这个功能参考了OceanBase和Oracle的设计，使用类似的格式输出。
+
+### 配置参数
+
+```sql
+-- 启用自动Outline显示
+SET outline.display_hints = on;
+
+-- 禁用自动Outline显示（默认）
+SET outline.display_hints = off;
+```
+
+### 使用示例
+
+```sql
+-- 1. 启用自动显示
+SET outline.display_hints = on;
+
+-- 2. 执行任意SQL查询
+SELECT * FROM orders WHERE customer_id = 123;
+
+-- 3. 系统会自动显示生成的Outline Data
+NOTICE:  Outline Data:
+/*+
+BEGIN_OUTLINE_DATA
+IndexScan(orders idx_orders_customer)
+END_OUTLINE_DATA
+*/
+
+-- 4. 对于包含连接的查询
+SELECT o.*, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE c.region = 'Asia';
+
+NOTICE:  Outline Data:
+/*+
+BEGIN_OUTLINE_DATA
+IndexScan(customers idx_customers_region)
+IndexScan(orders idx_orders_customer)
+HashJoin(customers orders)
+END_OUTLINE_DATA
+*/
+```
+
+### 输出格式
+
+生成的Outline Data采用标准的SQL注释格式，包含：
+
+- 开始标记：`/*+ BEGIN_OUTLINE_DATA`
+- Hint列表：每个Hint占一行
+- 结束标记：`END_OUTLINE_DATA */`
+
+这种格式与OceanBase和Oracle的Outline格式兼容，便于理解和手动使用。
+
+### 工作流程
+
+1. **执行查询**：PostgreSQL执行SQL查询并生成执行计划
+2. **提取Hint**：系统自动遍历执行计划树，识别扫描方法和连接方法
+3. **格式化输出**：将提取的Hint格式化为OceanBase/Oracle风格
+4. **显示结果**：通过NOTICE消息将Outline Data发送到客户端终端
+
+### 应用场景
+
+1. **学习优化器行为**：查看PostgreSQL为特定查询选择了哪些执行策略
+2. **快速创建Outline**：获取自动生成的Hint后，可以直接用于创建持久化Outline
+3. **性能分析**：了解执行计划的细节，便于优化调整
+4. **文档记录**：保存关键查询的执行计划Hint作为文档
+
+### 从自动生成到手动创建
+
+可以将自动生成的Hint直接用于创建永久Outline：
+
+```sql
+-- 步骤1：启用自动显示并执行查询
+SET outline.display_hints = on;
+SELECT * FROM orders WHERE status = 'pending';
+
+-- 步骤2：系统显示Outline Data
+NOTICE:  Outline Data:
+/*+
+BEGIN_OUTLINE_DATA
+SeqScan(orders)
+END_OUTLINE_DATA
+*/
+
+-- 步骤3：复制Hint内容，创建永久Outline
+SET outline.display_hints = off;  -- 可选，关闭自动显示
+
+SELECT pg_create_outline(
+    'outline_orders_pending',
+    'SELECT * FROM orders WHERE status = $1',
+    'SeqScan(orders)'  -- 使用自动生成的Hint
+);
+```
 
 ## 系统架构
 

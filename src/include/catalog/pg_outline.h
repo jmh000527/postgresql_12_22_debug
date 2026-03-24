@@ -61,14 +61,4 @@ CATALOG(pg_outline,9900,OutlineRelationId)
  */
 typedef FormData_pg_outline *Form_pg_outline;
 
-DECLARE_TOAST(pg_outline, 9901, 9902);
-#define PgOutlineToastTable 9901
-#define PgOutlineToastIndex 9902
-
-DECLARE_UNIQUE_INDEX(pg_outline_oid_index, 9903, on pg_outline using btree(oid oid_ops));
-#define OutlineOidIndexId  9903
-
-DECLARE_UNIQUE_INDEX(pg_outline_name_nsp_index, 9904, on pg_outline using btree(outlinename name_ops, outlinenamespace oid_ops));
-#define OutlineNameNspIndexId  9904
-
 #endif							/* PG_OUTLINE_H */
