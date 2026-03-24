@@ -120,6 +120,11 @@ extern void outline_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 
 /* GUC parameters and initialization */
 extern bool outline_display_hints;
+extern bool outline_recording_mode;
 extern void outline_init_guc(void);
+
+/* Query normalization and outline lookup */
+extern char *normalize_query_string(const char *query_string);
+extern void record_outline_for_query(const char *query_string, const char *hints);
 
 #endif							/* OUTLINE_HINTS_H */

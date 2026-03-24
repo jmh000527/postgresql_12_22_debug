@@ -1143,8 +1143,26 @@ exec_simple_query(const char *query_string)
 		querytree_list = pg_analyze_and_rewrite(parsetree, query_string,
 												NULL, 0, NULL);
 
+		/*
+		 * Check if we should apply hints from an outline
+		 */
+		{
+			HintState *hstate = get_hints_for_query(query_string);
+			if (hstate != NULL)
+			{
+				outline_set_hint_state(hstate);
+				ereport(DEBUG1,
+						(errmsg("Applying hints from outline for query")));
+			}
+		}
+
 		plantree_list = pg_plan_queries(querytree_list,
 										CURSOR_OPT_PARALLEL_OK, NULL);
+
+		/*
+		 * Clear hint state after planning
+		 */
+		outline_clear_hint_state();
 
 		/* Done with the snapshot used for parsing/planning */
 		if (snapshot_set)
@@ -1251,6 +1269,29 @@ exec_simple_query(const char *query_string)
 								(errmsg("Outline Data:\n%s", outline_data)));
 						pfree(outline_data);
 					}
+					pfree(hints);
+				}
+			}
+		}
+
+		/*
+		 * Record outline if recording mode is enabled
+		 */
+		if (outline_recording_mode && plantree_list != NIL)
+		{
+			ListCell   *lc;
+
+			foreach(lc, plantree_list)
+			{
+				PlannedStmt *pstmt = lfirst_node(PlannedStmt, lc);
+				char	   *hints;
+
+				/* Generate hints from the plan */
+				hints = plan_to_hints(pstmt, query_string);
+				if (hints != NULL)
+				{
+					/* Record the outline */
+					record_outline_for_query(query_string, hints);
 					pfree(hints);
 				}
 			}
@@ -4092,6 +4133,13 @@ PostgresMain(int argc, char *argv[],
 	 * Initialize outline system GUC parameters
 	 */
 	outline_init_guc();
+
+	/*
+	 * Register outline system hooks
+	 */
+	set_rel_pathlist_hook = outline_set_rel_pathlist;
+	set_join_pathlist_hook = outline_set_join_pathlist;
+	outline_hints_init();
 
 	/*
 	 * POSTGRES main processing loop begins here
