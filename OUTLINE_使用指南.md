@@ -1,0 +1,387 @@
+# PostgreSQL Outline 功能使用指南
+
+## 概述
+
+Outline（执行计划固定）功能是PostgreSQL的一项增强特性，参考了OceanBase的Outline接口设计，并基于pg_hint_plan的Hint实现。该功能允许数据库管理员（DBA）通过存储优化器提示（Hints）来固定和稳定特定SQL查询的执行计划，防止因统计信息变化、数据量增长等因素导致的性能退化。
+
+## 核心功能
+
+Outline系统提供以下核心能力：
+
+1. **执行计划固定**：为关键查询固定执行计划，防止性能回退
+2. **基于Hint的控制**：使用pg_hint_plan兼容的Hint语法进行细粒度控制
+3. **持久化存储**：将Outline持久化存储在`pg_outline`系统表中
+4. **动态管理**：无需修改应用代码即可启用/禁用Outline
+
+## 系统架构
+
+### 主要组件
+
+#### 1. 系统目录表 (`pg_outline`)
+
+位置：`src/include/catalog/pg_outline.h`
+
+`pg_outline`系统目录表存储Outline定义，包含以下字段：
+- `oid` - 对象标识符
+- `outlinename` - Outline名称
+- `outlinenamespace` - 命名空间OID
+- `outlineowner` - 所有者OID
+- `outlineenabled` - Outline是否启用
+- `outlinequery` - 规范化的SQL查询文本（查询签名）
+- `outlinehints` - pg_hint_plan格式的Hint字符串
+
+#### 2. Hint系统
+
+位置：`src/backend/optimizer/outline/`
+
+**outline_hints.c** - Hint解析
+- 解析pg_hint_plan格式的Hint字符串
+- 支持扫描方法提示：`SeqScan()`、`IndexScan()`、`NoSeqScan()`、`NoIndexScan()`
+- 支持连接方法提示：`NestLoop()`、`HashJoin()`、`MergeJoin()`
+
+**outline_plan.c** - 执行计划到Hint的转换
+- 从`PlannedStmt`执行计划中提取Hint
+- 生成能够重现相同执行计划的Hint字符串
+- 遍历计划树识别扫描和连接方法
+
+**outline_apply.c** - Hint应用
+- 实现优化器钩子（`set_rel_pathlist_hook`、`set_join_pathlist_hook`）
+- 根据活动的Hint过滤路径
+- 强制执行扫描和连接方法偏好
+
+#### 3. SQL函数
+
+位置：`src/backend/utils/adt/pg_outline_funcs.c`
+
+提供四个SQL可调用函数用于Outline管理：
+- `pg_create_outline(name, query, hints)` - 创建新的Outline
+- `pg_drop_outline(name)` - 删除现有Outline
+- `pg_enable_outline(name)` - 启用Outline
+- `pg_disable_outline(name)` - 禁用Outline
+
+## 支持的Hint类型
+
+### 扫描方法Hint
+
+```sql
+SeqScan(表名)                    -- 强制使用顺序扫描
+IndexScan(表名 索引名)           -- 强制使用指定索引的索引扫描
+NoSeqScan(表名)                  -- 禁用顺序扫描
+NoIndexScan(表名)                -- 禁用索引扫描
+```
+
+### 连接方法Hint
+
+```sql
+NestLoop(表1 表2)                -- 强制使用嵌套循环连接
+HashJoin(表1 表2)                -- 强制使用哈希连接
+MergeJoin(表1 表2)               -- 强制使用归并连接
+```
+
+## 使用示例
+
+### 示例1：为查询创建Outline
+
+```sql
+-- 创建一个强制在'orders'表上使用顺序扫描的Outline
+SELECT pg_create_outline(
+    'outline_orders_seq',                      -- Outline名称
+    'SELECT * FROM orders WHERE status = $1',  -- 查询文本
+    'SeqScan(orders)'                          -- Hint字符串
+);
+```
+
+**说明**：此Outline将强制查询使用顺序扫描而不是索引扫描，适用于需要扫描大量数据的场景。
+
+### 示例2：创建包含多个Hint的Outline
+
+```sql
+-- 强制特定的扫描和连接方法
+SELECT pg_create_outline(
+    'outline_complex_query',
+    'SELECT * FROM customers c JOIN orders o ON c.id = o.customer_id WHERE c.region = $1',
+    E'IndexScan(customers idx_customer_region)\nHashJoin(customers orders)'
+);
+```
+
+**说明**：
+- 第一个Hint：在customers表上使用idx_customer_region索引
+- 第二个Hint：在customers和orders之间使用哈希连接
+- 使用`E'...\n...'`语法在一个字符串中指定多个Hint
+
+### 示例3：管理Outline
+
+```sql
+-- 临时禁用Outline
+SELECT pg_disable_outline('outline_orders_seq');
+
+-- 稍后重新启用
+SELECT pg_enable_outline('outline_orders_seq');
+
+-- 永久删除Outline
+SELECT pg_drop_outline('outline_orders_seq');
+```
+
+**使用场景**：
+- **禁用**：在测试新的执行计划时临时禁用
+- **启用**：恢复已验证的稳定执行计划
+- **删除**：不再需要该Outline时清理
+
+### 示例4：查看现有Outline
+
+```sql
+-- 查询pg_outline系统表
+SELECT outlinename, outlineenabled, outlinehints
+FROM pg_outline
+WHERE outlinenamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public');
+```
+
+**输出示例**：
+```
+     outlinename      | outlineenabled |           outlinehints
+----------------------+----------------+----------------------------------
+ outline_orders_seq   | t              | SeqScan(orders)
+ outline_complex_query| t              | IndexScan(customers idx_customer_region)
+                      |                | HashJoin(customers orders)
+```
+
+## 实际应用场景
+
+### 场景1：防止执行计划变化
+
+**问题**：生产环境中某个关键查询因统计信息更新后执行计划发生变化，性能下降。
+
+**解决方案**：
+```sql
+-- 步骤1：使用EXPLAIN查看当前良好的执行计划
+EXPLAIN SELECT * FROM orders WHERE customer_id = 123;
+
+-- 步骤2：根据执行计划创建Outline
+-- 假设当前使用的是索引扫描，我们要固定它
+SELECT pg_create_outline(
+    'outline_orders_by_customer',
+    'SELECT * FROM orders WHERE customer_id = $1',
+    'IndexScan(orders idx_orders_customer_id)'
+);
+```
+
+### 场景2：优化复杂连接查询
+
+**问题**：多表连接查询的执行计划不稳定，有时选择低效的连接顺序。
+
+**解决方案**：
+```sql
+-- 创建固定连接方法的Outline
+SELECT pg_create_outline(
+    'outline_sales_report',
+    'SELECT c.name, o.total, p.product_name
+     FROM customers c
+     JOIN orders o ON c.id = o.customer_id
+     JOIN products p ON o.product_id = p.id
+     WHERE c.region = $1',
+    E'IndexScan(customers idx_region)\nHashJoin(customers orders)\nHashJoin(orders products)'
+);
+```
+
+### 场景3：应对数据量变化
+
+**问题**：表数据量增长后，优化器选择了不合适的执行计划。
+
+**解决方案**：
+```sql
+-- 对于小表强制使用索引，对于大表强制使用顺序扫描
+SELECT pg_create_outline(
+    'outline_large_table_scan',
+    'SELECT * FROM large_table WHERE status IN ($1, $2, $3)',
+    'SeqScan(large_table)'  -- 大范围查询使用顺序扫描更高效
+);
+```
+
+## 最佳实践
+
+### 1. 命名规范
+
+建议使用清晰的命名规范：
+- 使用前缀`outline_`
+- 包含表名或业务功能描述
+- 示例：`outline_orders_by_status`、`outline_user_login_query`
+
+### 2. 监控和验证
+
+在创建Outline后应进行验证：
+
+```sql
+-- 步骤1：查看Outline是否生效
+EXPLAIN (ANALYZE, VERBOSE)
+SELECT * FROM orders WHERE customer_id = 123;
+
+-- 步骤2：对比有无Outline的执行时间
+-- 禁用Outline测试
+SELECT pg_disable_outline('outline_orders_by_customer');
+-- 运行查询并记录时间
+-- 启用Outline测试
+SELECT pg_enable_outline('outline_orders_by_customer');
+-- 运行查询并记录时间
+```
+
+### 3. 文档记录
+
+为每个Outline创建文档记录：
+- 创建原因
+- 预期性能提升
+- 相关的业务场景
+- 创建日期和创建人
+
+### 4. 定期审查
+
+建议定期审查Outline的有效性：
+- 每季度检查Outline是否仍然必要
+- 评估数据量和查询模式的变化
+- 删除过时的Outline
+
+## 注意事项和限制
+
+### 当前限制
+
+1. **查询规范化**：当前实现存储原始查询文本。未来版本将实现查询规范化/指纹识别，以匹配具有不同字面值的相似查询。
+
+2. **连接Hint匹配**：连接Hint目前具有有限的匹配逻辑。未来将增强对复杂连接树中关系名称的跟踪。
+
+3. **Leading Hint**：用于控制连接顺序的`LEADING` Hint类型已定义但尚未实现。
+
+4. **子查询支持**：尚不支持子查询的Hint。
+
+5. **自动Outline创建**：当前需要手动创建Outline。未来版本可能从`EXPLAIN`输出自动捕获计划。
+
+### 使用建议
+
+1. **权限管理**：只有超级用户可以创建、修改和删除Outline，确保生产环境的安全性。
+
+2. **性能测试**：在生产环境应用Outline前，务必在测试环境充分验证。
+
+3. **版本兼容性**：升级PostgreSQL版本后，需要重新验证Outline的有效性。
+
+4. **避免过度使用**：不要为所有查询都创建Outline，只针对关键查询和问题查询。
+
+## 故障排查
+
+### 问题1：Outline未生效
+
+**检查步骤**：
+```sql
+-- 1. 确认Outline已启用
+SELECT outlinename, outlineenabled
+FROM pg_outline
+WHERE outlinename = 'your_outline_name';
+
+-- 2. 确认查询文本匹配
+-- 查询文本必须完全匹配（包括空格和大小写）
+```
+
+### 问题2：性能未改善
+
+**可能原因**：
+- Hint选择不当
+- 统计信息过时
+- 硬件资源限制
+
+**解决方法**：
+```sql
+-- 更新统计信息
+ANALYZE table_name;
+
+-- 尝试不同的Hint组合
+SELECT pg_drop_outline('old_outline');
+SELECT pg_create_outline('new_outline', 'query', 'different_hints');
+```
+
+### 问题3：查询报错
+
+**常见原因**：
+- 引用的索引不存在
+- 表名拼写错误
+- Hint语法错误
+
+**解决方法**：
+```sql
+-- 检查索引是否存在
+\d table_name
+
+-- 删除有问题的Outline
+SELECT pg_drop_outline('problematic_outline');
+```
+
+## 技术实现细节
+
+### 系统缓存
+
+实现添加了两个syscache条目用于快速Outline查找：
+- `OUTLINENAMENSP` - 按（名称，命名空间）查找
+- `OUTLINEOID` - 按OID查找
+
+### 优化器集成
+
+Outline系统通过钩子与PostgreSQL优化器集成：
+
+1. **set_rel_pathlist_hook**：在为基础关系生成路径时应用
+   - 根据扫描方法Hint过滤扫描路径
+   - 移除不需要的扫描类型
+
+2. **set_join_pathlist_hook**：在生成连接路径时应用
+   - 根据连接方法Hint过滤连接路径
+   - 强制执行特定的连接算法
+
+### Hint匹配机制
+
+当前Hint匹配依据：
+- **关系名称**：必须匹配查询中的表名
+- **Hint类型**：扫描或连接方法规范
+
+## 未来增强计划
+
+1. **查询指纹识别**：实现类似`pg_stat_statements`的查询规范化算法，以匹配具有不同字面值的查询。
+
+2. **自动捕获**：添加类似`pg_capture_outline(query_text)`的函数，自动执行查询并将其计划捕获为Hint。
+
+3. **导入/导出**：添加函数将Outline导出到SQL脚本，便于在不同环境之间迁移。
+
+4. **统计信息**：添加计数器跟踪每个Outline的应用频率及其对查询性能的影响。
+
+5. **计划比较**：添加工具比较有无Outline的执行计划，验证有效性。
+
+## 相关文件
+
+### 新增文件
+- `src/include/catalog/pg_outline.h` - 目录定义
+- `src/include/catalog/pg_outline.dat` - 目录数据
+- `src/include/optimizer/outline_hints.h` - Hint结构和API
+- `src/backend/optimizer/outline/outline_hints.c` - Hint解析
+- `src/backend/optimizer/outline/outline_plan.c` - 计划到Hint转换
+- `src/backend/optimizer/outline/outline_apply.c` - Hint应用
+- `src/backend/utils/adt/pg_outline_funcs.c` - SQL函数
+
+### 修改文件
+- `src/backend/optimizer/Makefile` - 添加outline子目录
+- `src/backend/utils/adt/Makefile` - 添加pg_outline_funcs.o
+- `src/backend/utils/cache/syscache.c` - 添加outline系统缓存
+- `src/include/utils/syscache.h` - 添加OUTLINENAMENSP和OUTLINEOID
+- `src/include/catalog/pg_proc.dat` - 注册SQL函数
+- `src/backend/catalog/Makefile` - 添加pg_outline到目录构建
+
+## 参考资料
+
+- **OceanBase Outline文档**: https://en.oceanbase.com/docs/common-oceanbase-database-10000000000872110
+- **pg_hint_plan文档**: https://pg-hint-plan.readthedocs.io/
+- **PostgreSQL优化器钩子**: `src/include/optimizer/paths.h`
+
+## 技术支持
+
+如遇到问题或需要帮助，请：
+1. 查看PostgreSQL日志文件
+2. 使用`EXPLAIN (ANALYZE, VERBOSE)`分析查询
+3. 检查系统表`pg_outline`中的Outline定义
+4. 参考本文档的故障排查部分
+
+## 许可证
+
+本实现是PostgreSQL的一部分，遵循PostgreSQL许可证。
