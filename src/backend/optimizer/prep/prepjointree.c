@@ -231,9 +231,25 @@ pull_up_sublinks(PlannerInfo *root)
 }
 
 /*
- * 递归遍历连接树节点以提升子链接（Sublinks）
+ * pull_up_sublinks_jointree_recurse
+ *		递归遍历连接树节点以提升子链接（Sublinks）。
  *
- * 除了返回可能被修改的连接树节点外，还通过 *relids 返回该子树包含的 relids 集合。
+ * 参数:
+ *	  root: 规划器信息。
+ *	  jtnode: 当前连接树节点。
+ *	  relids: [输出参数] 返回该子树包含的所有基表 relids。
+ *
+ * 返回值:
+ *	  可能被修改后的连接树节点（例如，如果在该节点下方提升了子查询，
+ *	  该节点可能被包装在新的 JoinExpr 中）。
+ *
+ * 核心逻辑:
+ *	  1. 递归深入连接树的所有分支。
+ *	  2. 计算每个子树包含的 relids。
+ *	  3. 调用 pull_up_sublinks_qual_recurse 处理当前节点的 quals（WHERE 或 ON 条件）。
+ *		 - 如果在 quals 中发现了可提升的 SubLink（如 EXISTS/ANY），
+ *		   会构建新的 Semi/Anti Join 节点，并将其插入到连接树的合适位置。
+ *		 - "合适位置"由传入 pull_up_sublinks_qual_recurse 的 jtlink 指针决定。
  */
 static Node *
 pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
@@ -246,29 +262,34 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 	{
 		*relids = NULL;
 	}
-	else if (IsA(jtnode, RangeTblRef))	/* 一定是查询树的叶子节点，是递归结束的条件 */
+	else if (IsA(jtnode, RangeTblRef))	/* 叶子节点：基表引用 */
 	{
 		int	varno = ((RangeTblRef *) jtnode)->rtindex;
 
 		*relids = bms_make_singleton(varno);
-		/* 返回未修改的 jtnode */
+		/* 叶子节点无法包含 quals，所以我们只需返回它 */
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
-		/* 处理 FromExpr 节点（连接树的中间节点） */
+		/* 
+		 * 处理 FromExpr 节点（对应 SQL 中的 FROM ... WHERE ...）。
+		 * FromExpr 的 quals 就是 WHERE 子句。
+		 */
 		FromExpr   *f = (FromExpr *) jtnode;
-		List	   *newfromlist = NIL;	/* 新的 fromlist，用于保存递归处理后的子节点 */
-		Relids		frelids = NULL;		/* 当前 FromExpr 包含的所有 relids */
-		FromExpr   *newf;				/* 新构造的 FromExpr 节点 */
-		Node	   *jtlink;				/* 用于连接新节点的指针 */
-		ListCell   *l;					/* 用于遍历 fromlist 的链表指针 */
+		List	   *newfromlist = NIL;	/* 重构后的 FROM 列表 */
+		Relids		frelids = NULL;		/* 当前节点下所有表的 relids 集合 */
+		FromExpr   *newf;
+		Node	   *jtlink;				/* 指向当前树顶部的指针（可能会被插入的 Join 改变） */
+		ListCell   *l;
 
-		/* 首先递归处理子节点并收集它们的 relids */
+		/* 
+		 * 自底向上处理：先递归处理所有子节点。
+		 * 必须先做这个，因为子节点可能会变成 JoinExpr 堆栈。
+		 */
 		foreach(l, f->fromlist)
 		{
-			/* 递归处理 fromlist 的每个子节点，并收集其 relids */
-			Node	   *newchild;		/* 递归处理后的新子节点 */
-			Relids		childrelids;	/* 当前子节点包含的 relids 集合 */
+			Node	   *newchild;
+			Relids		childrelids;
 
 			newchild = pull_up_sublinks_jointree_recurse(root,
 														 lfirst(l),
@@ -276,57 +297,65 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 			newfromlist = lappend(newfromlist, newchild);
 			frelids = bms_join(frelids, childrelids);
 		}
-		/* 构造新的 FromExpr，暂时不处理 quals */
+
+		/* 构造新的 FromExpr 节点，包含处理后的子节点列表 */
 		newf = makeFromExpr(newfromlist, NULL);
-		/* 设置代表重建连接树的 jtlink */
+		
+		/* 
+		 * 初始化 jtlink 指向这个新的 FromExpr。
+		 * 如果在处理 quals 时发现了 SubLink，pull_up_sublinks_qual_recurse 
+		 * 会修改 jtlink，让它指向新生成的 JoinExpr（而原来的 FromExpr 会变成其子节点）。
+		 */
 		jtlink = (Node *) newf;
-		/* 处理 quals，所有子节点都可用 */
+
+		/* 
+		 * 处理 WHERE 子句 (quals)。
+		 * 在 WHERE 子句中的 SubLink 可以与 FromExpr 下的任何表进行连接（Semi/Anti Join），
+		 * 因此我们将 frelids (所有子表的 relids) 作为 available_rels 传递。
+		 */
 		newf->quals = pull_up_sublinks_qual_recurse(root, f->quals,
 													&jtlink, frelids,
 													NULL, NULL);
 
 		/*
-		 * 返回结果可能是 newf，也可能是以 newf 为底的 JoinExpr 堆栈。
-		 * 后续优化步骤会进一步扁平化和重排这些连接。
-		 *
-		 * 虽然可以将上拉的子查询包含在返回的 relids 中，但没有必要，
-		 * 因为上层 quals 不会引用它们的输出。
+		 * 更新 relids 输出。
+		 * 注意：我们不需要包含新生成的 Semi-Join 里的子查询表的 relids，
+		 * 因为上层的 quals 不应该引用它们（SubLink 上拉后对上层是透明的）。
 		 */
 		*relids = frelids;
 		jtnode = jtlink;
 	}
 	else if (IsA(jtnode, JoinExpr))
 	{
-		/* 处理 JoinExpr 节点（连接树的中间节点） */
-		JoinExpr   *j;           /* 新构造的 JoinExpr 节点 */
-		Relids		leftrelids;   /* 左子树包含的 relids 集合 */
-		Relids		rightrelids;  /* 右子树包含的 relids 集合 */
-		Node	   *jtlink;       /* 用于连接新节点的指针 */
+		/* 处理 JoinExpr 节点（显式的 JOIN ... ON ...） */
+		JoinExpr   *j;
+		Relids		leftrelids;
+		Relids		rightrelids;
+		Node	   *jtlink;
 
-		/*
-		 * 构造可修改的 JoinExpr 节点，但暂时不复制其子节点
-		 */
+		/* 复制 JoinExpr 节点以便修改 */
 		j = (JoinExpr *) palloc(sizeof(JoinExpr));
 		memcpy(j, jtnode, sizeof(JoinExpr));
 		jtlink = (Node *) j;
 
-		/* 递归处理左右子节点并收集 relids */
+		/* 递归处理左右子树 */
 		j->larg = pull_up_sublinks_jointree_recurse(root, j->larg,
 													&leftrelids);
 		j->rarg = pull_up_sublinks_jointree_recurse(root, j->rarg,
 													&rightrelids);
 
 		/*
-		 * 处理 quals，展示合适的子节点 relids，并将上拉的连接节点插入正确位置。
-		 * 对于内连接，新 JoinExpr 节点放在现有连接之上（类似 FromExpr）。
-		 * 对于外连接，新 JoinExpr 节点必须插入到外连接的可空侧。
-		 * available_rels 的设计就是为了保证只上拉那些可以安全处理的 quals。
-		 *
-		 * 这里不期望出现 JOIN_SEMI 或 JOIN_ANTI 类型的节点。
+		 * 处理 JOIN 的 ON 子句 (quals)。
+		 * 根据连接类型，SubLink 上拉的位置和可用关系集有很大不同。
 		 */
 		switch (j->jointype)
 		{
 			case JOIN_INNER:
+				/* 
+				 * INNER JOIN: 等同于 FromExpr 的情况。
+				 * SubLink 可以放在这个 Join 节点之上，并且可以引用左右两侧的表。
+				 * 新生成的 SemiJoin 将会包裹当前的 join 节点。
+				 */
 				j->quals = pull_up_sublinks_qual_recurse(root, j->quals,
 														 &jtlink,
 														 bms_union(leftrelids,
@@ -334,15 +363,30 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 														 NULL, NULL);
 				break;
 			case JOIN_LEFT:
+				/* 
+				 * LEFT JOIN: 
+				 * ON 子句中的 SubLink 只能引用右侧表的列（或者是常量/左侧列，但必须视为在右侧上下文中）。
+				 * 生成的 SemiJoin 必须插入到左连接的右侧子树 (j->rarg) 上方，
+				 * 而不能在整个左连接上方（否则会破坏左连接的 NULL 生成语义）。
+				 * 因此传递 &j->rarg 作为插入点，rightrelids 作为可用关系。
+				 */
 				j->quals = pull_up_sublinks_qual_recurse(root, j->quals,
 														 &j->rarg,
 														 rightrelids,
 														 NULL, NULL);
 				break;
 			case JOIN_FULL:
-				/* 全连接的 quals 无法处理 */
+				/* 
+				 * FULL JOIN: 
+				 * 两侧都可能产生 NULL，非常复杂。目前不支持在这里提升 SubLink。
+				 * 它们将被保留为 SubPlan（执行时的过滤器）。
+				 */
 				break;
 			case JOIN_RIGHT:
+				/* 
+				 * RIGHT JOIN: 与 LEFT JOIN 对称。
+				 * 必须插入到左侧子树 (j->larg) 上方。
+				 */
 				j->quals = pull_up_sublinks_qual_recurse(root, j->quals,
 														 &j->larg,
 														 leftrelids,
@@ -355,10 +399,8 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 		}
 
 		/*
-		 * 虽然可以将上拉的子查询包含在返回的 relids 中，但没有必要，
-		 * 因为上层 quals 不会引用它们的输出。
-		 * 但需要包含连接自身的 rtindex，因为此时还未展开连接别名变量，
-		 * 上层可能会错误地认为不能引用该连接。
+		 * 计算当前子树的 relids。
+		 * 如果 JoinExpr 有别名 (rtindex)，必须包含它，防止上层错误判断引用可行性。
 		 */
 		*relids = bms_join(leftrelids, rightrelids);
 		if (j->rtindex)
@@ -372,19 +414,49 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 }
 
 /*
- * Recurse through top-level qual nodes for pull_up_sublinks()
+ * pull_up_sublinks_qual_recurse
+ *		递归遍历顶层 qual 节点以实现 pull_up_sublinks() 的逻辑。
  *
- * jtlink1 points to the link in the jointree where any new JoinExprs should
- * be inserted if they reference available_rels1 (i.e., available_rels1
- * denotes the relations present underneath jtlink1).  Optionally, jtlink2 can
- * point to a second link where new JoinExprs should be inserted if they
- * reference available_rels2 (pass NULL for both those arguments if not used).
- * Note that SubLinks referencing both sets of variables cannot be optimized.
- * If we find multiple pull-up-able SubLinks, they'll get stacked onto jtlink1
- * and/or jtlink2 in the order we encounter them.  We rely on subsequent
- * optimization to rearrange the stack if appropriate.
+ * 核心逻辑：
+ * 在 WHERE 或 JOIN/ON 子句中扫描 SubLink（如 IN, EXISTS），如果条件允许，
+ * 将其转化为 Semi Join (半连接) 或 Anti Join (反半连接)，并以此替换原来的 SubLink 表达式。
  *
- * Returns the replacement qual node, or NULL if the qual should be removed.
+ * 这种转换通常比针对每行扫描执行子查询要高效得多。
+ *
+ * 参数:
+ *	  root, node: 规划器信息和当前表达式节点。
+ *	  jtlink1/available_rels1: 指向连接树的一侧（通常是当前正在处理的关系层级）。
+ *	  jtlink2/available_rels2: 指向连接树的另一侧（如果是双侧 Join）。
+ *
+ * --- 下面是几种关键的子链接类型转换示例 ---
+ *
+ * 1. ANY_SUBLINK (IN 子查询) -> Semi Join
+ *    原始 SQL:
+ *        SELECT * FROM t1 WHERE t1.x IN (SELECT t2.y FROM t2);
+ *    内部 SubLink:
+ *        (x = ANY (SELECT y FROM t2))
+ *    转换后:
+ *        SELECT * FROM t1 Semi Join t2 ON t1.x = t2.y;
+ *
+ * 2. EXISTS_SUBLINK (EXISTS 子查询) -> Semi Join
+ *    原始 SQL:
+ *        SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t1.x = t2.y);
+ *    内部 SubLink:
+ *        EXISTS(SELECT 1 FROM t2 WHERE t1.x = t2.y)
+ *    转换后:
+ *        SELECT * FROM t1 Semi Join t2 ON t1.x = t2.y;
+ *
+ * 3. NOT EXISTS (反 EXISTS) -> Anti Join
+ *    原始 SQL:
+ *        SELECT * FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t1.x = t2.y);
+ *    内部 SubLink:
+ *        NOT(EXISTS(...))
+ *    转换后:
+ *        SELECT * FROM t1 Anti Join t2 ON t1.x = t2.y;
+ *
+ * 返回值：
+ *	  返回处理后的表达式树。如果 SubLink 被完全转化为 Join，
+ *    则原位置的过滤条件被移除（返回 NULL），因为它已经变成了 Join 的连接条件。
  */
 static Node *
 pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
@@ -399,24 +471,32 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 		JoinExpr   *j;
 		Relids		child_rels;
 
-		/* Is it a convertible ANY or EXISTS clause? */
+		/*
+		 * 情况 1: 处理 ANY 或 EXISTS 类型的子链接
+		 * 目标：尝试转换为 Semi Join (半连接)
+		 */
 		if (sublink->subLinkType == ANY_SUBLINK)
 		{
+			/*
+			 * 尝试针对 link1 侧的关系进行转换
+			 * 场景：WHERE t1.x IN (SELECT ...) 且 t1 在 available_rels1 中
+			 */
 			if ((j = convert_ANY_sublink_to_join(root, sublink,
 												 available_rels1)) != NULL)
 			{
-				/* Yes; insert the new join node into the join tree */
+				/* 转换成功! 构建新的 Join 节点并插入到 jtlink1 指向的位置 */
 				j->larg = *jtlink1;
 				*jtlink1 = (Node *) j;
-				/* Recursively process pulled-up jointree nodes */
+				
+				/* 递归处理刚刚提升上来的子查询部分 (j->rarg) */
 				j->rarg = pull_up_sublinks_jointree_recurse(root,
 															j->rarg,
 															&child_rels);
 
 				/*
-				 * Now recursively process the pulled-up quals.  Any inserted
-				 * joins can get stacked onto either j->larg or j->rarg,
-				 * depending on which rels they reference.
+				 * 递归处理新的 Join 节点的过滤条件 (quals)。
+				 * 为什么要递归？因为子查询里可能还有嵌套的子查询。
+				 * 新 Join 的条件可以引用左右两侧 (j->larg 和 j->rarg)。
 				 */
 				j->quals = pull_up_sublinks_qual_recurse(root,
 														 j->quals,
@@ -424,96 +504,82 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 														 available_rels1,
 														 &j->rarg,
 														 child_rels);
-				/* Return NULL representing constant TRUE */
+				
+				/* 返回 NULL，意味着原来的 IN (...) 条件不再作为 Filter 存在，而是变成了 Join */
 				return NULL;
 			}
+			/* 尝试针对 link2 侧的关系进行转换（为了处理复杂的 Join 树结构） */
 			if (available_rels2 != NULL &&
 				(j = convert_ANY_sublink_to_join(root, sublink,
 												 available_rels2)) != NULL)
 			{
-				/* Yes; insert the new join node into the join tree */
 				j->larg = *jtlink2;
 				*jtlink2 = (Node *) j;
-				/* Recursively process pulled-up jointree nodes */
 				j->rarg = pull_up_sublinks_jointree_recurse(root,
 															j->rarg,
 															&child_rels);
 
-				/*
-				 * Now recursively process the pulled-up quals.  Any inserted
-				 * joins can get stacked onto either j->larg or j->rarg,
-				 * depending on which rels they reference.
-				 */
 				j->quals = pull_up_sublinks_qual_recurse(root,
 														 j->quals,
 														 &j->larg,
 														 available_rels2,
 														 &j->rarg,
 														 child_rels);
-				/* Return NULL representing constant TRUE */
 				return NULL;
 			}
 		}
 		else if (sublink->subLinkType == EXISTS_SUBLINK)
 		{
+			/*
+			 * EXISTS 类型的逻辑几乎与 ANY 相同，只是使用 convert_EXISTS_sublink_to_join
+			 * 这里的 false 参数表示它是正向的 EXISTS（不是 NOT EXISTS）
+			 */
 			if ((j = convert_EXISTS_sublink_to_join(root, sublink, false,
 													available_rels1)) != NULL)
 			{
-				/* Yes; insert the new join node into the join tree */
 				j->larg = *jtlink1;
 				*jtlink1 = (Node *) j;
-				/* Recursively process pulled-up jointree nodes */
 				j->rarg = pull_up_sublinks_jointree_recurse(root,
 															j->rarg,
 															&child_rels);
 
-				/*
-				 * Now recursively process the pulled-up quals.  Any inserted
-				 * joins can get stacked onto either j->larg or j->rarg,
-				 * depending on which rels they reference.
-				 */
 				j->quals = pull_up_sublinks_qual_recurse(root,
 														 j->quals,
 														 &j->larg,
 														 available_rels1,
 														 &j->rarg,
 														 child_rels);
-				/* Return NULL representing constant TRUE */
 				return NULL;
 			}
 			if (available_rels2 != NULL &&
 				(j = convert_EXISTS_sublink_to_join(root, sublink, false,
 													available_rels2)) != NULL)
 			{
-				/* Yes; insert the new join node into the join tree */
 				j->larg = *jtlink2;
 				*jtlink2 = (Node *) j;
-				/* Recursively process pulled-up jointree nodes */
 				j->rarg = pull_up_sublinks_jointree_recurse(root,
 															j->rarg,
 															&child_rels);
 
-				/*
-				 * Now recursively process the pulled-up quals.  Any inserted
-				 * joins can get stacked onto either j->larg or j->rarg,
-				 * depending on which rels they reference.
-				 */
 				j->quals = pull_up_sublinks_qual_recurse(root,
 														 j->quals,
 														 &j->larg,
 														 available_rels2,
 														 &j->rarg,
 														 child_rels);
-				/* Return NULL representing constant TRUE */
 				return NULL;
 			}
 		}
-		/* Else return it unmodified */
+		/* 如果是其他类型的 SubLink (如标量子查询) 或无法转换，则保持原样 */
 		return node;
 	}
 	if (is_notclause(node))
 	{
-		/* If the immediate argument of NOT is EXISTS, try to convert */
+		/*
+		 * 情况 2: 处理 NOT EXISTS 类型的子链接
+		 * 目标：尝试转换为 Anti Join (反半连接)
+		 * node 是一个 NOT 表达式。
+		 */
 		SubLink    *sublink = (SubLink *) get_notclausearg((Expr *) node);
 		JoinExpr   *j;
 		Relids		child_rels;
@@ -522,65 +588,63 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 		{
 			if (sublink->subLinkType == EXISTS_SUBLINK)
 			{
+				/* 
+				 * 调用 convert_EXISTS_sublink_to_join，参数 true 表示 under_not。
+				 * 这将生成 Anti Join。
+				 */
 				if ((j = convert_EXISTS_sublink_to_join(root, sublink, true,
 														available_rels1)) != NULL)
 				{
-					/* Yes; insert the new join node into the join tree */
 					j->larg = *jtlink1;
 					*jtlink1 = (Node *) j;
-					/* Recursively process pulled-up jointree nodes */
 					j->rarg = pull_up_sublinks_jointree_recurse(root,
 																j->rarg,
 																&child_rels);
 
 					/*
-					 * Now recursively process the pulled-up quals.  Because
-					 * we are underneath a NOT, we can't pull up sublinks that
-					 * reference the left-hand stuff, but it's still okay to
-					 * pull up sublinks referencing j->rarg.
+					 * 关键点：对于 Anti Join (NOT EXISTS)，
+					 * 我们不能将引用左侧关系的 SubLink 上拉到这个 Join 的 quals 中。
+					 * 因为在 Anti Join 中，ON 条件过滤的是右表匹配行，
+					 * 而不是左表保留行。
+					 * 所以这里 jtlink1 传了 NULL，表示不允许引用左侧。
 					 */
 					j->quals = pull_up_sublinks_qual_recurse(root,
 															 j->quals,
 															 &j->rarg,
 															 child_rels,
 															 NULL, NULL);
-					/* Return NULL representing constant TRUE */
+					/* 返回 NULL (NOT EXISTS 条件已由 Anti Join 实现) */
 					return NULL;
 				}
 				if (available_rels2 != NULL &&
 					(j = convert_EXISTS_sublink_to_join(root, sublink, true,
 														available_rels2)) != NULL)
 				{
-					/* Yes; insert the new join node into the join tree */
 					j->larg = *jtlink2;
 					*jtlink2 = (Node *) j;
-					/* Recursively process pulled-up jointree nodes */
 					j->rarg = pull_up_sublinks_jointree_recurse(root,
 																j->rarg,
 																&child_rels);
 
-					/*
-					 * Now recursively process the pulled-up quals.  Because
-					 * we are underneath a NOT, we can't pull up sublinks that
-					 * reference the left-hand stuff, but it's still okay to
-					 * pull up sublinks referencing j->rarg.
-					 */
 					j->quals = pull_up_sublinks_qual_recurse(root,
 															 j->quals,
+															 &j->larg,
+															 available_rels2,
 															 &j->rarg,
-															 child_rels,
-															 NULL, NULL);
-					/* Return NULL representing constant TRUE */
+															 child_rels);
 					return NULL;
 				}
 			}
 		}
-		/* Else return it unmodified */
+		/* 否则原样返回 */
 		return node;
 	}
 	if (is_andclause(node))
 	{
-		/* Recurse into AND clause */
+		/*
+		 * 情况 3: 处理 AND 连接的多个条件
+		 * 递归处理 AND 列表中的每一个条件。
+		 */
 		List	   *newclauses = NIL;
 		ListCell   *l;
 
@@ -598,7 +662,7 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 			if (newclause)
 				newclauses = lappend(newclauses, newclause);
 		}
-		/* We might have got back fewer clauses than we started with */
+		/* 如果所有子句都被提升了（变为 Join），则返回 NULL；否则构造新的 AND */
 		if (newclauses == NIL)
 			return NULL;
 		else if (list_length(newclauses) == 1)
@@ -606,7 +670,7 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 		else
 			return (Node *) make_andclause(newclauses);
 	}
-	/* Stop if not an AND */
+	/* 如果不是 AND，停止递归 */
 	return node;
 }
 
@@ -662,17 +726,36 @@ inline_set_returning_functions(PlannerInfo *root)
  *		在范围表中查找可以提升到父查询中的子查询。
  *		如果子查询没有分组/聚合等特殊功能，我们可以将其合并到父查询的连接树中。
  *		此外，简单的 UNION ALL 结构的子查询可以转换为“追加关系”（append relations）。
+ *
+ *		此优化的目的是减少查询层级，给予优化器更多自由度来优化连接顺序。
+ *
+ *		例子 1：简单子查询合并 (Flattening)
+ *			原始查询：SELECT * FROM (SELECT * FROM t1 WHERE a=1) AS s JOIN t2 ON s.b=t2.b;
+ *			优化效果：逻辑上变为 SELECT * FROM t1 JOIN t2 ON t1.b=t2.b WHERE t1.a=1;
+ *			益处：消除子查询边界，允许优化器在 t1 和 t2 之间自由选择连接顺序。
+ *
+ *		例子 2：UNION ALL 展开 (Append Relations)
+ *			原始查询：SELECT * FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2) AS s WHERE s.a > 10;
+ *			优化效果：转换为 Append 计划，直接扫描 t1 和 t2，并将 s.a > 10 下推。
+ *			益处：避免物化中间结果，利用索引加速对基表的扫描。
  */
 void
 pull_up_subqueries(PlannerInfo *root)
 {
-	/* 连接树的顶层必须始终是一个 FromExpr */
+	/* 连接树的顶层必须始终是一个 FromExpr (通常对应 SELECT ... FROM ... WHERE ...) */
 	Assert(IsA(root->parse->jointree, FromExpr));
-	/* 递归开始时没有包含连接或追加关系 */
+
+	/* 
+	 * 递归遍历连接树，尝试提升子查询。
+	 * 初始状态下：
+	 * - lowest_outer_join_alias 为 NULL (不在外连接的右侧，可以自由提升)
+	 * - joinrelids 为 NULL (尚未进入连接关系)
+	 * - containing_appendrel 为 NULL (尚未进入 Append 关系)
+	 */
 	root->parse->jointree = (FromExpr *)
 		pull_up_subqueries_recurse(root, (Node *) root->parse->jointree,
 								   NULL, NULL, NULL);
-	/* 我们应该仍然有一个 FromExpr */
+	/* 优化及重写后，顶层结构应该仍然是一个 FromExpr */
 	Assert(IsA(root->parse->jointree, FromExpr));
 }
 
@@ -682,24 +765,27 @@ pull_up_subqueries(PlannerInfo *root)
  *
  * 此函数递归处理连接树并返回修改后的连接树。
  *
- * 如果此连接树节点位于外部连接的任一侧，则 lowest_outer_join 引用最低的此类 JoinExpr 节点；
- * 否则为 NULL。我们使用它来限制 LATERAL 子查询的影响。
+ * 参数说明:
+ *	 root: 规划器信息结构体。
+ *	 jtnode: 当前处理的连接树节点。
+ *	 lowest_outer_join: 如果此节点位于某个外部连接（Outer Join）的范围内（即在其 ON 子句或输出列表中），
+ *		则指向最低层级的那个 JoinExpr；否则为 NULL。这用于防止 LATERAL 子查询引用不该引用的变量。
+ *	 lowest_nulling_outer_join: 如果此节点位于可能为 NULL 的外部连接的一侧（例如 LEFT JOIN 的右侧），
+ *		则指向最低层级的那個 JoinExpr；否则为 NULL。这对于正确生成 PlaceHolderVar 至关重要，
+ *		确保在非 NULL 上下文中引用的变量被正确处理。
+ *	 containing_appendrel: 如果我们正在处理一个 Append Relation（由 UNION ALL 生成）的成员子查询，
+ *		这会指向描述该关系的结构体；否则为 NULL。
  *
- * 如果此连接树节点位于外部连接的可空侧，则 lowest_nulling_outer_join 引用最低的此类 JoinExpr 节点；
- * 否则为 NULL。这强制对非可空目标列表项的引用使用 PlaceHolderVar 机制，但仅针对该连接之上的引用。
+ * 处理逻辑:
+ *	 1. 简单子查询 (RTE_SUBQUERY): 尝试将其“扁平化”到当前查询层级。
+ *	 2. UNION ALL 子查询: 尝试将其转换为 Append Relation。
+ *	 3. VALUES 子句: 在某些条件下尝试展开。
+ *	 4. Still FromExpr/JoinExpr: 递归深入处理其子节点。
  *
- * 如果我们正在查看追加关系（append relation）的成员子查询，则 containing_appendrel 描述该关系；
- * 否则为 NULL。这强制对所有非 Var 目标列表项使用 PlaceHolderVar 机制，并对可以提升的内容施加一些额外限制。
- *
- * 此代码的一个棘手方面是，如果我们提升子查询，我们必须替换整个父查询中引用子查询输出的 Vars，
- * 包括附加到我们当前正在处理的节点之上的连接树节点的 quals！
- * 我们通过在递归时小心维护连接树结构的有效性来处理这个问题，具体如下：
- * 每当我们递归时，树中的所有 qual 表达式必须从顶层可达，以防递归调用需要修改它们。
- *
- * 还要注意，我们不能对整个连接树随意使用 pullup_replace_vars，因为它会返回树的变异副本；
- * 我们必须仅对 quals 调用它。这种行为使得将 lowest_outer_join 和 lowest_nulling_outer_join
- * 作为指针传递是合理的，而不是使用某种更间接的方式来标识最低的 OJs。
- * 同样，我们不替换 append_rel_list 成员，只替换它们的子结构，因此 containing_appendrel 引用是安全使用的。
+ * 变量替换 (Variable Replacement):
+ *	 当我们提升子查询时，必须在整个父查询中查找引用该子查询输出列的 Var 节点，
+ *	 并将它们替换为子查询内部对应的表达式。这项工作主要由 pull_up_simple_subquery 等辅助函数完成。
+ *	 此函数负责正确的递归遍历顺序，确保在修改其子节点之前，上层的结构是稳定的。
  */
 static Node *
 pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
@@ -707,9 +793,9 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 						   JoinExpr *lowest_nulling_outer_join,
 						   AppendRelInfo *containing_appendrel)
 {
-	/* 由于此函数递归调用，可能会导致堆栈溢出。 */
+	/* 由于此函数递归调用，可能会导致堆栈溢出，检查堆栈深度 */
 	check_stack_depth();
-	/* 此外，由于它有点昂贵，让我们检查查询取消。 */
+	/* 此外，由于它稍微有点昂贵，检查是否有查询取消信号 */
 	CHECK_FOR_INTERRUPTS();
 
 	Assert(jtnode != NULL);
@@ -719,9 +805,13 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 		RangeTblEntry *rte = rt_fetch(varno, root->parse->rtable);
 
 		/*
-		 * 这是一个子查询 RTE 吗？如果是，子查询是否简单到可以提升？
+		 * 情况 1: 这是一个子查询 RTE 吗？
+		 * 如果是，检查它是否足够简单以进行提升（Flattening）。
 		 *
-		 * 如果我们正在查看追加关系成员，除非 is_safe_append_member 允许，否则我们不能提升它。
+		 * 这里的 "简单 "通常意味着没有聚合、GROUP BY、ORDER BY ... LIMIT 等。
+		 * 
+		 * 如果我们正在处理追加关系成员 (UNION ALL 的一部分)，我们需要额外的检查 (is_safe_append_member)，
+		 * 以防止产生不正确的 PlaceHolderVar 行为。
 		 */
 		if (rte->rtekind == RTE_SUBQUERY &&
 			is_simple_subquery(root, rte->subquery, rte, lowest_outer_join) &&
@@ -733,20 +823,22 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 										   containing_appendrel);
 
 		/*
-		 * 或者，它是一个简单的 UNION ALL 子查询吗？如果是，将其展平为“追加关系”。
+		 * 情况 2: 它是一个简单的 UNION ALL 子查询吗？
+		 * 如果是，我们不进行扁平化，而是将其展开为“追加关系” (Append Relation)。
 		 *
-		 * 无论此查询本身是否为追加关系成员，这样做都是安全的。
-		 * （如果你认为我们应该尝试将两层追加关系展平在一起，你是对的；
-		 * 但我们在 set_append_rel_pathlist 中处理这个问题，而不是在这里。）
+		 * Append Relation 允许优化器将每个 UNION 分支视为独立的路径进行规划，
+		 * 然后将结果合并。这比将整个 UNION ALL 结果视为一个黑盒要高效得多。
 		 */
 		if (rte->rtekind == RTE_SUBQUERY &&
 			is_simple_union_all(rte->subquery))
 			return pull_up_simple_union_all(root, jtnode, rte);
 
 		/*
-		 * 或者也许它是一个简单的 VALUES RTE？
+		 * 情况 3: 它是一个简单的 VALUES RTE 吗？
 		 *
-		 * 我们不允许 VALUES 提升到外部连接下方或追加关系中（目前这些情况无论如何都是不可能的）。
+		 * 我们可以将简单的 VALUES 子句（例如 `FROM (VALUES (1),(2)) v(x)`）提升，
+		 * 就像提升 constant SELECT 一样，这有助于后续的常量折叠等优化。
+		 * 注意：我们不允许将 VALUES 提升到外部连接的可空侧下方，或者在 Append Relation 中。
 		 */
 		if (rte->rtekind == RTE_VALUES &&
 			lowest_outer_join == NULL &&
@@ -754,15 +846,16 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 			is_simple_values(root, rte))
 			return pull_up_simple_values(root, jtnode, rte);
 
-		/* 否则，在此节点不做任何操作。 */
+		/* 否则，无法提升，保持节点不变。 */
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
 		FromExpr   *f = (FromExpr *) jtnode;
 		ListCell   *l;
 
+		/* FromExpr 不应该出现在 AppendRelation 内部 */
 		Assert(containing_appendrel == NULL);
-		/* 递归转换所有子节点 */
+		/* 递归处理 FROM 列表中的所有子项 */
 		foreach(l, f->fromlist)
 		{
 			lfirst(l) = pull_up_subqueries_recurse(root, lfirst(l),
@@ -776,10 +869,15 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 		JoinExpr   *j = (JoinExpr *) jtnode;
 
 		Assert(containing_appendrel == NULL);
-		/* 递归，小心地告诉自己何时在外部连接内部 */
+		/* 
+		 * 递归处理 JOIN 的左右两侧。
+		 * 根据 JOIN 类型，我们需要传递正确的 lowest_outer_join 和 lowest_nulling_outer_join。
+		 * 这些参数告知下层节点它们处于何种外连接上下文中。
+		 */
 		switch (j->jointype)
 		{
 			case JOIN_INNER:
+				/* 内连接不改变 Nullable 上下文 */
 				j->larg = pull_up_subqueries_recurse(root, j->larg,
 													 lowest_outer_join,
 													 lowest_nulling_outer_join,
@@ -792,6 +890,11 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 			case JOIN_LEFT:
 			case JOIN_SEMI:
 			case JOIN_ANTI:
+				/* 
+				 * 对于左连接 (及其变体)，左侧上下文不变。
+				 * 右侧现在处于此连接 (j) 的可空侧，因此 lowest_nulling_outer_join 变为 j。
+				 * lowest_outer_join 也变为 j，因为右侧在 LATERAL 引用上也受到此连接的限制。
+				 */
 				j->larg = pull_up_subqueries_recurse(root, j->larg,
 													 j,
 													 lowest_nulling_outer_join,
@@ -802,6 +905,7 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 													 NULL);
 				break;
 			case JOIN_FULL:
+				/* 全外连接两侧都变为可空侧 */
 				j->larg = pull_up_subqueries_recurse(root, j->larg,
 													 j,
 													 j,
@@ -812,6 +916,7 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 													 NULL);
 				break;
 			case JOIN_RIGHT:
+				/* 右连接与左连接相反 */
 				j->larg = pull_up_subqueries_recurse(root, j->larg,
 													 j,
 													 j,
@@ -835,15 +940,13 @@ pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 
 /*
  * pull_up_simple_subquery
- *		Attempt to pull up a single simple subquery.
+ *		尝试提升单个简单子查询。
  *
- * jtnode is a RangeTblRef that has been tentatively identified as a simple
- * subquery by pull_up_subqueries.  We return the replacement jointree node,
- * or jtnode itself if we determine that the subquery can't be pulled up
- * after all.
+ * jtnode 是已经被 pull_up_subqueries 初步识别为简单子查询的 RangeTblRef。
+ * 我们返回替换后的连接树节点；如果最终确定该子查询无法提升，则返回 jtnode 本身。
  *
- * rte is the RangeTblEntry referenced by jtnode.  Remaining parameters are
- * as for pull_up_subqueries_recurse.
+ * rte 是 jtnode 引用的 RangeTblEntry。
+ * 其余参数与 pull_up_subqueries_recurse 相同。
  */
 static Node *
 pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
@@ -860,19 +963,17 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	ListCell   *lc;
 
 	/*
-	 * Need a modifiable copy of the subquery to hack on.  Even if we didn't
-	 * sometimes choose not to pull up below, we must do this to avoid
-	 * problems if the same subquery is referenced from multiple jointree
-	 * items (which can't happen normally, but might after rule rewriting).
+	 * 需要子查询的一个可修改副本以进行处理。
+	 * 即使我们在下面决定不提升，我们也必须这样做，以避免如果同一个子查询被多个连接树项引用时出现问题
+	 * （这在正常情况下不会发生，但在规则重写后可能会发生）。
 	 */
 	subquery = copyObject(rte->subquery);
 
 	/*
-	 * Create a PlannerInfo data structure for this subquery.
+	 * 为此子查询创建一个 PlannerInfo 数据结构。
 	 *
-	 * NOTE: the next few steps should match the first processing in
-	 * subquery_planner().  Can we refactor to avoid code duplication, or
-	 * would that just make things uglier?
+	 * 注意：接下来的几个步骤应与 subquery_planner() 中的初始处理相匹配。
+	 * 我们是否可以重构以避免代码重复，或者那只会让事情变得更糟？
 	 */
 	subroot = makeNode(PlannerInfo);
 	subroot->parse = subquery;
@@ -899,97 +1000,84 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	subroot->wt_param_id = -1;
 	subroot->non_recursive_path = NULL;
 
-	/* No CTEs to worry about */
+	/* 无需担心 CTE */
 	Assert(subquery->cteList == NIL);
 
 	/*
-	 * If the FROM clause is empty, replace it with a dummy RTE_RESULT RTE, so
-	 * that we don't need so many special cases to deal with that situation.
+	 * 如果 FROM 子句为空，将其替换为虚拟的 RTE_RESULT RTE，
+	 * 这样我们就不需要处理那么多特殊情况了。
 	 */
 	replace_empty_jointree(subquery);
 
 	/*
-	 * Pull up any SubLinks within the subquery's quals, so that we don't
-	 * leave unoptimized SubLinks behind.
+	 * 提升子查询 quals 中的任何 SubLink，以免留下未优化的 SubLink。
 	 */
 	if (subquery->hasSubLinks)
 		pull_up_sublinks(subroot);
 
 	/*
-	 * Similarly, inline any set-returning functions in its rangetable.
+	 * 同样，内联其范围表中的任何集合返回函数。
 	 */
 	inline_set_returning_functions(subroot);
 
 	/*
-	 * Recursively pull up the subquery's subqueries, so that
-	 * pull_up_subqueries' processing is complete for its jointree and
-	 * rangetable.
+	 * 递归提升子查询的子查询，以便 pull_up_subqueries 对其连接树和范围表的处理完成。
 	 *
-	 * Note: it's okay that the subquery's recursion starts with NULL for
-	 * containing-join info, even if we are within an outer join in the upper
-	 * query; the lower query starts with a clean slate for outer-join
-	 * semantics.  Likewise, we needn't pass down appendrel state.
+	 * 注意：即使我们在上层查询的外部连接中，子查询的递归以 containing-join info 为 NULL 开始也是可以的；
+	 * 下层查询以外部连接语义的空白开始。同样，我们不需要向下传递 appendrel 状态。
 	 */
 	pull_up_subqueries(subroot);
 
 	/*
-	 * Now we must recheck whether the subquery is still simple enough to pull
-	 * up.  If not, abandon processing it.
+	 * 现在我们必须重新检查子查询是否仍然足够简单以进行提升。如果不是，放弃处理它。
 	 *
-	 * We don't really need to recheck all the conditions involved, but it's
-	 * easier just to keep this "if" looking the same as the one in
-	 * pull_up_subqueries_recurse.
+	 * 我们实际上不需要重新检查所有涉及的条件，但为了保持这个“if”与
+	 * pull_up_subqueries_recurse 中的看起来一样，这样做更容易。
 	 */
 	if (is_simple_subquery(root, subquery, rte, lowest_outer_join) &&
 		(containing_appendrel == NULL || is_safe_append_member(subquery)))
 	{
-		/* good to go */
+		/* 可以继续 */
 	}
 	else
 	{
 		/*
-		 * Give up, return unmodified RangeTblRef.
+		 * 放弃，返回未修改的 RangeTblRef。
 		 *
-		 * Note: The work we just did will be redone when the subquery gets
-		 * planned on its own.  Perhaps we could avoid that by storing the
-		 * modified subquery back into the rangetable, but I'm not gonna risk
-		 * it now.
+		 * 注意：当子查询单独进行规划时，我们刚刚所做的工作将重做。
+		 * 也许我们可以通过将修改后的子查询存回范围表来避免这种情况，但我现在不想冒这个险。
 		 */
 		return jtnode;
 	}
 
 	/*
-	 * We must flatten any join alias Vars in the subquery's targetlist,
-	 * because pulling up the subquery's subqueries might have changed their
-	 * expansions into arbitrary expressions, which could affect
-	 * pullup_replace_vars' decisions about whether PlaceHolderVar wrappers
-	 * are needed for tlist entries.  (Likely it'd be better to do
-	 * flatten_join_alias_vars on the whole query tree at some earlier stage,
-	 * maybe even in the rewriter; but for now let's just fix this case here.)
+	 * 我们必须扁平化子查询目标列表中的任何连接别名 Vars，
+	 * 因为提升子查询的子查询可能已将其扩展为任意表达式，这可能会影响
+	 * pullup_replace_vars 关于是否需要 PlaceHolderVar 包装器的决策。
+	 * （可能最好在早期阶段，甚至在重写器中对整个查询树进行 flatten_join_alias_vars；
+	 * 但现在让我们就在这里修复这种情况。）
 	 */
 	subquery->targetList = (List *)
 		flatten_join_alias_vars(subroot->parse, (Node *) subquery->targetList);
 
 	/*
-	 * Adjust level-0 varnos in subquery so that we can append its rangetable
-	 * to upper query's.  We have to fix the subquery's append_rel_list as
-	 * well.
+	 * 调整子查询中的 level-0 varnos，以便我们可以将其范围表追加到上层查询的范围表。
+	 * 我们还必须修复子查询的 append_rel_list。
 	 */
 	rtoffset = list_length(parse->rtable);
 	OffsetVarNodes((Node *) subquery, rtoffset, 0);
 	OffsetVarNodes((Node *) subroot->append_rel_list, rtoffset, 0);
 
 	/*
-	 * Upper-level vars in subquery are now one level closer to their parent
-	 * than before.
+	 * 子查询中的上层变量现在比以前更接近其父级一层。
 	 */
 	IncrementVarSublevelsUp((Node *) subquery, -1, 1);
 	IncrementVarSublevelsUp((Node *) subroot->append_rel_list, -1, 1);
 
 	/*
-	 * The subquery's targetlist items are now in the appropriate form to
-	 * insert into the top query, except that we may need to wrap them in
-	 * PlaceHolderVars.  Set up required context data for pullup_replace_vars.
+	 * 子查询的目标列表项现在处于适合插入到顶层查询的形式，
+	 * 除了我们可能需要将它们包装在 PlaceHolderVars 中。
+	 * 为 pullup_replace_vars 设置所需的上下文数据。
 	 */
 	rvcontext.root = root;
 	rvcontext.targetlist = subquery->targetList;
@@ -997,11 +1085,11 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	if (rte->lateral)
 		rvcontext.relids = get_relids_in_jointree((Node *) subquery->jointree,
 												  true);
-	else						/* won't need relids */
+	else						/* 不需要 relids */
 		rvcontext.relids = NULL;
 	rvcontext.outer_hasSubLinks = &parse->hasSubLinks;
 	rvcontext.varno = varno;
-	/* these flags will be set below, if needed */
+	/* 这些标志将在下面根据需要设置 */
 	rvcontext.need_phvs = false;
 	rvcontext.wrap_non_vars = false;
 	/* initialize cache array with indexes 0 .. length(tlist) */
@@ -1009,18 +1097,15 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 								 sizeof(Node *));
 
 	/*
-	 * If we are under an outer join then non-nullable items and lateral
-	 * references may have to be turned into PlaceHolderVars.
+	 * 如果我们在外部连接下，则非可空项和 lateral 引用可能必须转换为 PlaceHolderVars。
 	 */
 	if (lowest_nulling_outer_join != NULL)
 		rvcontext.need_phvs = true;
 
 	/*
-	 * If we are dealing with an appendrel member then anything that's not a
-	 * simple Var has to be turned into a PlaceHolderVar.  We force this to
-	 * ensure that what we pull up doesn't get merged into a surrounding
-	 * expression during later processing and then fail to match the
-	 * expression actually available from the appendrel.
+	 * 如果我们正在处理 appendrel 成员，那么任何不是简单 Var 的东西都必须转换为 PlaceHolderVar。
+	 * 我们强制这样做是为了确保我们提升的内容不会在以后的处理中合并到周围的表达式中，
+	 * 从而无法匹配从 appendrel 实际可用的表达式。
 	 */
 	if (containing_appendrel != NULL)
 	{
@@ -1029,13 +1114,10 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	}
 
 	/*
-	 * If the parent query uses grouping sets, we need a PlaceHolderVar for
-	 * anything that's not a simple Var.  Again, this ensures that expressions
-	 * retain their separate identity so that they will match grouping set
-	 * columns when appropriate.  (It'd be sufficient to wrap values used in
-	 * grouping set columns, and do so only in non-aggregated portions of the
-	 * tlist and havingQual, but that would require a lot of infrastructure
-	 * that pullup_replace_vars hasn't currently got.)
+	 * 如果父查询使用分组集，我们需要为任何不是简单 Var 的东西使用 PlaceHolderVar。
+	 * 同样，这确保表达式保持其独立身份，以便在适当时匹配分组集列。
+	 * （仅包装分组集列中使用的值，并且仅在 tlist 和 havingQual 的非聚合部分中这样做就足够了，
+	 * 但这需要 pullup_replace_vars 目前尚未具备的大量基础设施。）
 	 */
 	if (parse->groupingSets)
 	{
@@ -1044,13 +1126,11 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	}
 
 	/*
-	 * Replace all of the top query's references to the subquery's outputs
-	 * with copies of the adjusted subtlist items, being careful not to
-	 * replace any of the jointree structure. (This'd be a lot cleaner if we
-	 * could use query_tree_mutator.)  We have to use PHVs in the targetList,
-	 * returningList, and havingQual, since those are certainly above any
-	 * outer join.  replace_vars_in_jointree tracks its location in the
-	 * jointree and uses PHVs or not appropriately.
+	 * 将顶层查询中对子查询输出的所有引用替换为调整后的子列表项的副本，
+	 * 小心不要替换任何连接树结构。（如果我们可以使用 query_tree_mutator，这会更干净。）
+	 * 我们必须在 targetList、returningList 和 havingQual 中使用 PHV，
+	 * 因为这些肯定在任何外部连接之上。
+	 * replace_vars_in_jointree 跟踪其在连接树中的位置，并适当地使用 PHV 或不使用。
 	 */
 	parse->targetList = (List *)
 		pullup_replace_vars((Node *) parse->targetList, &rvcontext);
@@ -1066,8 +1146,8 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 								&rvcontext);
 
 		/*
-		 * We assume ON CONFLICT's arbiterElems, arbiterWhere, exclRelTlist
-		 * can't contain any references to a subquery
+		 * 我们假设 ON CONFLICT 的 arbiterElems、arbiterWhere、exclRelTlist
+		 * 不包含任何对子查询的引用
 		 */
 	}
 	replace_vars_in_jointree((Node *) parse->jointree, &rvcontext,
@@ -1076,11 +1156,9 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	parse->havingQual = pullup_replace_vars(parse->havingQual, &rvcontext);
 
 	/*
-	 * Replace references in the translated_vars lists of appendrels. When
-	 * pulling up an appendrel member, we do not need PHVs in the list of the
-	 * parent appendrel --- there isn't any outer join between. Elsewhere, use
-	 * PHVs for safety.  (This analysis could be made tighter but it seems
-	 * unlikely to be worth much trouble.)
+	 * 替换 appendrels 的 translated_vars 列表中的引用。
+	 * 当提升 appendrel 成员时，我们不需要父 appendrel 列表中的 PHV —— 它们之间没有任何外部连接。
+	 * 在其他地方，使用 PHV 为了安全。（这个分析可以做得更紧密，但似乎不值得那么多麻烦。）
 	 */
 	foreach(lc, root->append_rel_list)
 	{
@@ -1095,13 +1173,11 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	}
 
 	/*
-	 * Replace references in the joinaliasvars lists of join RTEs.
+	 * 替换连接 RTE 的 joinaliasvars 列表中的引用。
 	 *
-	 * You might think that we could avoid using PHVs for alias vars of joins
-	 * below lowest_nulling_outer_join, but that doesn't work because the
-	 * alias vars could be referenced above that join; we need the PHVs to be
-	 * present in such references after the alias vars get flattened.  (It
-	 * might be worth trying to be smarter here, someday.)
+	 * 你可能认为我们可以避免对 lowest_nulling_outer_join 下方的连接别名变量使用 PHV，
+	 * 但这是行不通的，因为别名变量可能会在该连接上方被引用；
+	 * 在别名变量被展平后，我们需要 PHV 出现在此类引用中。（也许有一天值得尝试在这里更聪明一点。）
 	 */
 	foreach(lc, parse->rtable)
 	{
@@ -1114,11 +1190,9 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	}
 
 	/*
-	 * If the subquery had a LATERAL marker, propagate that to any of its
-	 * child RTEs that could possibly now contain lateral cross-references.
-	 * The children might or might not contain any actual lateral
-	 * cross-references, but we have to mark the pulled-up child RTEs so that
-	 * later planner stages will check for such.
+	 * 如果子查询有 LATERAL 标记，将其传播到其任何可能现在包含 lateral 交叉引用的子 RTE。
+	 * 子 RTE 可能包含也可能不包含任何实际的 lateral 交叉引用，
+	 * 但我们必须标记提升后的子 RTE，以便以后的规划阶段检查这些引用。
 	 */
 	if (rte->lateral)
 	{
@@ -1142,35 +1216,32 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 				case RTE_CTE:
 				case RTE_NAMEDTUPLESTORE:
 				case RTE_RESULT:
-					/* these can't contain any lateral references */
+					/* 这些不可能包含任何 lateral 引用 */
 					break;
 			}
 		}
 	}
 
 	/*
-	 * Now append the adjusted rtable entries to upper query. (We hold off
-	 * until after fixing the upper rtable entries; no point in running that
-	 * code on the subquery ones too.)
+	 * 现在将调整后的范围表条目追加到上层查询。（我们在修复上层范围表条目后再做，
+	 * 没有必要在子查询的条目上也运行该代码。）
 	 */
 	parse->rtable = list_concat(parse->rtable, subquery->rtable);
 
 	/*
-	 * Pull up any FOR UPDATE/SHARE markers, too.  (OffsetVarNodes already
-	 * adjusted the marker rtindexes, so just concat the lists.)
+	 * 也提升任何 FOR UPDATE/SHARE 标记。（OffsetVarNodes 已经调整了标记 rtindexes，
+	 * 所以只需连接列表。）
 	 */
 	parse->rowMarks = list_concat(parse->rowMarks, subquery->rowMarks);
 
 	/*
-	 * We also have to fix the relid sets of any PlaceHolderVar nodes in the
-	 * parent query.  (This could perhaps be done by pullup_replace_vars(),
-	 * but it seems cleaner to use two passes.)  Note in particular that any
-	 * PlaceHolderVar nodes just created by pullup_replace_vars() will be
-	 * adjusted, so having created them with the subquery's varno is correct.
+	 * 我们还必须修复父查询中任何 PlaceHolderVar 节点的 relid 集。
+	 * （这也许可以通过 pullup_replace_vars() 完成，但使用两遍扫描似乎更清晰。）
+	 * 特别注意，pullup_replace_vars() 刚刚创建的任何 PlaceHolderVar 节点都会被调整，
+	 * 所以用子查询的 varno 创建它们是正确的。
 	 *
-	 * Likewise, relids appearing in AppendRelInfo nodes have to be fixed. We
-	 * already checked that this won't require introducing multiple subrelids
-	 * into the single-slot AppendRelInfo structs.
+	 * 同样，出现在 AppendRelInfo 节点中的 relids 也必须修复。
+	 * 我们之前已经检查过，这不会需要在单槽 AppendRelInfo 结构中引入多个 subrelids。
 	 */
 	if (parse->hasSubLinks || root->glob->lastPHId != 0 ||
 		root->append_rel_list)
@@ -1183,14 +1254,14 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	}
 
 	/*
-	 * And now add subquery's AppendRelInfos to our list.
+	 * 现在将子查询的 AppendRelInfos 添加到我们的列表中。
 	 */
 	root->append_rel_list = list_concat(root->append_rel_list,
 										subroot->append_rel_list);
 
 	/*
-	 * We don't have to do the equivalent bookkeeping for outer-join info,
-	 * because that hasn't been set up yet.  placeholder_list likewise.
+	 * 我们不需要为 outer-join info 做类似的簿记，因为它还没有建立。
+	 * placeholder_list 也是如此。
 	 */
 	Assert(root->join_info_list == NIL);
 	Assert(subroot->join_info_list == NIL);
@@ -1198,28 +1269,25 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	Assert(subroot->placeholder_list == NIL);
 
 	/*
-	 * Miscellaneous housekeeping.
+	 * 杂项清理工作。
 	 *
-	 * Although replace_rte_variables() faithfully updated parse->hasSubLinks
-	 * if it copied any SubLinks out of the subquery's targetlist, we still
-	 * could have SubLinks added to the query in the expressions of FUNCTION
-	 * and VALUES RTEs copied up from the subquery.  So it's necessary to copy
-	 * subquery->hasSubLinks anyway.  Perhaps this can be improved someday.
+	 * 虽然如果从子查询的目标列表中复制了任何 SubLink，replace_rte_variables() 会忠实地更新 parse->hasSubLinks，
+	 * 但我们仍然可能会因为从子查询复制上来的 FUNCTION 和 VALUES RTE 的表达式中增加了 SubLinks。
+	 * 所以无论如何都有必要复制 subquery->hasSubLinks。也许这一天可以改进。
 	 */
 	parse->hasSubLinks |= subquery->hasSubLinks;
 
-	/* If subquery had any RLS conditions, now main query does too */
+	/* 如果子查询有任何 RLS 条件，现在主查询也有 */
 	parse->hasRowSecurity |= subquery->hasRowSecurity;
 
 	/*
-	 * subquery won't be pulled up if it hasAggs, hasWindowFuncs, or
-	 * hasTargetSRFs, so no work needed on those flags
+	 * 如果有 hasAggs, hasWindowFuncs 或 hasTargetSRFs，子查询将不会被提升，
+	 * 所以不需要在这些标志上做任何工作
 	 */
 
-	/*
-	 * Return the adjusted subquery jointree to replace the RangeTblRef entry
-	 * in parent's jointree; or, if the FromExpr is degenerate, just return
-	 * its single member.
+	 /*
+	 * 返回调整后的子查询连接树以替换父连接树中的 RangeTblRef 条目；
+	 * 或者，如果 FromExpr 只有一个成员，只返回它的单个成员。
 	 */
 	Assert(IsA(subquery->jointree, FromExpr));
 	Assert(subquery->jointree->fromlist != NIL);
@@ -1409,42 +1477,48 @@ make_setop_translation_list(Query *query, Index newvarno,
 
 /*
  * is_simple_subquery
- *	  Check a subquery in the range table to see if it's simple enough
- *	  to pull up into the parent query.
+ *	  检查范围表（RangeTable）中的子查询是否足够简单，能够被提升（pull up）到父查询中。
  *
- * rte is the RTE_SUBQUERY RangeTblEntry that contained the subquery.
- * (Note subquery is not necessarily equal to rte->subquery; it could be a
- * processed copy of that.)
- * lowest_outer_join is the lowest outer join above the subquery, or NULL.
+ *	  所谓的“提升”，指的是将子查询的结构（FROM, WHERE 等）合并到父查询中，
+ *	  从而消除子查询的边界。这通常能让优化器有更多的连接顺序选择。
+ *
+ * 参数:
+ *	  rte: 包含子查询的 RTE_SUBQUERY 类型的 RangeTblEntry。
+ *	  subquery: 具体的查询树 (Query 结构体)。注意它不一定等于 rte->subquery；
+ *				可能是它的一个经过处理的副本。
+ *	  lowest_outer_join: 子查询之上的最低层外部连接（Outer Join），如果没有则为 NULL。
+ *                       用于检查 LATERAL 引用的安全性。
  */
 static bool
 is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 				   JoinExpr *lowest_outer_join)
 {
 	/*
-	 * Let's just make sure it's a valid subselect ...
+	 * 首先确保它是一个有效的 SELECT 子查询 ...
 	 */
 	if (!IsA(subquery, Query) ||
 		subquery->commandType != CMD_SELECT)
 		elog(ERROR, "subquery is bogus");
 
 	/*
-	 * Can't currently pull up a query with setops (unless it's simple UNION
-	 * ALL, which is handled by a different code path). Maybe after querytree
-	 * redesign...
+	 * 目前无法提升包含集合操作（Set Operations，如 UNION, INTERSECT, EXCEPT）的查询。
+	 * （除非它是简单的 UNION ALL，那种情况由不同的代码路径处理，见 pull_up_simple_union_all）。
+	 * 也许在未来的查询树重构后可以支持更多情况...
 	 */
 	if (subquery->setOperations)
 		return false;
 
 	/*
-	 * Can't pull up a subquery involving grouping, aggregation, SRFs,
-	 * sorting, limiting, or WITH.  (XXX WITH could possibly be allowed later)
+	 * 无法提升涉及分组、聚合、窗口函数、集合返回函数 (SRF)、
+	 * 排序、限制 (LIMIT) 或 CTE (WITH) 的子查询。
+	 * (XXX WITH 将来可能会被允许)
 	 *
-	 * We also don't pull up a subquery that has explicit FOR UPDATE/SHARE
-	 * clauses, because pullup would cause the locking to occur semantically
-	 * higher than it should.  Implicit FOR UPDATE/SHARE is okay because in
-	 * that case the locking was originally declared in the upper query
-	 * anyway.
+	 * 如果子查询有显式的 FOR UPDATE/SHARE 子句，我们也无法提升，
+	 * 因为提升会导致锁定操作发生在语义上比原本应该发生的层级更高的地方。
+	 * 隐式的 FOR UPDATE/SHARE 是可以的，因为这种情况下锁定原本就在上层查询中声明了。
+	 *
+	 * 简而言之，这些特性通常意味着子查询定义了一个特定的数据集边界或计算顺序，
+	 * 打破这个边界会改变查询的语义。
 	 */
 	if (subquery->hasAggs ||
 		subquery->hasWindowFuncs ||
@@ -1461,15 +1535,18 @@ is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 		return false;
 
 	/*
-	 * Don't pull up if the RTE represents a security-barrier view; we
-	 * couldn't prevent information leakage once the RTE's Vars are scattered
-	 * about in the upper query.
+	 * 如果 RTE 代表一个安全屏障（security-barrier）视图（例如使用了 security_barrier 选项的视图），
+	 * 则不要提升。
+	 * 
+	 * 原因：如果提升了视图，视图内部的 WHERE 条件和上层查询的 WHERE 条件混杂在一起，
+	 * 优化器可能会重排执行顺序，导致上层用户定义的（可能是恶意的）函数在视图过滤条件之前执行，
+	 * 从而泄露本应被视图隐藏的数据。
 	 */
 	if (rte->security_barrier)
 		return false;
 
 	/*
-	 * If the subquery is LATERAL, check for pullup restrictions from that.
+	 * 如果子查询是 LATERAL 的（即它可以引用同层级之前的表），检查基于此的提升限制。
 	 */
 	if (rte->lateral)
 	{
@@ -1477,13 +1554,12 @@ is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 		Relids		safe_upper_varnos;
 
 		/*
-		 * The subquery's WHERE and JOIN/ON quals mustn't contain any lateral
-		 * references to rels outside a higher outer join (including the case
-		 * where the outer join is within the subquery itself).  In such a
-		 * case, pulling up would result in a situation where we need to
-		 * postpone quals from below an outer join to above it, which is
-		 * probably completely wrong and in any case is a complication that
-		 * doesn't seem worth addressing at the moment.
+		 * 子查询的 WHERE 和 JOIN/ON 条件绝不能包含任何指向“高于某个外部连接”的外部表的 LATERAL 引用。
+		 * （即使该外部连接位于子查询本身内部，也算作这种情况，不过这里主要关注 lowest_outer_join）。
+		 *
+		 * 如果存在这种情况，提升子查询会导致我们需要将位于外部连接下方的条件推迟到外部连接上方执行，
+		 * 这在逻辑上可能是完全错误的（例如，破坏了外连接的语义），
+		 * 无论如何这是一个复杂的问题，目前不值得为了解决它而增加复杂性。
 		 */
 		if (lowest_outer_join != NULL)
 		{
@@ -1494,7 +1570,7 @@ is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 		else
 		{
 			restricted = false;
-			safe_upper_varnos = NULL;	/* doesn't matter */
+			safe_upper_varnos = NULL;	/* 并不重要 */
 		}
 
 		if (jointree_contains_lateral_outer_refs(root,
@@ -1503,17 +1579,16 @@ is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 			return false;
 
 		/*
-		 * If there's an outer join above the LATERAL subquery, also disallow
-		 * pullup if the subquery's targetlist has any references to rels
-		 * outside the outer join, since these might get pulled into quals
-		 * above the subquery (but in or below the outer join) and then lead
-		 * to qual-postponement issues similar to the case checked for above.
-		 * (We wouldn't need to prevent pullup if no such references appear in
-		 * outer-query quals, but we don't have enough info here to check
-		 * that.  Also, maybe this restriction could be removed if we forced
-		 * such refs to be wrapped in PlaceHolderVars, even when they're below
-		 * the nearest outer join?	But it's a pretty hokey usage, so not
-		 * clear this is worth sweating over.)
+		 * 如果 LATERAL 子查询上方存在外部连接，并且子查询的目标列表（TargetList）
+		 * 包含任何指向该外部连接之外的表的引用，也禁止提升。
+		 *
+		 * 因为这些引用可能会被拉取到子查询上方的条件中（但在外部连接内部或下方），
+		 * 从而导致类似于上述检查的“条件推迟”问题。
+		 *
+		 * （如果在外部查询的条件中没有出现此类引用，我们其实不需要阻止提升，
+		 * 但我们在这里没有足够的信息来检查这一点。
+		 * 另外，如果我们强制将此类引用包装在 PlaceHolderVars 中，即使它们位于最近的外部连接下方，
+		 * 也许可以移除此限制？但这用法相当奇怪，不确定是否值得通过努力来支持。）
 		 */
 		if (lowest_outer_join != NULL)
 		{
@@ -1527,12 +1602,14 @@ is_simple_subquery(PlannerInfo *root, Query *subquery, RangeTblEntry *rte,
 	}
 
 	/*
-	 * Don't pull up a subquery that has any volatile functions in its
-	 * targetlist.  Otherwise we might introduce multiple evaluations of these
-	 * functions, if they get copied to multiple places in the upper query,
-	 * leading to surprising results.  (Note: the PlaceHolderVar mechanism
-	 * doesn't quite guarantee single evaluation; else we could pull up anyway
-	 * and just wrap such items in PlaceHolderVars ...)
+	 * 不要提升任何在其目标列表中包含易变（volatile）函数的子查询。
+	 *
+	 * 原因：易变函数（如 random(), timeofday()）每次调用结果可能不同。
+	 * 提升后，原本在子查询中只计算一次的表达式，可能会被复制到上层查询的多个位置，
+	 * 导致多次评估，从而产生令人惊讶的结果（例如，WHERE random() < 0.5 AND random() > 0.5）。
+	 *
+	 * （注意：PlaceHolderVar 机制并不能完全保证单次评估；
+	 * 否则我们本可以提升它并通过 PlaceHolderVars 包装这些项目...）
 	 */
 	if (contain_volatile_functions((Node *) subquery->targetList))
 		return false;
@@ -2262,17 +2339,20 @@ pullup_replace_vars_subquery(Query *query,
 
 /*
  * flatten_simple_union_all
- *		Try to optimize top-level UNION ALL structure into an appendrel
+ *		尝试将顶层 UNION ALL 结构优化为 appendrel（追加关系）
  *
- * If a query's setOperations tree consists entirely of simple UNION ALL
- * operations, flatten it into an append relation, which we can process more
- * intelligently than the general setops case.  Otherwise, do nothing.
+ * 如果一个查询的 setOperations 树完全由简单的 UNION ALL 操作组成，
+ * 则将其扁平化为 append relation，这样我们可以比一般集合操作更智能地处理它。
+ * 否则，什么也不做。
  *
- * In most cases, this can succeed only for a top-level query, because for a
- * subquery in FROM, the parent query's invocation of pull_up_subqueries would
- * already have flattened the UNION via pull_up_simple_union_all.  But there
- * are a few cases we can support here but not in that code path, for example
- * when the subquery also contains ORDER BY.
+ * 在大多数情况下，这只能对顶层查询成功，因为对于 FROM 中的子查询，
+ * 父查询调用 pull_up_subqueries 时，通常已经通过 pull_up_simple_union_all 扁平化了 UNION。
+ * 但这里我们支持一些那个代码路径不支持的情况，例如当子查询还包含 ORDER BY 时。
+ *
+ * 例如：
+ * SELECT * FROM t1 UNION ALL SELECT * FROM t2 ORDER BY a;
+ * 这里的 UNION ALL 可以被转换为一个 append relation，允许我们对 t1 和 t2 分别进行扫描，
+ * 然后合并结果，而不是先计算 UNION ALL 的结果集再排序。
  */
 void
 flatten_simple_union_all(PlannerInfo *root)
@@ -2286,24 +2366,25 @@ flatten_simple_union_all(PlannerInfo *root)
 	RangeTblEntry *childRTE;
 	RangeTblRef *rtr;
 
-	/* Shouldn't be called unless query has setops */
+	/* 除非查询有 setops，否则不应该调用 */
 	topop = castNode(SetOperationStmt, parse->setOperations);
 	Assert(topop);
 
-	/* Can't optimize away a recursive UNION */
+	/* 无法优化递归 UNION (WITH RECURSIVE) */
 	if (root->hasRecursion)
 		return;
 
 	/*
-	 * Recursively check the tree of set operations.  If not all UNION ALL
-	 * with identical column types, punt.
+	 * 递归检查集合操作树。如果不是所有列类型相同的 UNION ALL，则放弃。
 	 */
 	if (!is_simple_union_all_recurse((Node *) topop, parse, topop->colTypes))
 		return;
 
 	/*
-	 * Locate the leftmost leaf query in the setops tree.  The upper query's
-	 * Vars all refer to this RTE (see transformSetOperationStmt).
+	 * 定位 setops 树中最左边的叶子查询。上层查询的 Vars 都引用此 RTE (参见 transformSetOperationStmt)。
+	 *
+	 * 在 UNION ALL 树中，最左侧的叶子节点具有特殊的地位，因为它的 RangeTblEntry (RTE)
+	 * 最初被用作整个 UNION ALL 结果的每一个列的“代表”。
 	 */
 	leftmostjtnode = topop->larg;
 	while (leftmostjtnode && IsA(leftmostjtnode, SetOperationStmt))
@@ -2314,25 +2395,33 @@ flatten_simple_union_all(PlannerInfo *root)
 	Assert(leftmostRTE->rtekind == RTE_SUBQUERY);
 
 	/*
-	 * Make a copy of the leftmost RTE and add it to the rtable.  This copy
-	 * will represent the leftmost leaf query in its capacity as a member of
-	 * the appendrel.  The original will represent the appendrel as a whole.
-	 * (We must do things this way because the upper query's Vars have to be
-	 * seen as referring to the whole appendrel.)
+	 * 制作最左边 RTE 的副本并将其添加到 rtable。
+	 * 此副本将代表最左边的叶子查询作为 appendrel 的成员。
+	 * 原始 RTE 将代表整个 appendrel。
+	 * (我们必须这样做，因为上层查询的 Vars 必须被视为引用整个 appendrel。)
+	 *
+	 * 举例:
+	 * 原始: SELECT * FROM t1 UNION ALL SELECT * FROM t2;
+	 * 转换期间:
+	 * 我们创建一个新的 RTE 来专门代表 t1 (作为子节点)，而原来的 RTE 现在变成了
+	 * 代表 (t1 UNION ALL t2) 这个整体结构的“父”节点。
 	 */
 	childRTE = copyObject(leftmostRTE);
 	parse->rtable = lappend(parse->rtable, childRTE);
 	childRTI = list_length(parse->rtable);
 
-	/* Modify the setops tree to reference the child copy */
+	/* 修改 setops 树以引用子副本 */
 	((RangeTblRef *) leftmostjtnode)->rtindex = childRTI;
 
-	/* Modify the formerly-leftmost RTE to mark it as an appendrel parent */
+	/* 修改原来最左边的 RTE 以将其标记为 appendrel 父级 */
 	leftmostRTE->inh = true;
 
 	/*
-	 * Form a RangeTblRef for the appendrel, and insert it into FROM.  The top
-	 * Query of a setops tree should have had an empty FromClause initially.
+	 * 为 appendrel 形成一个 RangeTblRef，并将其插入到 FROM 中。
+	 * setops 树的顶层 Query 最初应该有一个空的 FromClause。
+	 *
+	 * 这一步有效地将 "SELECT ... FROM (t1 UNION ALL t2)" 中的集合操作结构
+	 * 转换为了 "SELECT ... FROM append_rel_parent" 的形式。
 	 */
 	rtr = makeNode(RangeTblRef);
 	rtr->rtindex = leftmostRTI;
@@ -2340,16 +2429,20 @@ flatten_simple_union_all(PlannerInfo *root)
 	parse->jointree->fromlist = list_make1(rtr);
 
 	/*
-	 * Now pretend the query has no setops.  We must do this before trying to
-	 * do subquery pullup, because of Assert in pull_up_simple_subquery.
+	 * 现在假装查询没有 setops。我们必须在尝试进行子查询提升之前这样做，
+	 * 因为 pull_up_simple_subquery 中有 Assert。
+	 *
+	 * 通过将 setOperations 置为 NULL，我们告诉规划器的后续部分：
+	 * "这不是一个集合操作查询了，这是一个普通的扫描查询（扫描一个追加关系）"。
 	 */
 	parse->setOperations = NULL;
 
 	/*
-	 * Build AppendRelInfo information, and apply pull_up_subqueries to the
-	 * leaf queries of the UNION ALL.  (We must do that now because they
-	 * weren't previously referenced by the jointree, and so were missed by
-	 * the main invocation of pull_up_subqueries.)
+	 * 构建 AppendRelInfo 信息，并将 pull_up_subqueries 应用于 UNION ALL 的叶子查询。
+	 * (我们必须现在做，因为它们以前没有被 jointree 引用，因此被 pull_up_subqueries 的主调用错过了。)
+	 *
+	 * 这一步是核心：它遍历 UNION ALL 树的每个分支，为每个分支创建一个 AppendRelInfo，
+	 * 告诉优化器："这个分支是 appendrel 父级的一个成员"。
 	 */
 	pull_up_union_leaf_queries((Node *) topop, root, leftmostRTI, parse, 0);
 }

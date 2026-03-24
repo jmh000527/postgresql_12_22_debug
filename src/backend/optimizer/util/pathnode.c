@@ -3343,12 +3343,12 @@ create_groupingsets_path(PlannerInfo *root,
 
 /*
  * create_minmaxagg_path
- *	  Creates a pathnode that represents computation of MIN/MAX aggregates
+ *	  创建一个表示 MIN/MAX 聚合计算的路径节点
  *
- * 'rel' is the parent relation associated with the result
- * 'target' is the PathTarget to be computed
- * 'mmaggregates' is a list of MinMaxAggInfo structs
- * 'quals' is the HAVING quals if any
+ * 'rel' 是与结果关联的父关系
+ * 'target' 是要计算的 PathTarget
+ * 'mmaggregates' 是 MinMaxAggInfo 结构体的列表
+ * 'quals' 是 HAVING 条件（如果有）
  */
 MinMaxAggPath *
 create_minmaxagg_path(PlannerInfo *root,
@@ -3361,24 +3361,24 @@ create_minmaxagg_path(PlannerInfo *root,
 	Cost		initplan_cost;
 	ListCell   *lc;
 
-	/* The topmost generated Plan node will be a Result */
+	/* 最顶层生成的 Plan 节点将是一个 Result */
 	pathnode->path.pathtype = T_Result;
 	pathnode->path.parent = rel;
 	pathnode->path.pathtarget = target;
-	/* For now, assume we are above any joins, so no parameterization */
+	/* 目前假设我们位于所有连接之上，因此没有参数化 */
 	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
-	/* A MinMaxAggPath implies use of initplans, so cannot be parallel-safe */
+	/* MinMaxAggPath 意味着使用 initplans，因此不能是并行安全的 */
 	pathnode->path.parallel_safe = false;
 	pathnode->path.parallel_workers = 0;
-	/* Result is one unordered row */
+	/* 结果是一行无序数据 */
 	pathnode->path.rows = 1;
 	pathnode->path.pathkeys = NIL;
 
 	pathnode->mmaggregates = mmaggregates;
 	pathnode->quals = quals;
 
-	/* Calculate cost of all the initplans ... */
+	/* 计算所有 initplans 的成本 ... */
 	initplan_cost = 0;
 	foreach(lc, mmaggregates)
 	{
@@ -3387,14 +3387,14 @@ create_minmaxagg_path(PlannerInfo *root,
 		initplan_cost += mminfo->pathcost;
 	}
 
-	/* add tlist eval cost for each output row, plus cpu_tuple_cost */
+	/* 为每行输出添加 tlist 评估成本，加上 cpu_tuple_cost */
 	pathnode->path.startup_cost = initplan_cost + target->cost.startup;
 	pathnode->path.total_cost = initplan_cost + target->cost.startup +
 		target->cost.per_tuple + cpu_tuple_cost;
 
 	/*
-	 * Add cost of qual, if any --- but we ignore its selectivity, since our
-	 * rowcount estimate should be 1 no matter what the qual is.
+	 * 添加 qual 的成本（如果有）--- 但我们忽略其选择性，
+	 * 因为无论 qual 是什么，我们的行数估计都应该是 1。
 	 */
 	if (quals)
 	{

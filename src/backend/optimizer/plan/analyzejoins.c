@@ -499,16 +499,20 @@ remove_rel_from_joinlist(List *joinlist, int relid, int *nremoved)
 
 /*
  * reduce_unique_semijoins
- *		Check for semijoins that can be simplified to plain inner joins
- *		because the inner relation is provably unique for the join clauses.
+ *		尝试将半连接（Semi Join）转换为普通的内连接（Inner Join）。
+ *		这通常发生在其内关系在连接条件上可被证明是唯一的情况下。
  *
- * Ideally this would happen during reduce_outer_joins, but we don't have
- * enough information at that point.
+ * 理想情况下，这一步应该在 reduce_outer_joins 期间进行，但那时我们还没有
+ * 足够的信息。
  *
- * To perform the strength reduction when applicable, we need only delete
- * the semijoin's SpecialJoinInfo from root->join_info_list.  (We don't
- * bother fixing the join type attributed to it in the query jointree,
- * since that won't be consulted again.)
+ * 当适用这种强度削减（strength reduction）时，我们只需要从 root->join_info_list
+ * 中删除该半连接的 SpecialJoinInfo。
+ * （我们无需费心去修改查询连接树中归属于它的连接类型，因为后续不会再查询该信息。）
+ *
+ * 如果我们可以证明在连接条件下，右表（内表）对于左表的任意一行最多只有一个匹配项（即右表在连接键上是唯一的），那么：
+ * 1、右表没有重复匹配，内连接不会导致左表行膨胀。
+ * 2、半连接的“去重”特性在这里自然满足。
+ * 在这种情况下，半连接在逻辑上完全等价于内连接。优化器将其转换为内连接后，可以利用更多常规的连接优化策略。
  */
 void
 reduce_unique_semijoins(PlannerInfo *root)
@@ -517,8 +521,9 @@ reduce_unique_semijoins(PlannerInfo *root)
 	ListCell   *next;
 
 	/*
-	 * Scan the join_info_list to find semijoins.  We can't use foreach
-	 * because we may delete the current cell.
+	 * 遍历连接列表，查找半连接（Semi Join）。
+	 * 扫描 join_info_list 以查找 semi-joins。我们不能使用 foreach，
+	 * 因为我们可能会删除当前的单元格。
 	 */
 	for (lc = list_head(root->join_info_list); lc != NULL; lc = next)
 	{
@@ -531,50 +536,68 @@ reduce_unique_semijoins(PlannerInfo *root)
 		next = lnext(lc);
 
 		/*
-		 * Must be a non-delaying semijoin to a single baserel, else we aren't
-		 * going to be able to do anything with it.  (It's probably not
-		 * possible for delay_upper_joins to be set on a semijoin, but we
-		 * might as well check.)
+		 * 必须是指向单个基础关系（baserel）的非延迟半连接，否则我们无法对其进行
+		 * 任何操作。（对于半连接来说，delay_upper_joins 大概是不可能被设置的，
+		 * 但我们不妨检查一下。）
 		 */
 		if (sjinfo->jointype != JOIN_SEMI ||
 			sjinfo->delay_upper_joins)
 			continue;
 
+		/* sjinfo->min_righthand 必须是一个单一的基础表（Baserel）。
+		 * 目前的逻辑不支持右侧是复杂子查询或连接的情况。
+		 */
 		if (!bms_get_singleton_member(sjinfo->min_righthand, &innerrelid))
 			continue;
 
+		/* 查找内关系的 RelOptInfo 结构体 */
 		innerrel = find_base_rel(root, innerrelid);
 
 		/*
-		 * Before we trouble to run generate_join_implied_equalities, make a
-		 * quick check to eliminate cases in which we will surely be unable to
-		 * prove uniqueness of the innerrel.
+		 * 在我们费力运行 generate_join_implied_equalities 之前，先做一个快速检查，
+		 * 以排除那些我们肯定无法证明内关系唯一性的情况。
+		 *
+		 * 检查右表是否有支持唯一性的性质（例如是否有唯一索引、主键等）。
+		 * 如果这个表连一个唯一索引都没有，那就没必要进行后面复杂的检查了，直接跳过。
 		 */
 		if (!rel_supports_distinctness(root, innerrel))
 			continue;
 
-		/* Compute the relid set for the join we are considering */
+		/* 计算我们正在考虑的连接的关系ID集合 */
 		joinrelids = bms_union(sjinfo->min_lefthand, sjinfo->min_righthand);
 
 		/*
-		 * Since we're only considering a single-rel RHS, any join clauses it
-		 * has must be clauses linking it to the semijoin's min_lefthand.  We
-		 * can also consider EC-derived join clauses.
+		 * restrictlist 收集了所有连接条件，
+		 * 包括从等价类（Equivalence Class）推导出的隐含相等条件，以及直接写在 ON 子句中的条件。
+		 *
+		 * 由于我们只考虑右侧是单个关系的情况，它所拥有的任何连接子句必然是
+		 * 将其链接到半连接的 min_lefthand 的子句。我们还可以考虑由等价类（EC）
+		 * 派生的连接子句。
 		 */
 		restrictlist =
 			list_concat(generate_join_implied_equalities(root,
 														 joinrelids,
 														 sjinfo->min_lefthand,
-														 innerrel),
-						innerrel->joininfo);
+														 innerrel), innerrel->joininfo);
 
-		/* Test whether the innerrel is unique for those clauses. */
+		/*
+		 * 测试内关系是否对于这些子句是唯一的
+		 * 它会检查连接条件是否使用了右表的所有唯一索引列（或主键列）。
+		 *
+		 * 例子：如果 Semi Join 是 ON left.id = right.pk，且 pk 是 right 表的主键，
+		 * 那么对于任意 left.id，最多只能找到一个 right 行。此时函数返回 true。
+		 */
 		if (!innerrel_is_unique(root,
 								joinrelids, sjinfo->min_lefthand, innerrel,
 								JOIN_SEMI, restrictlist, true))
 			continue;
 
-		/* OK, remove the SpecialJoinInfo from the list. */
+		/*
+		 * 好的，从列表中移除该 SpecialJoinInfo
+		 * 这是优化生效的一步。
+		 * PostgreSQL 的规划器通过 join_info_list 来追踪外连接和半连接。
+		 * 移除 sjinfo 后，规划器在后续步骤中就不再把这个连接视为 Semi Join，而是当作普通的 Inner Join 来规划。
+		 */
 		root->join_info_list = list_delete_ptr(root->join_info_list, sjinfo);
 	}
 }
@@ -582,29 +605,26 @@ reduce_unique_semijoins(PlannerInfo *root)
 
 /*
  * rel_supports_distinctness
- *		Could the relation possibly be proven distinct on some set of columns?
+ *		判断该关系是否可能在某些列集合上被证明是唯一的。
  *
- * This is effectively a pre-checking function for rel_is_distinct_for().
- * It must return true if rel_is_distinct_for() could possibly return true
- * with this rel, but it should not expend a lot of cycles.  The idea is
- * that callers can avoid doing possibly-expensive processing to compute
- * rel_is_distinct_for()'s argument lists if the call could not possibly
- * succeed.
+ * 这是一个 rel_is_distinct_for() 的预检查函数。
+ * 如果 rel_is_distinct_for() 可能对此关系返回 true，则此函数必须返回 true，
+ * 但它不应消耗大量 CPU 周期。
+ * 其目的是让调用者在调用不可能成功的情况下，避免执行可能耗时的处理来计算
+ * rel_is_distinct_for() 的参数列表。
  */
 static bool
 rel_supports_distinctness(PlannerInfo *root, RelOptInfo *rel)
 {
-	/* We only know about baserels ... */
+	/* 我们只了解基础关系（baserels）... */
 	if (rel->reloptkind != RELOPT_BASEREL)
 		return false;
 	if (rel->rtekind == RTE_RELATION)
 	{
 		/*
-		 * For a plain relation, we only know how to prove uniqueness by
-		 * reference to unique indexes.  Make sure there's at least one
-		 * suitable unique index.  It must be immediately enforced, and not a
-		 * partial index. (Keep these conditions in sync with
-		 * relation_has_unique_index_for!)
+		 * 对于普通关系，我们只知道如何通过引用唯一索引来证明唯一性。
+		 * 确保至少存在一个合适的唯一索引。它必须是立即强制执行的（immediate），
+		 * 且不是部分索引。（请保持这些条件与 relation_has_unique_index_for 同步！）
 		 */
 		ListCell   *lc;
 
@@ -620,11 +640,11 @@ rel_supports_distinctness(PlannerInfo *root, RelOptInfo *rel)
 	{
 		Query	   *subquery = root->simple_rte_array[rel->relid]->subquery;
 
-		/* Check if the subquery has any qualities that support distinctness */
+		/* 检查子查询是否具有任何支持唯一性的性质 */
 		if (query_supports_distinctness(subquery))
 			return true;
 	}
-	/* We have no proof rules for any other rtekinds. */
+	/* 对于任何其他 rtekind，我们没有证明规则。 */
 	return false;
 }
 

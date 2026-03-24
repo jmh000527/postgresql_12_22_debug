@@ -2300,27 +2300,26 @@ typedef enum
 } PartitionwiseAggregateType;
 
 /*
- * Struct for extra information passed to subroutines of create_grouping_paths
+ * 传递给 create_grouping_paths 子程序的额外信息结构体
  *
- * flags indicating what kinds of grouping are possible.
- * partial_costs_set is true if the agg_partial_costs and agg_final_costs
- * 		have been initialized.
- * agg_partial_costs gives partial aggregation costs.
- * agg_final_costs gives finalization costs.
- * target_parallel_safe is true if target is parallel safe.
- * havingQual gives list of quals to be applied after aggregation.
- * targetList gives list of columns to be projected.
- * patype is the type of partitionwise aggregation that is being performed.
+ * flags 指示可能的聚合方式（HASHED, SORTED, PARTIAL 等）。
+ * 如果 agg_partial_costs 和 agg_final_costs 已被初始化，则 partial_costs_set 为 true。
+ * agg_partial_costs 给出执行部分聚合（Partial Aggregation）的成本。
+ * agg_final_costs 给出执行最终聚合（Finalization）的成本。
+ * 如果目标列表（TargetList）是并行安全的，则 target_parallel_safe 为 true。
+ * havingQual 给出聚合后要应用的过滤条件（HAVING 子句）。
+ * targetList 给出要投影的列列表。
+ * patype 是正在执行的分区聚合类型。
  */
 typedef struct
 {
-	/* Data which remains constant once set. */
+	/* 设置后保持不变的数据。 */
 	int			flags;
 	bool		partial_costs_set;
 	AggClauseCosts agg_partial_costs;
 	AggClauseCosts agg_final_costs;
 
-	/* Data which may differ across partitions. */
+	/* 可能因分区而异的数据。 */
 	bool		target_parallel_safe;
 	Node	   *havingQual;
 	List	   *targetList;

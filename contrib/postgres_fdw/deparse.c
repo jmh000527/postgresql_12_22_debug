@@ -92,17 +92,16 @@ typedef struct foreign_loc_cxt
 } foreign_loc_cxt;
 
 /*
- * Context for deparseExpr
+ * deparseExpr 的上下文
  */
 typedef struct deparse_expr_cxt
 {
-	PlannerInfo *root;			/* global planner state */
-	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
-	RelOptInfo *scanrel;		/* the underlying scan relation. Same as
-								 * foreignrel, when that represents a join or
-								 * a base relation. */
-	StringInfo	buf;			/* output buffer to append to */
-	List	  **params_list;	/* exprs that will become remote Params */
+	PlannerInfo *root;			/* 全局规划器状态 */
+	RelOptInfo *foreignrel;		/* 我们正在为其规划的外部关系 */
+	RelOptInfo *scanrel;		/* 底层扫描关系。当 foreignrel 代表
+								 * 连接或基础关系时，与之相同。 */
+	StringInfo	buf;			/* 要追加到的输出缓冲区 */
+	List	  **params_list;	/* 将成为远程参数的表达式 */
 } deparse_expr_cxt;
 
 #define REL_ALIAS_PREFIX	"r"
@@ -1093,17 +1092,14 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
- * Construct a simple SELECT statement that retrieves desired columns
- * of the specified foreign table, and append it to "buf".  The output
- * contains just "SELECT ... ".
+ * 构建一个简单的 SELECT 语句，检索指定外部表的所需列，
+ * 并将其追加到 "buf" 中。输出仅包含 "SELECT ... "。
  *
- * We also create an integer List of the columns being retrieved, which is
- * returned to *retrieved_attrs, unless we deparse the specified relation
- * as a subquery.
+ * 我们还会创建一个正在检索的列的整数列表，并将其返回给 *retrieved_attrs，
+ * 除非我们将指定的关系解析为子查询。
  *
- * tlist is the list of desired columns.  is_subquery is the flag to
- * indicate whether to deparse the specified relation as a subquery.
- * Read prologue of deparseSelectStmtForRel() for details.
+ * tlist 是所需列的列表。is_subquery 是指示是否将指定关系解析为子查询的标志。
+ * 详情请阅读 deparseSelectStmtForRel() 的序言。
  */
 static void
 deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
@@ -1115,38 +1111,34 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) foreignrel->fdw_private;
 
 	/*
-	 * Construct SELECT list
+	 * 构建 SELECT 列表
 	 */
 	appendStringInfoString(buf, "SELECT ");
 
 	if (is_subquery)
 	{
 		/*
-		 * For a relation that is deparsed as a subquery, emit expressions
-		 * specified in the relation's reltarget.  Note that since this is for
-		 * the subquery, no need to care about *retrieved_attrs.
+		 * 对于解析为子查询的关系，发出关系 reltarget 中指定的表达式。
+		 * 注意，既然这是针对子查询的，无需关心 *retrieved_attrs。
 		 */
 		deparseSubqueryTargetList(context);
 	}
 	else if (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel))
 	{
 		/*
-		 * For a join or upper relation the input tlist gives the list of
-		 * columns required to be fetched from the foreign server.
+		 * 对于连接或上层关系，输入 tlist 给出了需要从外部服务器获取的列的列表。
 		 */
 		deparseExplicitTargetList(tlist, false, retrieved_attrs, context);
 	}
 	else
 	{
 		/*
-		 * For a base relation fpinfo->attrs_used gives the list of columns
-		 * required to be fetched from the foreign server.
+		 * 对于基础关系，fpinfo->attrs_used 给出了需要从外部服务器获取的列的列表。
 		 */
 		RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
 
 		/*
-		 * Core code already has some lock on each rel being planned, so we
-		 * can use NoLock here.
+		 * 核心代码已经对每个正在规划的关系持有某种锁，所以我们在这里可以使用 NoLock。
 		 */
 		Relation	rel = table_open(rte->relid, NoLock);
 
@@ -2292,9 +2284,39 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 }
 
 /*
- * Append remote name of specified foreign table to buf.
- * Use value of table_name FDW option (if any) instead of relation's name.
- * Similarly, schema_name FDW option overrides schema name.
+ * 将指定外部表的远程名称追加到 buf 中。
+ *
+ * 如果存在 FDW 选项 table_name，则使用其值代替关系本身的名称。
+ * 同样，FDW 选项 schema_name 会覆盖模式名称。
+ *
+ * 示例 1 (映射情况 - 本地表名与远程表名不同):
+ *   SQL 上下文:
+ *     CREATE SERVER my_server FOREIGN DATA WRAPPER postgres_fdw ...;
+ *     CREATE SCHEMA app_data;
+ *     CREATE FOREIGN TABLE app_data.customers (
+ *         id integer,
+ *         name text
+ *     )
+ *     SERVER my_server
+ *     OPTIONS (schema_name 'legacy_sys', table_name 't_cust');
+ *
+ *   当查询 "SELECT * FROM app_data.customers" 执行时:
+ *     输入 rel: 本地表 app_data.customers
+ *     输出 buf: "legacy_sys"."t_cust"
+ *     生成的完整远程 SQL: SELECT id, name FROM "legacy_sys"."t_cust"
+ *
+ * 示例 2 (默认情况 - 使用本地名称):
+ *   SQL 上下文:
+ *     CREATE FOREIGN TABLE public.users (
+ *         id integer,
+ *         name text
+ *     )
+ *     SERVER my_server;
+ *
+ *   当查询 "SELECT * FROM public.users" 执行时:
+ *     输入 rel: 本地表 public.users
+ *     输出 buf: "public"."users"
+ *     生成的完整远程 SQL: SELECT id, name FROM "public"."users"
  */
 static void
 deparseRelation(StringInfo buf, Relation rel)
@@ -2304,11 +2326,13 @@ deparseRelation(StringInfo buf, Relation rel)
 	const char *relname = NULL;
 	ListCell   *lc;
 
-	/* obtain additional catalog information. */
+	/* 根据关系的 OID 获取外部表的目录信息（包括选项） */
 	table = GetForeignTable(RelationGetRelid(rel));
 
 	/*
-	 * Use value of FDW options if any, instead of the name of object itself.
+	 * 遍历外部表选项。如果有 FDW 选项指定了 schema_name 或 table_name，
+	 * 则使用这些选项值代替本地对象本身的名称。
+	 * 这是为了允许本地表名与远程表名不同。
 	 */
 	foreach(lc, table->options)
 	{
@@ -2321,14 +2345,17 @@ deparseRelation(StringInfo buf, Relation rel)
 	}
 
 	/*
-	 * Note: we could skip printing the schema name if it's pg_catalog, but
-	 * that doesn't seem worth the trouble.
+	 * 如果没有在选项中找到 schema_name，则默认使用本地表的模式名。
+	 * 注意：如果它是 pg_catalog，我们可以跳过打印模式名称，但这似乎不值得麻烦。
 	 */
 	if (nspname == NULL)
 		nspname = get_namespace_name(RelationGetNamespace(rel));
+	
+	/* 如果没有在选项中找到 table_name，则默认使用本地表的表名。 */
 	if (relname == NULL)
 		relname = RelationGetRelationName(rel);
 
+	/* 将最终确定的 模式名.表名 追加到 SQL 缓冲区，并对其进行引用（加引号），防止特殊字符或关键字冲突 */
 	appendStringInfo(buf, "%s.%s",
 					 quote_identifier(nspname), quote_identifier(relname));
 }

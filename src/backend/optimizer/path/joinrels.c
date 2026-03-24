@@ -724,9 +724,10 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
  *   restrictlist - 连接的限制条件列表
  *
  * 功能说明：
- *   该函数根据连接类型，为joinrel填充可能的执行路径。针对不同的连接类型（内连接、左连接、
- *   全连接、半连接、反连接），函数会考虑输入关系的不同组合（rel1为外表/内表，rel2为内表/外表）
- *   并添加相应的路径。同时，函数还会处理特殊情况如空关系、恒假条件等进行优化。
+ *   主要作用是为两个输入关系（rel1 和 rel2）生成所有可能的连接路径（Join Paths）。
+ *	 简单来说，当数据库决定要连接表 A 和表 B 时，这个函数会根据连接类型（Inner、Left、Full 等），
+ *	 尝试生成 Nested Loop（嵌套循环）、Merge Join（归并连接）、Hash Join（哈希连接）等具体的执行计划，
+ *   并处理一些特殊的优化场景（如表为空的情况）。
  *
  *   函数会根据连接类型和输入关系的特性，执行以下操作：
  *   1. 检查输入关系是否为空或连接条件是否恒假
@@ -770,7 +771,10 @@ populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
 								 restrictlist);
 			break;
 		case JOIN_LEFT: /* 左连接处理 */
-			/* 左连接：外表为空或下推条件恒 FALSE，则结果为空 */
+			/*
+			 * 只看左表判空：不同于内连接，左连接中如果右表 (table_b) 为空，查询结果不为空（会返回左表数据，右边补 NULL）。
+			 * 所以代码里只检查 is_dummy_rel(rel1)（左表）。如果左表为空，整个结果才为空。
+			 * */
 			if (is_dummy_rel(rel1) ||
 				restriction_is_constant_false(restrictlist, joinrel, true))
 			{
@@ -816,6 +820,8 @@ populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
 			/*
 			 * 可能是普通半连接，也可能 RHS 可唯一化后做普通连接（见 join_is_legal 注释）。
 			 * 后者不能用 JOIN_SEMI 方式。
+			 *
+			 * bms_is_subset 确保当前的两个表 (rel1 和 rel2) 确实包含了半连接所需的左侧和右侧所有关系。
 			 */
 			if (bms_is_subset(sjinfo->min_lefthand, rel1->relids) &&
 				bms_is_subset(sjinfo->min_righthand, rel2->relids))
@@ -834,6 +840,9 @@ populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
 			/*
 			 * 如果 RHS 可唯一化且输入关系正好是 RHS，则可以唯一化后做普通连接。
 			 * （create_unique_path 检查可能与 join_is_legal 重复，但有缓存，故仍检查。）
+			 *
+			 * 如果右表（子查询部分）可以通过某种方式保证唯一性，那么“半连接”在语义上就等价于“普通内连接”。
+			 *
 			 */
 			if (bms_equal(sjinfo->syn_righthand, rel2->relids) &&
 				create_unique_path(root, rel2, rel2->cheapest_total_path,

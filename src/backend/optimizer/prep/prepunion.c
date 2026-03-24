@@ -144,12 +144,6 @@ plan_set_operations(PlannerInfo *root)
 	Assert(leftmostQuery != NULL);                  /* 断言子查询存在 */
 
 	/*
-	 * Propagate hint from leftmost query to all other queries.
-	 */
-	if (leftmostQuery->hint)
-		propagate_hint_to_queries(root, (Node *) topop, leftmostQuery->hint);
-
-	/*
 	 * 为每个叶级子查询（它们是此查询中的RTE_SUBQUERY类型的范围表条目）
 	 * 构建RelOptInfos结构。为此，我们需要准备索引数组。
 	 */

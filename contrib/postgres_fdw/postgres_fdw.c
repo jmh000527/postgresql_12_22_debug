@@ -1172,7 +1172,7 @@ postgresGetForeignPaths(PlannerInfo *root,
 
 /*
  * postgresGetForeignPlan
- *		Create ForeignScan plan node which implements selected best path
+ *		创建一个 ForeignScan 计划节点，实现选定的最佳路径
  */
 static ForeignScan *
 postgresGetForeignPlan(PlannerInfo *root,
@@ -1198,7 +1198,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 	ListCell   *lc;
 
 	/*
-	 * Get FDW private data created by postgresGetForeignUpperPaths(), if any.
+	 * 获取由 postgresGetForeignUpperPaths() 创建的 FDW 私有数据（如果有）。
 	 */
 	if (best_path->fdw_private)
 	{
@@ -1211,34 +1211,29 @@ postgresGetForeignPlan(PlannerInfo *root,
 	if (IS_SIMPLE_REL(foreignrel))
 	{
 		/*
-		 * For base relations, set scan_relid as the relid of the relation.
+		 * 对于基础关系，将 scan_relid 设置为关系的 relid。
 		 */
 		scan_relid = foreignrel->relid;
 
 		/*
-		 * In a base-relation scan, we must apply the given scan_clauses.
+		 * 在基础关系扫描中，我们必须应用给定的 scan_clauses。
 		 *
-		 * Separate the scan_clauses into those that can be executed remotely
-		 * and those that can't.  baserestrictinfo clauses that were
-		 * previously determined to be safe or unsafe by classifyConditions
-		 * are found in fpinfo->remote_conds and fpinfo->local_conds. Anything
-		 * else in the scan_clauses list will be a join clause, which we have
-		 * to check for remote-safety.
+		 * 将 scan_clauses 分为可以在远程执行的和不能在远程执行的。
+		 * 之前由 classifyConditions 确定为安全或不安全的 baserestrictinfo 子句
+		 * 可以在 fpinfo->remote_conds 和 fpinfo->local_conds 中找到。
+		 * scan_clauses 列表中的其他任何内容都将是连接子句，我们必须检查其远程安全性。
 		 *
-		 * Note: the join clauses we see here should be the exact same ones
-		 * previously examined by postgresGetForeignPaths.  Possibly it'd be
-		 * worth passing forward the classification work done then, rather
-		 * than repeating it here.
+		 * 注意：我们在这里看到的连接子句应该与之前由 postgresGetForeignPaths 检查的完全相同。
+		 * 可能值得传递当时所做的分类工作，而不是在这里重复。
 		 *
-		 * This code must match "extract_actual_clauses(scan_clauses, false)"
-		 * except for the additional decision about remote versus local
-		 * execution.
+		 * 此代码必须与 "extract_actual_clauses(scan_clauses, false)" 匹配，
+		 * 除了关于远程与本地执行的额外决定。
 		 */
 		foreach(lc, scan_clauses)
 		{
 			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-			/* Ignore any pseudoconstants, they're dealt with elsewhere */
+			/* 忽略任何伪常量，它们在别处处理 */
 			if (rinfo->pseudoconstant)
 				continue;
 
@@ -1253,68 +1248,59 @@ postgresGetForeignPlan(PlannerInfo *root,
 		}
 
 		/*
-		 * For a base-relation scan, we have to support EPQ recheck, which
-		 * should recheck all the remote quals.
+		 * 对于基础关系扫描，我们必须支持 EPQ 重检查，所有的远程条件都应该被重新检查。
 		 */
 		fdw_recheck_quals = remote_exprs;
 	}
 	else
 	{
 		/*
-		 * Join relation or upper relation - set scan_relid to 0.
+		 * 连接关系或上层关系 - 将 scan_relid 设置为 0。
 		 */
 		scan_relid = 0;
 
 		/*
-		 * For a join rel, baserestrictinfo is NIL and we are not considering
-		 * parameterization right now, so there should be no scan_clauses for
-		 * a joinrel or an upper rel either.
+		 * 对于连接关系，baserestrictinfo 为 NIL，并且我们目前不考虑参数化，
+		 * 所以连接关系或上层关系也不应该有 scan_clauses。
 		 */
 		Assert(!scan_clauses);
 
 		/*
-		 * Instead we get the conditions to apply from the fdw_private
-		 * structure.
+		 * 相反，我们从 fdw_private 结构中获取要应用的条件。
 		 */
 		remote_exprs = extract_actual_clauses(fpinfo->remote_conds, false);
 		local_exprs = extract_actual_clauses(fpinfo->local_conds, false);
 
 		/*
-		 * We leave fdw_recheck_quals empty in this case, since we never need
-		 * to apply EPQ recheck clauses.  In the case of a joinrel, EPQ
-		 * recheck is handled elsewhere --- see postgresGetForeignJoinPaths().
-		 * If we're planning an upperrel (ie, remote grouping or aggregation)
-		 * then there's no EPQ to do because SELECT FOR UPDATE wouldn't be
-		 * allowed, and indeed we *can't* put the remote clauses into
-		 * fdw_recheck_quals because the unaggregated Vars won't be available
-		 * locally.
+		 * 在这种情况下，我们让 fdw_recheck_quals 保持为空，因为我们不需要应用 EPQ 重检查子句。
+		 * 对于连接关系，EPQ 重检查在别处处理 --- 请参阅 postgresGetForeignJoinPaths()。
+		 * 如果我们正在规划上层关系（即远程分组或聚合），那么不需要做 EPQ，
+		 * 因为 SELECT FOR UPDATE 是不被允许的，而且实际上我们将无法把远程子句放入
+		 * fdw_recheck_quals，因为未聚合的变量在本地不可用。
 		 */
 
-		/* Build the list of columns to be fetched from the foreign server. */
+		/* 构建需要从外部服务器获取的列的列表。 */
 		fdw_scan_tlist = build_tlist_to_deparse(foreignrel);
 
 		/*
-		 * Ensure that the outer plan produces a tuple whose descriptor
-		 * matches our scan tuple slot.  Also, remove the local conditions
-		 * from outer plan's quals, lest they be evaluated twice, once by the
-		 * local plan and once by the scan.
+		 * 确保外部计划生成的元组，其描述符与我们的扫描元组槽相匹配。
+		 * 同时，从外部计划的条件中移除本地条件，以免它们被评估两次：
+		 * 一次由本地计划，一次由扫描。
 		 */
 		if (outer_plan)
 		{
 			ListCell   *lc;
 
 			/*
-			 * Right now, we only consider grouping and aggregation beyond
-			 * joins. Queries involving aggregates or grouping do not require
-			 * EPQ mechanism, hence should not have an outer plan here.
+			 * 目前，我们只考虑连接之后的分组和聚合。
+			 * 涉及聚合或分组的查询不需要 EPQ 机制，因此这里不应该有外部计划。
 			 */
 			Assert(!IS_UPPER_REL(foreignrel));
 
 			/*
-			 * First, update the plan's qual list if possible.  In some cases
-			 * the quals might be enforced below the topmost plan level, in
-			 * which case we'll fail to remove them; it's not worth working
-			 * harder than this.
+			 * 首先，如果可能的话更新计划的条件列表。在某些情况下，条件可能会在
+			 * 最顶层计划级别之下被强制执行，在这种情况下我们将无法移除它们；
+			 * 不值得为此付出更多努力。
 			 */
 			foreach(lc, local_exprs)
 			{
@@ -1323,10 +1309,8 @@ postgresGetForeignPlan(PlannerInfo *root,
 				outer_plan->qual = list_delete(outer_plan->qual, qual);
 
 				/*
-				 * For an inner join the local conditions of foreign scan plan
-				 * can be part of the joinquals as well.  (They might also be
-				 * in the mergequals or hashquals, but we can't touch those
-				 * without breaking the plan.)
+				 * 对于内连接，外部扫描计划的本地条件也可以是连接条件的一部分。
+				 * （它们也可能在合并条件或哈希条件中，但我们不能在不破坏计划的情况下触碰它们。）
 				 */
 				if (IsA(outer_plan, NestLoop) ||
 					IsA(outer_plan, MergeJoin) ||
@@ -1341,8 +1325,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 			}
 
 			/*
-			 * Now fix the subplan's tlist --- this might result in inserting
-			 * a Result node atop the plan tree.
+			 * 现在修复子计划的 tlist --- 这可能会导致在计划树顶端插入一个 Result 节点。
 			 */
 			outer_plan = change_plan_targetlist(outer_plan, fdw_scan_tlist,
 												best_path->path.parallel_safe);
@@ -1350,8 +1333,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 	}
 
 	/*
-	 * Build the query string to be sent for execution, and identify
-	 * expressions to be sent as parameters.
+	 * 构建要发送执行的查询字符串，并识别要作为参数发送的表达式。
 	 */
 	initStringInfo(&sql);
 	deparseSelectStmtForRel(&sql, root, foreignrel, fdw_scan_tlist,
@@ -1359,12 +1341,12 @@ postgresGetForeignPlan(PlannerInfo *root,
 							has_final_sort, has_limit, false,
 							&retrieved_attrs, &params_list);
 
-	/* Remember remote_exprs for possible use by postgresPlanDirectModify */
+	/* 记住 remote_exprs 供 postgresPlanDirectModify 可能使用 */
 	fpinfo->final_remote_exprs = remote_exprs;
 
 	/*
-	 * Build the fdw_private list that will be available to the executor.
-	 * Items in the list must match order in enum FdwScanPrivateIndex.
+	 * 构建执行器可用的 fdw_private 列表。
+	 * 列表中的项目必须与 enum FdwScanPrivateIndex 中的顺序匹配。
 	 */
 	fdw_private = list_make3(makeString(sql.data),
 							 retrieved_attrs,
@@ -1374,11 +1356,10 @@ postgresGetForeignPlan(PlannerInfo *root,
 							  makeString(fpinfo->relation_name->data));
 
 	/*
-	 * Create the ForeignScan node for the given relation.
+	 * 为给定的关系创建 ForeignScan 节点。
 	 *
-	 * Note that the remote parameter expressions are stored in the fdw_exprs
-	 * field of the finished plan node; we can't keep them in private state
-	 * because then they wouldn't be subject to later planner processing.
+	 * 注意，远程参数表达式存储在已完成计划节点的 fdw_exprs 字段中；
+	 * 我们不能将它们保存在私有状态中，因为那样它们就不会受到后续规划器处理的影响。
 	 */
 	return make_foreignscan(tlist,
 							local_exprs,
@@ -4983,9 +4964,22 @@ postgresImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 }
 
 /*
- * Assess whether the join between inner and outer relations can be pushed down
- * to the foreign server. As a side effect, save information we obtain in this
- * function to PgFdwRelationInfo passed in.
+ * foreign_join_ok
+ *      核心逻辑：判断一个连接（JOIN）操作是否可以“下推”到远程数据库执行。
+ *
+ * 所谓的“下推”（Pushdown），就是与其把两个表的数据全部拉回本地 PostgreSQL 再做连接，
+ * 不如直接发送一条包含 JOIN 的 SQL 到远程数据库，让远程数据库做完连接后，只返回结果。
+ * 这样做通常能极大减少网络传输量，提高性能。
+ *
+ * 输入参数：
+ * - root: 查询规划器的全局信息。
+ * - joinrel: 表示连接后的结果关系（我们正在规划这个关系）。
+ * - jointype: 连接类型（INNER, LEFT, RIGHT, FULL 等）。
+ * - outerrel, innerrel: 参与连接的两个子关系（外表和内表）。
+ * - extra: 连接路径的额外数据。
+ *
+ * 如果函数返回 true，说明可以下推，相关信息会保存到 joinrel->fdw_private (也就是 fpinfo) 中。
+ * 如果返回 false，说明必须在本地执行连接。
  */
 static bool
 foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
@@ -4999,17 +4993,23 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	List	   *joinclauses;
 
 	/*
-	 * We support pushing down INNER, LEFT, RIGHT and FULL OUTER joins.
-	 * Constructing queries representing SEMI and ANTI joins is hard, hence
-	 * not considered right now.
+	 * 1. 检查连接类型。
+	 * 目前 postgres_fdw 只支持将 INNER JOIN (内连接)、LEFT/RIGHT/FULL OUTER JOIN (外连接) 下推。
+	 *
+	 * 对于 SEMI JOIN (半连接，exists) 和 ANTI JOIN (反连接，not exists)，
+	 * 构建对应的远程 SQL 比较复杂（通常涉及子查询），目前还没实现支持。
 	 */
 	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
 		jointype != JOIN_RIGHT && jointype != JOIN_FULL)
 		return false;
 
 	/*
-	 * If either of the joining relations is marked as unsafe to pushdown, the
-	 * join can not be pushed down.
+	 * 2. 检查子关系是否安全。
+	 * 要想把 A JOIN B 下推，前提是 A 和 B 自己得是“安全”的。
+	 *
+	 * fpinfo_o 和 fpinfo_i 分别存储了外表和内表的 FDW 私有信息。
+	 * pushdown_safe 标记是在之前的规划阶段设置的（比如在基表扫描或更底层的连接规划时）。
+	 * 如果其中任何一个已经是 false（比如因为包含了无法远程执行的函数），那它们的连接自然也不能下推。
 	 */
 	fpinfo = (PgFdwRelationInfo *) joinrel->fdw_private;
 	fpinfo_o = (PgFdwRelationInfo *) outerrel->fdw_private;
@@ -5019,36 +5019,39 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 		return false;
 
 	/*
-	 * If joining relations have local conditions, those conditions are
-	 * required to be applied before joining the relations. Hence the join can
-	 * not be pushed down.
+	 * 3. 检查是否有必须在本地执行的过滤条件。
+	 *
+	 * local_conds 列表包含那些无法发送到远程执行的 WHERE 条件（例如使用了本地自定义函数）。
+	 * 如果外表或内表有这种“必须在本地过滤”的条件，原本的执行顺序应该是：
+	 *    从远程拉取数据 -> 本地过滤 -> 执行 JOIN
+	 *
+	 * 如果直接下推 JOIN SQL，远程数据库会先做 JOIN，这改变了执行语义（或者需要复杂的子查询封装）。
+	 * 为了简化实现，如果发现子关系有未处理的本地条件，我们就不下推这个 JOIN。
 	 */
 	if (fpinfo_o->local_conds || fpinfo_i->local_conds)
 		return false;
 
 	/*
-	 * Merge FDW options.  We might be tempted to do this after we have deemed
-	 * the foreign join to be OK.  But we must do this beforehand so that we
-	 * know which quals can be evaluated on the foreign server, which might
-	 * depend on shippable_extensions.
+	 * 4. 合并 FDW 选项。
+	 *
+	 * 我们需要把外表和内表的服务器选项（如 use_remote_estimate, fetch_size 等）合并起来。
+	 * 这一步必须尽早做，因为接下来的步骤需要判断过滤条件是否可以发送到远程（shippable）。
+	 * 而判断“是否可以发送”依赖于服务器配置项（例如 shippable_extensions 扩展白名单）。
 	 */
 	fpinfo->server = fpinfo_o->server;
 	merge_fdw_options(fpinfo, fpinfo_o, fpinfo_i);
 
 	/*
-	 * Separate restrict list into join quals and pushed-down (other) quals.
+	 * 5. 分析和分类过滤条件 (Quals)。
 	 *
-	 * Join quals belonging to an outer join must all be shippable, else we
-	 * cannot execute the join remotely.  Add such quals to 'joinclauses'.
+	 * extra->restrictlist 包含了此时适用于该 JOIN 的所有过滤条件。我们需要把它们分为两类：
+	 * a) joinclauses: 必须作为远程 JOIN 的 ON 子句发送的条件。
+	 * b) 其他条件: 可以作为 WHERE 子句发送（remote_conds），或者必须留着本地过滤（local_conds）。
 	 *
-	 * Add other quals to fpinfo->remote_conds if they are shippable, else to
-	 * fpinfo->local_conds.  In an inner join it's okay to execute conditions
-	 * either locally or remotely; the same is true for pushed-down conditions
-	 * at an outer join.
-	 *
-	 * Note we might return failure after having already scribbled on
-	 * fpinfo->remote_conds and fpinfo->local_conds.  That's okay because we
-	 * won't consult those lists again if we deem the join unshippable.
+	 * 特别注意外连接 (Outer Join)：
+	 * 如果是一个通过 ON 子句定义的条件，并且因为外连接的性质不能随意变成 WHERE 条件（防止语义改变），
+	 * 那么它必须能被“完整地”下推。如果这种条件里包含本地函数，那整个 JOIN 都没法下推了，
+	 * 因为我们没法在远程表达这个语义。
 	 */
 	joinclauses = NIL;
 	foreach(lc, extra->restrictlist)
@@ -5074,14 +5077,14 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	}
 
 	/*
-	 * deparseExplicitTargetList() isn't smart enough to handle anything other
-	 * than a Var.  In particular, if there's some PlaceHolderVar that would
-	 * need to be evaluated within this join tree (because there's an upper
-	 * reference to a quantity that may go to NULL as a result of an outer
-	 * join), then we can't try to push the join down because we'll fail when
-	 * we get to deparseExplicitTargetList().  However, a PlaceHolderVar that
-	 * needs to be evaluated *at the top* of this join tree is OK, because we
-	 * can do that locally after fetching the results from the remote side.
+	 * 6. 检查 PlaceHolderVar (占位符变量)。
+	 *
+	 * 这是一个比较底层的限制。当发生外连接且内表可能为 NULL 时，PostgreSQL 可能会生成 PlaceHolderVar
+	 * 来代表某些表达式的值。
+	 * 
+	 * postgres_fdw 的 SQL 生成器（deparser）目前处理复杂表达式的能力有限。
+	 * 如果发现某些 PlaceHolderVar 需要在连接“内部”计算（而不是连接完之后在顶层计算），
+	 * 为了防止生成错误的 SQL 或崩溃，我们保守地选择不下推。
 	 */
 	foreach(lc, root->placeholder_list)
 	{
@@ -5097,7 +5100,7 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			return false;
 	}
 
-	/* Save the join clauses, for later use. */
+	/* 保存连接子句，以备后用。 */
 	fpinfo->joinclauses = joinclauses;
 
 	fpinfo->outerrel = outerrel;
@@ -5105,10 +5108,9 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 	fpinfo->jointype = jointype;
 
 	/*
-	 * By default, both the input relations are not required to be deparsed as
-	 * subqueries, but there might be some relations covered by the input
-	 * relations that are required to be deparsed as subqueries, so save the
-	 * relids of those relations for later use by the deparser.
+	 * 默认情况下，两个输入关系都不需要作为子查询进行反解析（deparse），
+	 * 但是输入关系覆盖的某些关系可能需要作为子查询进行反解析，
+	 * 因此保存这些关系的 relid 以供反解析器稍后使用。
 	 */
 	fpinfo->make_outerrel_subquery = false;
 	fpinfo->make_innerrel_subquery = false;
@@ -5118,23 +5120,16 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 											fpinfo_i->lower_subquery_rels);
 
 	/*
-	 * Pull the other remote conditions from the joining relations into join
-	 * clauses or other remote clauses (remote_conds) of this relation
-	 * wherever possible. This avoids building subqueries at every join step.
+	 * 7. 尝试“拉取”子节点的条件，避免过度嵌套子查询。
 	 *
-	 * For an inner join, clauses from both the relations are added to the
-	 * other remote clauses. For LEFT and RIGHT OUTER join, the clauses from
-	 * the outer side are added to remote_conds since those can be evaluated
-	 * after the join is evaluated. The clauses from inner side are added to
-	 * the joinclauses, since they need to be evaluated while constructing the
-	 * join.
+	 * 在生成远程 SQL 时，我们希望生成的 SQL 越平级越好，例如：
+	 *    SELECT ... FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.x > 10 AND t2.y < 5
 	 *
-	 * For a FULL OUTER JOIN, the other clauses from either relation can not
-	 * be added to the joinclauses or remote_conds, since each relation acts
-	 * as an outer relation for the other.
+	 * 而不是：
+	 *    SELECT ... FROM (SELECT * FROM t1 WHERE x > 10) s1 JOIN (SELECT * FROM t2 WHERE y < 5) s2 ON ...
 	 *
-	 * The joining sides can not have local conditions, thus no need to test
-	 * shippability of the clauses being pulled up.
+	 * 下面的 switch 逻辑就是根据 JOIN 类型，判断能不能把子表（inner/outer）里的过滤条件（remote_conds）
+	 * 提升上来，合并到当前的 JOIN 条件或 WHERE 条件中。
 	 */
 	switch (jointype)
 	{
@@ -5162,12 +5157,14 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 		case JOIN_FULL:
 
 			/*
-			 * In this case, if any of the input relations has conditions, we
-			 * need to deparse that relation as a subquery so that the
-			 * conditions can be evaluated before the join.  Remember it in
-			 * the fpinfo of this relation so that the deparser can take
-			 * appropriate action.  Also, save the relids of base relations
-			 * covered by that relation for later use by the deparser.
+			 * 全外连接 (FULL OUTER JOIN) 特殊处理：
+			 * 
+			 * 对于全外连接，任何一侧的过滤条件都不能简单地提升到 JOIN 的外层。
+			 * 因为全外连接会保留不匹配的行（补 NULL），如果在 JOIN 之后再过滤，
+			 * 可能会错误地过滤掉那些由 JOIN 产生的 NULL 补全行，或者改变语义。
+			 *
+			 * 因此，如果子表有过滤条件，我们必须强制把子表生成为子查询：
+			 * SELECT ... FROM (SELECT ... FROM t1 WHERE cond) JOIN ...
 			 */
 			if (fpinfo_o->remote_conds)
 			{
@@ -5186,14 +5183,17 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 			break;
 
 		default:
-			/* Should not happen, we have just checked this above */
+			/* 不应该发生，我们刚才在上面已经检查过了 */
 			elog(ERROR, "unsupported join type %d", jointype);
 	}
 
 	/*
-	 * For an inner join, all restrictions can be treated alike. Treating the
-	 * pushed down conditions as join conditions allows a top level full outer
-	 * join to be deparsed without requiring subqueries.
+	 * 8. 内连接优化。
+	 *
+	 * 对于 INNER JOIN，WHERE 子句和 ON 子句在语义上通常是等价的。
+	 * 为了后续可能存在的更上层 JOIN 能更好地处理，我们把所有收集到的远程条件
+	 * 都统一放到 joinclauses 中（作为 ON 子句处理）。
+	 * 这样做有助于生成更紧凑的 SQL。
 	 */
 	if (jointype == JOIN_INNER)
 	{
@@ -5202,10 +5202,14 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 		fpinfo->remote_conds = NIL;
 	}
 
-	/* Mark that this join can be pushed down safely */
+	/* 
+	 * 9. 成功！标记此连接可以安全下推。
+	 *
+	 * fpinfo->pushdown_safe = true 告诉优化器，后续可以为这个关系生成 ForeignScan 路径。
+	 */
 	fpinfo->pushdown_safe = true;
 
-	/* Get user mapping */
+	/* 获取用户映射 */
 	if (fpinfo->use_remote_estimate)
 	{
 		if (fpinfo_o->use_remote_estimate)
@@ -5217,17 +5221,19 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 		fpinfo->user = NULL;
 
 	/*
-	 * Set # of retrieved rows and cached relation costs to some negative
-	 * value, so that we can detect when they are set to some sensible values,
-	 * during one (usually the first) of the calls to estimate_path_cost_size.
+	 * 将检索到的行数和缓存的关系成本设置为某个负值，
+	 * 这样我们就可以在调用 estimate_path_cost_size 期间（通常是第一次），
+	 * 检测到它们何时被设置为合理的数值。
 	 */
 	fpinfo->retrieved_rows = -1;
 	fpinfo->rel_startup_cost = -1;
 	fpinfo->rel_total_cost = -1;
 
 	/*
-	 * Set the string describing this join relation to be used in EXPLAIN
-	 * output of corresponding ForeignScan.
+	 * 10. 构造 EXPLAIN 输出用的关系名称。
+	 *
+	 * 例如生成 "(ft1) INNER JOIN (ft2)" 这样的字符串，
+	 * 当用户执行 EXPLAIN 时，能看到 postgres_fdw 打算怎么在远程执行这个连接。
 	 */
 	fpinfo->relation_name = makeStringInfo();
 	appendStringInfo(fpinfo->relation_name, "(%s) %s JOIN (%s)",
@@ -5236,10 +5242,8 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 					 fpinfo_i->relation_name->data);
 
 	/*
-	 * Set the relation index.  This is defined as the position of this
-	 * joinrel in the join_rel_list list plus the length of the rtable list.
-	 * Note that since this joinrel is at the end of the join_rel_list list
-	 * when we are called, we can get the position by list_length.
+	 * 设置关系索引。这定义为该 joinrel 在 join_rel_list 列表中的位置加上 rtable 列表的长度。
+	 * 注意，由于在调用我们时，此 joinrel 位于 join_rel_list 列表的末尾，我们可以通过 list_length 获取位置。
 	 */
 	Assert(fpinfo->relation_index == 0);	/* shouldn't be set yet */
 	fpinfo->relation_index =
@@ -5465,7 +5469,13 @@ merge_fdw_options(PgFdwRelationInfo *fpinfo,
 
 /*
  * postgresGetForeignJoinPaths
- *		Add possible ForeignPath to joinrel, if join is safe to push down.
+ *		如果连接（JOIN）可以安全下推，则将可能的 ForeignPath 添加到 joinrel 中。
+ *
+ * 例：
+ * SELECT * FROM ft1 JOIN ft2 ON ft1.id = ft2.id;
+ * 如果 ft1 和 ft2 位于同一个外部服务器，我们希望生成如下的远程 SQL：
+ * SELECT ... FROM r1 JOIN r2 ON r1.id = r2.id
+ * 而不是把 r1 和 r2 的数据都拉回本地再进行连接。
  */
 static void
 postgresGetForeignJoinPaths(PlannerInfo *root,
@@ -5481,44 +5491,73 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 	int			width;
 	Cost		startup_cost;
 	Cost		total_cost;
-	Path	   *epq_path;		/* Path to create plan to be executed when
-								 * EvalPlanQual gets triggered. */
+	Path	   *epq_path;		/* 用于 EvalPlanQual 触发时执行的计划路径 */
 
 	/*
-	 * Skip if this join combination has been considered already.
+	 * 如果这个连接组合已经被处理过了，直接跳过。
+	 * 优化器可能会多次尝试同一个关系组合，fdw_private 非空说明我们已经处理过。
+	 *
+	 * postgres_fdw 在第一次为这个 joinrel 计算连接路径时，会在内存中分配以此关系相关的 FDW 元数据（比如远程 SQL 语句片段、连接成本估算等），
+	 * 并将这个指针挂在 joinrel->fdw_private 上。
+	 *
+	 * PostgreSQL 的查询优化器可能会尝试在一个连接关系上多次调用 add_paths_to_joinrel
+	 * （也就是多次触发 GetForeignJoinPaths）。
+	 * 这种情况通常发生在处理子查询上拉（Subquery Pullup）或者参数化路径（Parameterized Paths）生成的时候。
+	 * 在上拉过程中，RelOptInfo（关系对象）可能会被重构或合并。
+	 * 虽然对于同一个最终的三个表连接（{t1, t2, t3}），add_paths_to_joinrel 理论上只会在规划这一层级时被调用。
+	 * 但是，如果上拉发生在一个更复杂的嵌套结构中（例如多层视图或者 UNION ALL），
+	 * 优化器可能会先尝试规划子层级（这时调用一次），然后决定上拉，接着在上层重新规划（这时又针对新的组合调用一次）。
+	 *
+	 * FDW 看到 joinrel({t2, t3})->fdw_private 已经有东西了，
+	 * 就知道“啊，我之前在规划子查询时已经算过这两个表怎么连了”，于是直接返回，复用之前的成果（或者只是不再重复计算）。
 	 */
 	if (joinrel->fdw_private)
 		return;
 
 	/*
-	 * This code does not work for joins with lateral references, since those
-	 * must have parameterized paths, which we don't generate yet.
+	 * 目前不支持带有 LATERAL 引用的连接下推。
+	 * LATERAL 引用需要参数化路径（Parameterized Paths），我们暂时还没生成。
+	 *
+	 * 例：SELECT * FROM t1, LATERAL (SELECT * FROM t2 WHERE t2.x = t1.x) ss;
 	 */
 	if (!bms_is_empty(joinrel->lateral_relids))
 		return;
 
 	/*
-	 * Create unfinished PgFdwRelationInfo entry which is used to indicate
-	 * that the join relation is already considered, so that we won't waste
-	 * time in judging safety of join pushdown and adding the same paths again
-	 * if found safe. Once we know that this join can be pushed down, we fill
-	 * the entry.
+	 * 创建未完成的 PgFdwRelationInfo 条目。
+	 * 它的主要作用是标记该连接关系已经被考虑过了，防止重复计算。
+	 * 如果后续发现连接可以安全下推，我们会填充这个结构体。
 	 */
 	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
 	fpinfo->pushdown_safe = false;
+
+	/* “占位符”。任何后续对同一个 joinrel 的访问都会因为 fdw_private 非空而立即返回。 */
 	joinrel->fdw_private = fpinfo;
-	/* attrs_used is only for base relations. */
+
+	/*
+	 * 这是一个用于基表（Base Relation）扫描时记录需要哪些列的字段（用于 SELECT 列表裁剪）。
+	 * 对于连接关系（Join Relation），这个信息是不需要的或者是通过其他方式维护的，所以设为 NULL。
+	 */
 	fpinfo->attrs_used = NULL;
 
 	/*
-	 * If there is a possibility that EvalPlanQual will be executed, we need
-	 * to be able to reconstruct the row using scans of the base relations.
-	 * GetExistingLocalJoinPath will find a suitable path for this purpose in
-	 * the path list of the joinrel, if one exists.  We must be careful to
-	 * call it before adding any ForeignPath, since the ForeignPath might
-	 * dominate the only suitable local path available.  We also do it before
-	 * calling foreign_join_ok(), since that function updates fpinfo and marks
-	 * it as pushable if the join is found to be pushable.
+	 * 检查是否必须支持 EvalPlanQual (EPQ) 机制。
+	 *
+	 * 如果当前的查询涉及修改数据（DELETE, UPDATE）或者使用了显式的行级锁（SELECT FOR UPDATE/SHARE），
+	 * 那么 PostgreSQL 必须能够处理并发更新冲突。当发生冲突时，PostgreSQL 会重新获取最新的行版本，
+	 * 并在“本地”重新运行查询计划的检查部分（Recheck），以验证该行是否仍然满足 WHERE 条件。
+	 *
+	 * 这里的关键在于“本地重新运行”。如果连接操作完全在远程执行（下推），本地就没有独立的行数据
+	 * 来逐个验证连接条件。因此，为了支持 EPQ，我们必须确保存在一条“本地连接路径”（Local Join Path），
+	 * 即把数据拉回本地后再执行连接的路径。
+	 *
+	 * GetExistingLocalJoinPath 会尝试在 joinrel 的现有路径列表中查找这样的路径。
+	 * 如果找不到本地路径（这意味着数据只能远程访问，或者本地连接不可行），出于数据一致性的考虑，
+	 * 我们不能下推这个连接。EPQ 路径的缺失意味着我们在发生冲突时没有任何回退手段。
+	 *
+	 * 注意：这一步检查非常关键，必须在添加任何真正的 ForeignPath 之前进行。因为 ForeignPath
+	 * （远程连接路径）的成本通常估算得很低，如果我们先添加了它，优化器可能会选择它作为唯一路径，
+	 * 从而掩盖了我们实际上缺乏可靠的本地回退路径这一事实。
 	 */
 	if (root->parse->commandType == CMD_DELETE ||
 		root->parse->commandType == CMD_UPDATE ||
@@ -5532,23 +5571,31 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 		}
 	}
 	else
-		epq_path = NULL;
+		epq_path = NULL; 
 
+	/*
+	 * 核心检查：判断连接是否可以下推。
+	 * 这一步会检查：
+	 * 1. 两个表是否属于同一个 Foreign Server。
+	 * 2. 用户映射是否兼容。
+	 * 3. 连接类型和条件是否支持下推。
+	 *
+	 * 如果这里返回 false，说明不能下推，我们之前分配的 fpinfo 就保持 pushdown_safe = false。
+	 */
 	if (!foreign_join_ok(root, joinrel, jointype, outerrel, innerrel, extra))
 	{
-		/* Free path required for EPQ if we copied one; we don't need it now */
+		/* 如果之前复制了 EPQ 路径，现在不需要下推了，释放它 */
 		if (epq_path)
 			pfree(epq_path);
 		return;
 	}
 
 	/*
-	 * Compute the selectivity and cost of the local_conds, so we don't have
-	 * to do it over again for each path. The best we can do for these
-	 * conditions is to estimate selectivity on the basis of local statistics.
-	 * The local conditions are applied after the join has been computed on
-	 * the remote side like quals in WHERE clause, so pass jointype as
-	 * JOIN_INNER.
+	 * 计算必须在本地执行的过滤条件 (local_conds) 的选择率和成本。
+	 * 这样我们就不用为每个路径重复计算了。
+	 *
+	 * 这些条件是在远程 JOIN 完成后，应用在结果集上的，就像 WHERE 子句一样，
+	 * 所以计算选择率时假设是 JOIN_INNER。
 	 */
 	fpinfo->local_conds_sel = clauselist_selectivity(root,
 													 fpinfo->local_conds,
@@ -5558,18 +5605,21 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 	cost_qual_eval(&fpinfo->local_conds_cost, fpinfo->local_conds, root);
 
 	/*
-	 * If we are going to estimate costs locally, estimate the join clause
-	 * selectivity here while we have special join info.
+	 * 如果我们在这个 FDW 中进行本地成本估算（而不是使用 EXPLAIN 询问远程服务器），
+	 * 这里需要估算连接子句的选择率。
 	 */
 	if (!fpinfo->use_remote_estimate)
 		fpinfo->joinclause_sel = clauselist_selectivity(root, fpinfo->joinclauses,
 														0, fpinfo->jointype,
 														extra->sjinfo);
 
-	/* Estimate costs for bare join relation */
+	/*
+	 * 估算连接关系的大小和成本。
+	 * 这会计算 rows (行数), width (宽度), startup_cost (启动成本), total_cost (总成本)。
+	 */
 	estimate_path_cost_size(root, joinrel, NIL, NIL, NULL,
 							&rows, &width, &startup_cost, &total_cost);
-	/* Now update this information in the joinrel */
+	/* 更新 joinrel 的统计信息 */
 	joinrel->rows = rows;
 	joinrel->reltarget->width = width;
 	fpinfo->rows = rows;
@@ -5578,8 +5628,8 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 	fpinfo->total_cost = total_cost;
 
 	/*
-	 * Create a new join path and add it to the joinrel which represents a
-	 * join between foreign tables.
+	 * 创建一个新的 JOIN 路径 (ForeignPath) 并添加到 joinrel 中。
+	 * 这个路径代表了在远程服务器上执行 JOIN 操作。
 	 */
 	joinpath = create_foreign_join_path(root,
 										joinrel,
@@ -5592,10 +5642,14 @@ postgresGetForeignJoinPaths(PlannerInfo *root,
 										epq_path,
 										NIL);	/* no fdw_private */
 
-	/* Add generated path into joinrel by add_path(). */
+	/* 将生成的路径添加到优化器的路径列表中 */
 	add_path(joinrel, (Path *) joinpath);
 
-	/* Consider pathkeys for the join relation */
+	/*
+	 * 考虑该连接关系是否有可用的路径排序键 (pathkeys)。
+	 * 如果远程查询结果是原本有序的（例如远程执行了 Merge Join），
+	 * 我们可以告诉优化器这个路径是有序的，这可能对上层操作（如 ORDER BY, Merge Join）有利。
+	 */
 	add_paths_with_pathkeys_for_rel(root, joinrel, epq_path);
 
 	/* XXX Consider parameterized paths for the join relation */
@@ -5840,8 +5894,61 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 
 /*
  * postgresGetForeignUpperPaths
- *		Add paths for post-join operations like aggregation, grouping etc. if
- *		corresponding operations are safe to push down.
+ *      尝试为“上层”操作（如聚合、分组、排序等）生成可以下推到远程服务器执行的路径。
+ *
+ * 在 PostgreSQL 的查询规划中，连接（Join）之后的处理阶段被称为 "Upper Planning"。
+ * 如果我们发现基表扫描和连接都已经可以安全下推了，那么也许我们可以更进一步，
+ * 把分组（GROUP BY）、排序（ORDER BY）甚至 LIMIT 也推给远程数据库做。
+ * 这样可以进一步减少网络传输的数据量。
+ *
+ * SQL 示例 - 可以下推的情况：
+ * 1. 简单聚合：
+ *    SELECT count(*) FROM remote_table;
+ *    -- 远程 SQL: SELECT count(*) FROM remote_table
+ *
+ * 2. 分组聚合：
+ *    SELECT country, sum(sales) FROM remote_table GROUP BY country;
+ *    -- 远程 SQL: SELECT country, sum(sales) FROM remote_table GROUP BY country
+ *
+ * 3. 排序和限制 (Top-N)：
+ *    SELECT * FROM remote_table ORDER BY created_at DESC LIMIT 10;
+ *    -- 远程 SQL: SELECT * FROM remote_table ORDER BY created_at DESC LIMIT 10
+ *
+ * SQL 示例 - 不会下推的情况（需要在本地执行）：
+ * 1. 使用了不可下推的本地函数：
+ *    SELECT local_func(country), count(*) FROM remote_table GROUP BY local_func(country);
+/*
+ * postgresGetForeignUpperPaths
+ *		为扫描/连接之后的处理添加路径（聚合、分组操作等）
+ *
+ * 只要所有底层的扫描/连接关系对于 FDW 来说是安全的，
+ * 后续的上层关系处理（如聚合、排序、Limit）也有可能被推送到远端执行。
+ *
+ * 目前支持的上层关系下推（Pushdown）与其对应的 SQL 示例：
+ *
+ * 1. 聚合与分组 (Aggregation & Grouping) - stage: UPPERREL_GROUP_AGG
+ *    SQL 示例: SELECT department_id, COUNT(*), AVG(salary) FROM employees GROUP BY department_id HAVING AVG(salary) > 5000;
+ *    下推效果: 整个 GROUP BY 和 HAVING 子句以及聚合函数计算都会在远端执行。
+ *    本地只接收分组后的结果集。
+ *
+ * 2. 排序 (Sorting) - stage: UPPERREL_ORDERED
+ *    SQL 示例: SELECT * FROM employees ORDER BY hire_date DESC;
+ *    下推效果: ORDER BY 子句会在远端执行。本地接收到的数据已经是排序好的。
+ *    这对后续的本地 Merge Join 非常有用。
+ *
+ * 3. 最终投影 (Final Projection) - stage: UPPERREL_FINAL
+ *    SQL 示例: SELECT salary * 12 + bonus FROM employees;
+ *    下推效果: 复杂的列表达式计算（如算术运算、函数调用）会在远端执行。
+ *    本地只接收最终计算结果。
+ *
+ * 4. 限制与偏移 (Limit & Offset) - 通常结合 UPPERREL_ORDERED 或 UPPERREL_FINAL 处理
+ *    SQL 示例: SELECT * FROM employees ORDER BY salary DESC LIMIT 10 OFFSET 5;
+ *    下推效果: LIMIT 和 OFFSET 会被添加到远程 SQL 中，极大地减少网络传输量。
+ *
+ * 注意：以下操作目前不支持下推（将由其他路径处理或回退到本地执行）：
+ * - 窗口函数 (Window Functions, UPPERREL_WINDOW): 如 OVER (PARTITION BY ...)
+ * - 集合操作 (Set Operations, UPPERREL_SETOP): 如 UNION, INTERSECT, EXCEPT
+ * - DISTINCT (UPPERREL_DISTINCT): 除非它可以被转换为 Grouping 实现
  */
 static void
 postgresGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
@@ -5851,24 +5958,24 @@ postgresGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	PgFdwRelationInfo *fpinfo;
 
 	/*
-	 * If input rel is not safe to pushdown, then simply return as we cannot
-	 * perform any post-join operations on the foreign server.
+	 * 1. 检查输入关系是否安全。
+	 *
+	 * 上层操作是建立在之前的操作基础之上的。如果之前的操作（input_rel，可能是扫描或连接）
+	 * 本身就不能下推（pushdown_safe 为 false），那后续的聚合等操作显然也没法在远程执行。
+	 * 这种情况下，直接返回，不做任何处理。
+	 *
+	 * (input_rel->fdw_private 存储了之前阶段判断的 FDW 信息)
 	 */
 	if (!input_rel->fdw_private ||
 		!((PgFdwRelationInfo *) input_rel->fdw_private)->pushdown_safe)
 		return;
 
-	/* Ignore stages we don't support; and skip any duplicate calls. */
-	if ((stage != UPPERREL_GROUP_AGG &&
-		 stage != UPPERREL_ORDERED &&
-		 stage != UPPERREL_FINAL) ||
-		output_rel->fdw_private)
+	/*
+	 * 如果 live remote estimate 没有启用，我们不做上层关系下推。
+	 */
+	fpinfo = (PgFdwRelationInfo *) input_rel->fdw_private;
+	if (!fpinfo->use_remote_estimate)
 		return;
-
-	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
-	fpinfo->pushdown_safe = false;
-	fpinfo->stage = stage;
-	output_rel->fdw_private = fpinfo;
 
 	switch (stage)
 	{
@@ -5880,6 +5987,55 @@ postgresGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 			add_foreign_ordered_paths(root, input_rel, output_rel);
 			break;
 		case UPPERREL_FINAL:
+			add_foreign_final_paths(root, input_rel, output_rel,
+									(FinalPathExtraData *) extra);
+			break;
+		default:
+			/* skip other upper relations */
+			break;
+	}
+}
+	 * - UPPERREL_GROUP_AGG: 分组和聚合 (GROUP BY, SUM, COUNT 等)
+	 * - UPPERREL_ORDERED:   排序 (ORDER BY)
+	 * - UPPERREL_FINAL:     最终修正 (LIMIT, OFFSET, 锁定行等)
+	 *
+	 * 如果是其他阶段（比如窗口函数 UPPERREL_WINDOW，目前暂不支持），或者 output_rel
+	 * 已经有 FDW 信息了（说明可以通过其他方式处理，或者我们已经处理过），则跳过。
+	 */
+	if ((stage != UPPERREL_GROUP_AGG &&
+		 stage != UPPERREL_ORDERED &&
+		 stage != UPPERREL_FINAL) ||
+		output_rel->fdw_private)
+		return;
+
+	/*
+	 * 3. 初始化输出关系的 FDW 信息。
+	 *
+	 * 我们为 output_rel 分配一个新的 PgFdwRelationInfo 结构。
+	 * 默认先标记 pushdown_safe = false。具体的处理函数（如 add_foreign_grouping_paths）
+	 * 在验证通过后，会将其标记为 true。
+	 */
+	fpinfo = (PgFdwRelationInfo *) palloc0(sizeof(PgFdwRelationInfo));
+	fpinfo->pushdown_safe = false;
+	fpinfo->stage = stage;
+	output_rel->fdw_private = fpinfo;
+
+	/*
+	 * 4. 根据阶段分发处理逻辑。
+	 */
+	switch (stage)
+	{
+		case UPPERREL_GROUP_AGG:
+			/* 尝试下推聚合和分组 */
+			add_foreign_grouping_paths(root, input_rel, output_rel,
+									   (GroupPathExtraData *) extra);
+			break;
+		case UPPERREL_ORDERED:
+			/* 尝试下推排序 */
+			add_foreign_ordered_paths(root, input_rel, output_rel);
+			break;
+		case UPPERREL_FINAL:
+			/* 尝试下推 LIMIT/OFFSET 等最终操作 */
 			add_foreign_final_paths(root, input_rel, output_rel,
 									(FinalPathExtraData *) extra);
 			break;

@@ -63,9 +63,9 @@ typedef struct UserMapping
 
 typedef struct ForeignTable
 {
-	Oid			relid;			/* relation Oid */
-	Oid			serverid;		/* server Oid */
-	List	   *options;		/* ftoptions as DefElem list */
+	Oid			relid;			/* 关系/表 Oid */
+	Oid			serverid;		/* 服务器 Oid */
+	List	   *options;		/* 以外部表选项 (ftoptions) 作为 DefElem 列表 */
 } ForeignTable;
 
 /* Flags for GetForeignServerExtended */

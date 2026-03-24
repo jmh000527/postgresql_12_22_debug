@@ -139,26 +139,22 @@ get_first_col_type(Plan *plan, Oid *coltype, int32 *coltypmod,
 }
 
 /*
- * Convert a SubLink (as created by the parser) into a SubPlan.
+ * 将由解析器创建的 SubLink 转换为 SubPlan。
  *
- * We are given the SubLink's contained query, type, ID, and testexpr.  We are
- * also told if this expression appears at top level of a WHERE/HAVING qual.
+ * 我们获得 SubLink 包含的查询、类型、ID 和测试表达式。我们还被告知
+ * 此表达式是否出现在 WHERE/HAVING 限定符的顶层。
  *
- * Note: we assume that the testexpr has been AND/OR flattened (actually,
- * it's been through eval_const_expressions), but not converted to
- * implicit-AND form; and any SubLinks in it should already have been
- * converted to SubPlans.  The subquery is as yet untouched, however.
+ * 注意：我们假设测试表达式已经过 AND/OR 展开（实际上经过了 eval_const_expressions），
+ * 但未转换为隐式 AND 形式；其中的任何 SubLink 应该已经转换为 SubPlan。
+ * 然而，子查询尚未被触及。
  *
- * The result is whatever we need to substitute in place of the SubLink node
- * in the executable expression.  If we're going to do the subplan as a
- * regular subplan, this will be the constructed SubPlan node.  If we're going
- * to do the subplan as an InitPlan, the SubPlan node instead goes into
- * root->init_plans, and what we return here is an expression tree
- * representing the InitPlan's result: usually just a Param node representing
- * a single scalar result, but possibly a row comparison tree containing
- * multiple Param nodes, or for a MULTIEXPR subquery a simple NULL constant
- * (since the real output Params are elsewhere in the tree, and the MULTIEXPR
- * subquery itself is in a resjunk tlist entry whose value is uninteresting).
+ * 结果是我们需要的任何替代执行表达式中的 SubLink 节点的内容。
+ * 如果我们要将子计划作为常规子计划执行，这将是构造的 SubPlan 节点。
+ * 如果我们要将子计划作为 InitPlan 执行，则 SubPlan 节点将放入 root->init_plans，
+ * 而我们在此处返回的是表示 InitPlan 结果的表达式树：
+ * 通常只是表示单个标量结果的 Param 节点，但也可能是包含多个 Param 节点的行比较树，
+ * 或者对于 MULTIEXPR 子查询，是一个简单的 NULL 常量
+ * （因为实际的输出 Param 在树的其他位置，且 MULTIEXPR 子查询本身在 resjunk tlist 条目中，其值并不重要）。
  */
 static Node *
 make_subplan(PlannerInfo *root, Query *orig_subquery,
@@ -176,119 +172,109 @@ make_subplan(PlannerInfo *root, Query *orig_subquery,
 	Node	   *result;
 
 	/*
-	 * Copy the source Query node.  This is a quick and dirty kluge to resolve
-	 * the fact that the parser can generate trees with multiple links to the
-	 * same sub-Query node, but the planner wants to scribble on the Query.
-	 * Try to clean this up when we do querytree redesign...
+	 * 复制源 Query 节点。这是一个快速且粗糙的权宜之计，用于解决
+	 * 解析器可能生成具有指向同一子 Query 节点的多个链接的树的事实，
+	 * 但规划器想要在 Query 上进行修改。
+	 * 尝试在重新设计查询树时清理它...
 	 */
 	subquery = copyObject(orig_subquery);
 
 	/*
-	 * If it's an EXISTS subplan, we might be able to simplify it.
+	 * 如果是一个 EXISTS 子计划，我们或许可以简化它。
 	 */
 	if (subLinkType == EXISTS_SUBLINK)
 		simple_exists = simplify_EXISTS_query(root, subquery);
 
 	/*
-	 * For an EXISTS subplan, tell lower-level planner to expect that only the
-	 * first tuple will be retrieved.  For ALL and ANY subplans, we will be
-	 * able to stop evaluating if the test condition fails or matches, so very
-	 * often not all the tuples will be retrieved; for lack of a better idea,
-	 * specify 50% retrieval.  For EXPR, MULTIEXPR, and ROWCOMPARE subplans,
-	 * use default behavior (we're only expecting one row out, anyway).
+	 * 对于 EXISTS 子计划，告诉底层规划器预期只会检索第一个元组。
+	 * 对于 ALL 和 ANY 子计划，如果测试条件失败或匹配，我们将能够停止评估，
+	 * 因此通常不会检索所有元组；在没有更好主意的情况下，指定 50% 的检索率。
+	 * 对于 EXPR、MULTIEXPR 和 ROWCOMPARE 子计划，使用默认行为（反正我们只期望输出一行）。
 	 *
-	 * NOTE: if you change these numbers, also change cost_subplan() in
-	 * path/costsize.c.
+	 * 注意：如果你更改这些数字，也要更改 path/costsize.c 中的 cost_subplan()。
 	 *
-	 * XXX If an ANY subplan is uncorrelated, build_subplan may decide to hash
-	 * its output.  In that case it would've been better to specify full
-	 * retrieval.  At present, however, we can only check hashability after
-	 * we've made the subplan :-(.  (Determining whether it'll fit in work_mem
-	 * is the really hard part.)  Therefore, we don't want to be too
-	 * optimistic about the percentage of tuples retrieved, for fear of
-	 * selecting a plan that's bad for the materialization case.
+	 * XXX 如果 ANY 子计划是非相关的，build_subplan 可能决定对其输出进行哈希处理。
+	 * 在这种情况下，指定完全检索会更好。目前，我们只能在制作子计划后检查可哈希性 :-(。
+	 * （确定它是否适合 work_mem 是真正困难的部分。）
+	 * 因此，我们不想对检索元组的百分比过于乐观，以免选择对物化情况不利的计划。
 	 */
 	if (subLinkType == EXISTS_SUBLINK)
-		tuple_fraction = 1.0;	/* just like a LIMIT 1 */
+		tuple_fraction = 1.0;	/* 就像 LIMIT 1 */
 	else if (subLinkType == ALL_SUBLINK ||
 			 subLinkType == ANY_SUBLINK)
 		tuple_fraction = 0.5;	/* 50% */
 	else
-		tuple_fraction = 0.0;	/* default behavior */
+		tuple_fraction = 0.0;	/* 默认行为 */
 
-	/* plan_params should not be in use in current query level */
+	/* plan_params 不应在当前查询级别中使用 */
 	Assert(root->plan_params == NIL);
 
-	/* Generate Paths for the subquery */
+	/* 为子查询生成路径 */
 	subroot = subquery_planner(root->glob, subquery,
 							   root,
 							   false, tuple_fraction);
 
-	/* Isolate the params needed by this specific subplan */
+	/* 隔离此特定子计划所需的参数 */
 	plan_params = root->plan_params;
 	root->plan_params = NIL;
 
 	/*
-	 * Select best Path and turn it into a Plan.  At least for now, there
-	 * seems no reason to postpone doing that.
+	 * 选择最佳 Path 并将其转换为 Plan。至少目前看来，没有理由推迟这样做。
 	 */
 	final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
 	best_path = get_cheapest_fractional_path(final_rel, tuple_fraction);
 
 	plan = create_plan(subroot, best_path);
 
-	/* And convert to SubPlan or InitPlan format. */
+	/* 并转换为 SubPlan 或 InitPlan 格式。 */
 	result = build_subplan(root, plan, subroot, plan_params,
 						   subLinkType, subLinkId,
 						   testexpr, NIL, isTopQual);
 
 	/*
-	 * If it's a correlated EXISTS with an unimportant targetlist, we might be
-	 * able to transform it to the equivalent of an IN and then implement it
-	 * by hashing.  We don't have enough information yet to tell which way is
-	 * likely to be better (it depends on the expected number of executions of
-	 * the EXISTS qual, and we are much too early in planning the outer query
-	 * to be able to guess that).  So we generate both plans, if possible, and
-	 * leave it to the executor to decide which to use.
+	 * 如果它是一个带有不重要目标列表的相关 EXISTS，我们或许能够将其转换为等效的 IN，
+	 * 然后通过哈希来实现。我们还没有足够的信息来判断哪种方式可能更好
+	 * （这取决于 EXISTS 限定符的预期执行次数，我们在规划外部查询时还太早，无法猜测这一点）。
+	 * 因此，如果可能的话，我们将生成两种计划，并留给执行器决定使用哪一种。
 	 */
 	if (simple_exists && IsA(result, SubPlan))
 	{
 		Node	   *newtestexpr;
 		List	   *paramIds;
 
-		/* Make a second copy of the original subquery */
+		/* 制作原始子查询的第二个副本 */
 		subquery = copyObject(orig_subquery);
-		/* and re-simplify */
+		/* 并重新简化 */
 		simple_exists = simplify_EXISTS_query(root, subquery);
 		Assert(simple_exists);
-		/* See if it can be converted to an ANY query */
+		/* 看看它是否可以转换为 ANY 查询 */
 		subquery = convert_EXISTS_to_ANY(root, subquery,
 										 &newtestexpr, &paramIds);
 		if (subquery)
 		{
-			/* Generate Paths for the ANY subquery; we'll need all rows */
+			/* 为 ANY 子查询生成路径；我们需要所有行 */
 			subroot = subquery_planner(root->glob, subquery,
 									   root,
 									   false, 0.0);
 
-			/* Isolate the params needed by this specific subplan */
+			/* 隔离此特定子计划所需的参数 */
 			plan_params = root->plan_params;
 			root->plan_params = NIL;
 
-			/* Select best Path and turn it into a Plan */
+			/* 选择最佳 Path 并将其转换为 Plan */
 			final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
 			best_path = final_rel->cheapest_total_path;
 
 			plan = create_plan(subroot, best_path);
 
-			/* Now we can check if it'll fit in work_mem */
-			/* XXX can we check this at the Path stage? */
+			/* 现在我们可以检查它是否适合 work_mem */
+			/* XXX 我们能在 Path 阶段检查这个吗？ */
 			if (subplan_is_hashable(plan))
 			{
 				SubPlan    *hashplan;
 				AlternativeSubPlan *asplan;
 
-				/* OK, convert to SubPlan format. */
+				/* OK，转换为 SubPlan 格式。 */
 				hashplan = castNode(SubPlan,
 									build_subplan(root, plan, subroot,
 												  plan_params,
@@ -296,11 +282,11 @@ make_subplan(PlannerInfo *root, Query *orig_subquery,
 												  newtestexpr,
 												  paramIds,
 												  true));
-				/* Check we got what we expected */
+				/* 检查是否符合预期 */
 				Assert(hashplan->parParam == NIL);
 				Assert(hashplan->useHashTable);
 
-				/* Leave it to the executor to decide which plan to use */
+				/* 留给执行器决定使用哪个计划 */
 				asplan = makeNode(AlternativeSubPlan);
 				asplan->subplans = list_make2(result, hashplan);
 				result = (Node *) asplan;
@@ -854,15 +840,15 @@ hash_ok_operator(OpExpr *expr)
 
 
 /*
- * SS_process_ctes: process a query's WITH list
+ * SS_process_ctes: 处理查询的 WITH 列表 (Common Table Expressions)
  *
- * Consider each CTE in the WITH list and either ignore it (if it's an
- * unreferenced SELECT), "inline" it to create a regular sub-SELECT-in-FROM,
- * or convert it to an initplan.
+ * 考虑 WITH 列表中的每个 CTE，并执行以下操作之一：
+ * 1. 忽略它（如果是未引用的 SELECT）。
+ * 2. "内联"它（创建一个常规的 FROM 子查询）。
+ * 3. 将其转换为 initplan（作为独立的子计划执行）。
  *
- * A side effect is to fill in root->cte_plan_ids with a list that
- * parallels root->parse->cteList and provides the subplan ID for
- * each CTE's initplan, or a dummy ID (-1) if we didn't make an initplan.
+ * 副作用是填充 root->cte_plan_ids 列表，该列表与 root->parse->cteList 平行，
+ * 并提供每个 CTE 的 initplan 的子计划 ID，如果未创建 initplan，则提供虚拟 ID (-1)。
  */
 void
 SS_process_ctes(PlannerInfo *root)
@@ -884,45 +870,38 @@ SS_process_ctes(PlannerInfo *root)
 		int			paramid;
 
 		/*
-		 * Ignore SELECT CTEs that are not actually referenced anywhere.
+		 * 忽略那些实际上未在任何地方引用的 SELECT CTE。
 		 */
 		if (cte->cterefcount == 0 && cmdType == CMD_SELECT)
 		{
-			/* Make a dummy entry in cte_plan_ids */
+			/* 在 cte_plan_ids 中创建一个虚拟条目 */
 			root->cte_plan_ids = lappend_int(root->cte_plan_ids, -1);
 			continue;
 		}
 
 		/*
-		 * Consider inlining the CTE (creating RTE_SUBQUERY RTE(s)) instead of
-		 * implementing it as a separately-planned CTE.
+		 * 考虑内联 CTE（创建 RTE_SUBQUERY RTE）而不是将其实现为单独规划的 CTE。
 		 *
-		 * We cannot inline if any of these conditions hold:
+		 * 如果满足以下任何条件，则无法内联：
 		 *
-		 * 1. The user said not to (the CTEMaterializeAlways option).
+		 * 1. 用户指定不内联（CTEMaterializeAlways 选项，即 MATERIALIZED）。
 		 *
-		 * 2. The CTE is recursive.
+		 * 2. CTE 是递归的。
 		 *
-		 * 3. The CTE has side-effects; this includes either not being a plain
-		 * SELECT, or containing volatile functions.  Inlining might change
-		 * the side-effects, which would be bad.
+		 * 3. CTE 具有副作用；这包括不是纯 SELECT，或包含易变函数。
+		 *    内联可能会改变副作用（例如执行次数），这是不好的。
 		 *
-		 * 4. The CTE is multiply-referenced and contains a self-reference to
-		 * a recursive CTE outside itself.  Inlining would result in multiple
-		 * recursive self-references, which we don't support.
+		 * 4. CTE 被多次引用，并且包含对自身外部递归 CTE 的自引用。
+		 *    内联会导致多个递归自引用，我们不支持这样做。
 		 *
-		 * Otherwise, we have an option whether to inline or not.  That should
-		 * always be a win if there's just a single reference, but if the CTE
-		 * is multiply-referenced then it's unclear: inlining adds duplicate
-		 * computations, but the ability to absorb restrictions from the outer
-		 * query level could outweigh that.  We do not have nearly enough
-		 * information at this point to tell whether that's true, so we let
-		 * the user express a preference.  Our default behavior is to inline
-		 * only singly-referenced CTEs, but a CTE marked CTEMaterializeNever
-		 * will be inlined even if multiply referenced.
+		 * 否则，我们可以选择是否内联。如果只有一个引用，那通常总是好的。
+		 * 但如果 CTE 被多次引用，情况就不清楚了：内联会增加重复计算，
+		 * 但吸收外部查询层级限制的能力可能会超过这一点。
+		 * 目前我们没有足够的信息来判断这是否正确，所以我们让用户表达偏好。
+		 * 我们的默认行为是仅内联单次引用的 CTE，但标记为 CTEMaterializeNever (NOT MATERIALIZED)
+		 * 的 CTE 即使被多次引用也会被内联。
 		 *
-		 * Note: we check for volatile functions last, because that's more
-		 * expensive than the other tests needed.
+		 * 注意：我们最后检查易变函数，因为那比所需的其他测试更昂贵。
 		 */
 		if ((cte->ctematerialized == CTEMaterializeNever ||
 			 (cte->ctematerialized == CTEMaterializeDefault &&
@@ -935,39 +914,35 @@ SS_process_ctes(PlannerInfo *root)
 			!contain_volatile_functions(cte->ctequery))
 		{
 			inline_cte(root, cte);
-			/* Make a dummy entry in cte_plan_ids */
+			/* 在 cte_plan_ids 中创建一个虚拟条目 */
 			root->cte_plan_ids = lappend_int(root->cte_plan_ids, -1);
 			continue;
 		}
 
 		/*
-		 * Copy the source Query node.  Probably not necessary, but let's keep
-		 * this similar to make_subplan.
+		 * 复制源 Query 节点。可能不是必须的，但让我们保持与 make_subplan 相似。
 		 */
 		subquery = (Query *) copyObject(cte->ctequery);
 
-		/* plan_params should not be in use in current query level */
+		/* plan_params 不应在当前查询级别中使用 */
 		Assert(root->plan_params == NIL);
 
 		/*
-		 * Generate Paths for the CTE query.  Always plan for full retrieval
-		 * --- we don't have enough info to predict otherwise.
+		 * 为 CTE 查询生成路径。总是按全量检索进行规划
+		 * --- 我们没有足够的信息来预测其他情况。
 		 */
 		subroot = subquery_planner(root->glob, subquery,
 								   root,
 								   cte->cterecursive, 0.0);
 
 		/*
-		 * Since the current query level doesn't yet contain any RTEs, it
-		 * should not be possible for the CTE to have requested parameters of
-		 * this level.
+		 * 由于当前查询级别尚未包含任何 RTE，因此 CTE 不可能请求此级别的参数。
 		 */
 		if (root->plan_params)
 			elog(ERROR, "unexpected outer reference in CTE query");
 
 		/*
-		 * Select best Path and turn it into a Plan.  At least for now, there
-		 * seems no reason to postpone doing that.
+		 * 选择最佳路径并将其转换为计划。至少目前看来，没有理由推迟这样做。
 		 */
 		final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
 		best_path = final_rel->cheapest_total_path;
@@ -975,10 +950,8 @@ SS_process_ctes(PlannerInfo *root)
 		plan = create_plan(subroot, best_path);
 
 		/*
-		 * Make a SubPlan node for it.  This is just enough unlike
-		 * build_subplan that we can't share code.
-		 *
-		 * Note plan_id, plan_name, and cost fields are set further down.
+		 * 为其创建一个 SubPlan 节点。这与 build_subplan 足够不同，因此我们无法共享代码。
+		 * 注意 plan_id、plan_name 和 cost 字段将在下面设置。
 		 */
 		splan = makeNode(SubPlan);
 		splan->subLinkType = CTE_SUBLINK;
@@ -991,9 +964,8 @@ SS_process_ctes(PlannerInfo *root)
 		splan->unknownEqFalse = false;
 
 		/*
-		 * CTE scans are not considered for parallelism (cf
-		 * set_rel_consider_parallel), and even if they were, initPlans aren't
-		 * parallel-safe.
+		 * CTE 扫描不被考虑用于并行性（参见 set_rel_consider_parallel），
+         * 即使它们被考虑，initPlans 也不是并行安全的。
 		 */
 		splan->parallel_safe = false;
 		splan->setParam = NIL;
@@ -1001,25 +973,21 @@ SS_process_ctes(PlannerInfo *root)
 		splan->args = NIL;
 
 		/*
-		 * The node can't have any inputs (since it's an initplan), so the
-		 * parParam and args lists remain empty.  (It could contain references
-		 * to earlier CTEs' output param IDs, but CTE outputs are not
-		 * propagated via the args list.)
+		 * 该节点不能有任何输入（因为它是 initplan），所以 parParam 和 args 列表保持为空。
+         * （它可能包含对早期 CTE 输出参数 ID 的引用，但 CTE 输出不通过 args 列表传播。）
 		 */
 
 		/*
-		 * Assign a param ID to represent the CTE's output.  No ordinary
-		 * "evaluation" of this param slot ever happens, but we use the param
-		 * ID for setParam/chgParam signaling just as if the CTE plan were
-		 * returning a simple scalar output.  (Also, the executor abuses the
-		 * ParamExecData slot for this param ID for communication among
-		 * multiple CteScan nodes that might be scanning this CTE.)
+		 * 分配一个参数 ID 来表示 CTE 的输出。从未发生过对此参数槽的普通“评估”，
+         * 但我们使用参数 ID 进行 setParam/chgParam 信号传递，
+         * 就好像 CTE 计划返回简单的标量输出一样。
+         * （此外，执行器滥用此参数 ID 的 ParamExecData 槽，用于可能正在扫描此 CTE 的多个 CteScan 节点之间的通信。）
 		 */
 		paramid = assign_special_exec_param(root);
 		splan->setParam = list_make1_int(paramid);
 
 		/*
-		 * Add the subplan and its PlannerInfo to the global lists.
+		 * 将子计划及其 PlannerInfo 添加到全局列表中。
 		 */
 		root->glob->subplans = lappend(root->glob->subplans, plan);
 		root->glob->subroots = lappend(root->glob->subroots, subroot);
@@ -1029,10 +997,10 @@ SS_process_ctes(PlannerInfo *root)
 
 		root->cte_plan_ids = lappend_int(root->cte_plan_ids, splan->plan_id);
 
-		/* Label the subplan for EXPLAIN purposes */
+		/* 为 EXPLAIN 目的标记子计划 */
 		splan->plan_name = psprintf("CTE %s", cte->ctename);
 
-		/* Lastly, fill in the cost estimates for use later */
+		/* 最后，填写成本估算以供稍后使用 */
 		cost_subplan(root, splan, plan);
 	}
 }

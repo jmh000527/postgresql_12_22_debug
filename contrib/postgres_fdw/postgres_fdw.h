@@ -21,103 +21,144 @@
 #include "libpq-fe.h"
 
 /*
- * FDW-specific planner information kept in RelOptInfo.fdw_private for a
- * postgres_fdw foreign table.  For a baserel, this struct is created by
- * postgresGetForeignRelSize, although some fields are not filled till later.
- * postgresGetForeignJoinPaths creates it for a joinrel, and
- * postgresGetForeignUpperPaths creates it for an upperrel.
+ * PgFdwRelationInfo
+ *
+ * 这是 postgres_fdw 在优化阶段为每个关系（RelOptInfo）维护的私有数据，
+ * 存储在 RelOptInfo.fdw_private 字段中。
+ *
+ * 对于基表（baserel），此结构由 postgresGetForeignRelSize 创建，
+ * 尽管部分字段会稍后填充。
+ * 对于连接关系（joinrel），由 postgresGetForeignJoinPaths 创建。
+ * 对于上层关系（upperrel，如聚合/分组），由 postgresGetForeignUpperPaths 创建。
  */
 typedef struct PgFdwRelationInfo
 {
 	/*
-	 * True means that the relation can be pushed down. Always true for simple
-	 * foreign scan.
+	 * 指示该关系是否可以安全地下推到远程服务器执行。
+	 * 对于简单的单表外部扫描（foreign scan），此值总为 true。
+	 * 对于连接或聚合，若存在不支持的语法或函数，则为 false。
 	 */
 	bool		pushdown_safe;
 
 	/*
-	 * Restriction clauses, divided into safe and unsafe to pushdown subsets.
-	 * All entries in these lists should have RestrictInfo wrappers; that
-	 * improves efficiency of selectivity and cost estimation.
+	 * 过滤条件（Restriction clauses）列表。
+	 * 分为两部分：
+	 * remote_conds: 可以安全下推并在远程服务器执行的条件。
+	 * local_conds: 不能下推，必须将数据拉回本地后过滤的条件。
+	 *
+	 * 列表中的每一项都应包装在 RestrictInfo 结构中，
+	 * 这有助于提高选择率（selectivity）和成本（cost）估算的效率。
 	 */
 	List	   *remote_conds;
 	List	   *local_conds;
 
-	/* Actual remote restriction clauses for scan (sans RestrictInfos) */
+	/*
+	 * 用于实际生成 SQL 的远程过滤条件列表（不包含 RestrictInfo 包装器）。
+	 * 这些是从 remote_conds 提取出来的纯表达式。
+	 */
 	List	   *final_remote_exprs;
 
-	/* Bitmap of attr numbers we need to fetch from the remote server. */
+	/*
+	 * 位图，记录了我们需要从远程服务器获取哪些列（属性）。
+	 * 对应于 baserel 的属性号。
+	 */
 	Bitmapset  *attrs_used;
 
-	/* True means that the query_pathkeys is safe to push down */
+	/*
+	 * 指示查询的路径键（pathkeys，即排序顺序）是否可以安全地下推。
+	 * 如果为 true，我们可以请求远程服务器对结果进行排序。
+	 */
 	bool		qp_is_pushdown_safe;
 
-	/* Cost and selectivity of local_conds. */
+	/* 本地过滤条件（local_conds）的计算成本和选择率 */
 	QualCost	local_conds_cost;
 	Selectivity local_conds_sel;
 
-	/* Selectivity of join conditions */
+	/*
+	 * 连接条件（join clauses）的选择率。
+	 * 仅当此关系为 joinrel 时有效。
+	 */
 	Selectivity joinclause_sel;
 
-	/* Estimated size and cost for a scan, join, or grouping/aggregation. */
+	/*
+	 * 估算结果：
+	 * rows: 扫描、连接或分组/聚合后的预计行数。
+	 * width: 预计行的平均宽度（字节）。
+	 * startup_cost: 启动成本（获取第一行所需的成本）。
+	 * total_cost: 总成本（获取所有行所需的成本）。
+	 *
+	 * 注意：这些成本包括了网络传输和本地处理的开销。
+	 */
 	double		rows;
 	int			width;
 	Cost		startup_cost;
 	Cost		total_cost;
 
 	/*
-	 * Estimated number of rows fetched from the foreign server, and costs
-	 * excluding costs for transferring those rows from the foreign server.
-	 * These are only used by estimate_path_cost_size().
+	 * 仅用于 estimate_path_cost_size() 内部估算的中间值：
+	 * retrieved_rows: 从远程服务器实际获取的行数估算值。
+	 * rel_startup_cost: 在远程服务器上的启动成本（不含传输）。
+	 * rel_total_cost: 在远程服务器上的总执行成本（不含传输）。
 	 */
 	double		retrieved_rows;
 	Cost		rel_startup_cost;
 	Cost		rel_total_cost;
 
-	/* Options extracted from catalogs. */
-	bool		use_remote_estimate;
-	Cost		fdw_startup_cost;
-	Cost		fdw_tuple_cost;
-	List	   *shippable_extensions;	/* OIDs of whitelisted extensions */
+	/* 从系统目录（System Catalogs）中提取的 FDW 选项 */
+	bool		use_remote_estimate;	/* 是否使用 EXPLAIN 从远程获取估算值 */
+	Cost		fdw_startup_cost;		/* FDW 设置的启动成本因子 */
+	Cost		fdw_tuple_cost;			/* FDW 设置的每行处理成本因子 */
+	List	   *shippable_extensions;	/* 允许下推的扩展 OID 白名单 */
 
-	/* Cached catalog information. */
+	/* 缓存的系统目录信息，避免重复查表 */
 	ForeignTable *table;
 	ForeignServer *server;
-	UserMapping *user;			/* only set in use_remote_estimate mode */
+	UserMapping *user;			/* 仅在 use_remote_estimate 模式下设置 */
 
-	int			fetch_size;		/* fetch size for this remote table */
+	int			fetch_size;		/* 此远程表的每次网络获取行数（fetch size） */
 
 	/*
-	 * Name of the relation while EXPLAINing ForeignScan. It is used for join
-	 * relations but is set for all relations. For join relation, the name
-	 * indicates which foreign tables are being joined and the join type used.
+	 * 关系名称，用于构建 EXPLAIN 输出中的 Description。
+	 * 也会用于 joinrel，此时名称指示了正在连接哪些表以及连接类型。
 	 */
 	StringInfo	relation_name;
 
-	/* Join information */
-	RelOptInfo *outerrel;
-	RelOptInfo *innerrel;
-	JoinType	jointype;
-	/* joinclauses contains only JOIN/ON conditions for an outer join */
-	List	   *joinclauses;	/* List of RestrictInfo */
-
-	/* Upper relation information */
-	UpperRelationKind stage;
-
-	/* Grouping information */
-	List	   *grouped_tlist;
-
-	/* Subquery information */
-	bool		make_outerrel_subquery; /* do we deparse outerrel as a
-										 * subquery? */
-	bool		make_innerrel_subquery; /* do we deparse innerrel as a
-										 * subquery? */
-	Relids		lower_subquery_rels;	/* all relids appearing in lower
-										 * subqueries */
+	/*
+	 * 连接信息（仅当此 struct 为 joinrel 时有效）
+	 */
+	RelOptInfo *outerrel;		/* 连接的外侧关系 */
+	RelOptInfo *innerrel;		/* 连接的内侧关系 */
+	JoinType	jointype;		/* 连接类型（Inner, Left, etc.） */
 
 	/*
-	 * Index of the relation.  It is used to create an alias to a subquery
-	 * representing the relation.
+	 * 仅包含 JOIN/ON 条件的列表（主要用于外连接）。
+	 * 对于内连接，条件通常在 remote_conds 中，这里可能为空。
+	 */
+	List	   *joinclauses;	/* List of RestrictInfo */
+
+	/*
+	 * 上层关系信息（仅当此 struct 为 upperrel 时有效）
+	 */
+	UpperRelationKind stage;	/* 上层处理阶段（如 Group, Sort） */
+
+	/*
+	 * 分组信息（仅当做聚合/分组下推时有效）
+	 */
+	List	   *grouped_tlist;	/* 分组目标列表 */
+
+	/*
+	 * 子查询构造信息。
+	 * 在生成远程 SQL 时，是否需要将 outerrel 或 innerrel 包装在括号子查询中？
+	 */
+	bool		make_outerrel_subquery; /* 是否将 outerrel 解析为子查询? */
+	bool		make_innerrel_subquery; /* 是否将 innerrel 解析为子查询? */
+
+	/* 所有出现在下层子查询中的关系 ID 集合 */
+	Relids		lower_subquery_rels;
+
+	/*
+	 * 关系的索引（虚构的）。
+	 * 用于在生成 SQL 时为代表该关系的子查询创建一个别名（例如 "s1", "s2"）。
 	 */
 	int			relation_index;
 } PgFdwRelationInfo;

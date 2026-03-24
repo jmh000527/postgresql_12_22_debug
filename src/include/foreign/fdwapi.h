@@ -171,20 +171,18 @@ typedef List *(*ReparameterizeForeignPathByChild_function) (PlannerInfo *root,
 															RelOptInfo *child_rel);
 
 /*
- * FdwRoutine is the struct returned by a foreign-data wrapper's handler
- * function.  It provides pointers to the callback functions needed by the
- * planner and executor.
+ * FdwRoutine 是外部数据包装器（FDW）的处理函数返回的结构体。
+ * 它提供了规划器和执行器所需的回调函数指针。
  *
- * More function pointers are likely to be added in the future.  Therefore
- * it's recommended that the handler initialize the struct with
- * makeNode(FdwRoutine) so that all fields are set to NULL.  This will
- * ensure that no fields are accidentally left undefined.
+ * 未来可能会添加更多函数指针。因此，建议处理函数使用 makeNode(FdwRoutine)
+ * 初始化结构体，以确保所有字段都设置为 NULL。
+ * 这将确保不会意外地留下未定义的字段。
  */
 typedef struct FdwRoutine
 {
 	NodeTag		type;
 
-	/* Functions for scanning foreign tables */
+	/* 扫描外部表的函数 */
 	GetForeignRelSize_function GetForeignRelSize;
 	GetForeignPaths_function GetForeignPaths;
 	GetForeignPlan_function GetForeignPlan;
@@ -194,17 +192,17 @@ typedef struct FdwRoutine
 	EndForeignScan_function EndForeignScan;
 
 	/*
-	 * Remaining functions are optional.  Set the pointer to NULL for any that
-	 * are not provided.
+	 * 其余函数是可选的。
+	 * 对于未提供的函数，请将指针设置为 NULL。
 	 */
 
-	/* Functions for remote-join planning */
+	/* 远程连接规划的函数 */
 	GetForeignJoinPaths_function GetForeignJoinPaths;
 
-	/* Functions for remote upper-relation (post scan/join) planning */
+	/* 远程上层关系（扫描/连接后）规划的函数 */
 	GetForeignUpperPaths_function GetForeignUpperPaths;
 
-	/* Functions for updating foreign tables */
+	/* 更新外部表的函数 */
 	AddForeignUpdateTargets_function AddForeignUpdateTargets;
 	PlanForeignModify_function PlanForeignModify;
 	BeginForeignModify_function BeginForeignModify;
@@ -220,23 +218,23 @@ typedef struct FdwRoutine
 	IterateDirectModify_function IterateDirectModify;
 	EndDirectModify_function EndDirectModify;
 
-	/* Functions for SELECT FOR UPDATE/SHARE row locking */
+	/* SELECT FOR UPDATE/SHARE 行锁定的函数 */
 	GetForeignRowMarkType_function GetForeignRowMarkType;
 	RefetchForeignRow_function RefetchForeignRow;
 	RecheckForeignScan_function RecheckForeignScan;
 
-	/* Support functions for EXPLAIN */
+	/* EXPLAIN 的支持函数 */
 	ExplainForeignScan_function ExplainForeignScan;
 	ExplainForeignModify_function ExplainForeignModify;
 	ExplainDirectModify_function ExplainDirectModify;
 
-	/* Support functions for ANALYZE */
+	/* ANALYZE 的支持函数 */
 	AnalyzeForeignTable_function AnalyzeForeignTable;
 
-	/* Support functions for IMPORT FOREIGN SCHEMA */
+	/* IMPORT FOREIGN SCHEMA 的支持函数 */
 	ImportForeignSchema_function ImportForeignSchema;
 
-	/* Support functions for parallelism under Gather node */
+	/* Gather 节点下并行执行的支持函数 */
 	IsForeignScanParallelSafe_function IsForeignScanParallelSafe;
 	EstimateDSMForeignScan_function EstimateDSMForeignScan;
 	InitializeDSMForeignScan_function InitializeDSMForeignScan;
@@ -244,7 +242,7 @@ typedef struct FdwRoutine
 	InitializeWorkerForeignScan_function InitializeWorkerForeignScan;
 	ShutdownForeignScan_function ShutdownForeignScan;
 
-	/* Support functions for path reparameterization. */
+	/* 路径重新参数化的支持函数 */
 	ReparameterizeForeignPathByChild_function ReparameterizeForeignPathByChild;
 } FdwRoutine;
 

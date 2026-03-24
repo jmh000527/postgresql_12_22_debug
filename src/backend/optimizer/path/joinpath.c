@@ -310,7 +310,26 @@ add_paths_to_joinrel(PlannerInfo *root,        /* 规划器全局信息结构 */
     /*
      * createplan.c 当前不支持处理由扩展推送下来的连接分配的伪常量子句；
      * 检查 restrictlist 是否有这样的子句，如果没有，则允许考虑推送下来的连接。
-     */
+	 *
+	 * 如果 joinrel->fdwroutine 不为 NULL，
+	 * 说明当前的连接关系涉及外部表，且有一个对应的 FDW（如 postgres_fdw）在管理它。
+	 *
+	 * joinrel->fdwroutine->GetForeignJoinPaths：这个 FDW 插件是否实现了远程连接的规划功能？
+	 * 并不是所有的 FDW 都支持连接下推
+	 * （例如 file_fdw 只能读文件，显然不支持在文件系统上做 SQL JOIN，所以它的这个指针通常是 NULL）。
+	 * 只有像 postgres_fdw 这样连接到另一个数据库的 FDW，才有可能实现这个函数。
+	 *
+	 * set_join_pathlist_hook：除了 FDW，PostgreSQL 还允许通过普通的钩子函数（Hook）来扩展优化器。
+	 * 如果有插件（例如 pg_hint_plan 或某些自定义的 AI 优化器插件）挂载了这个钩子，
+	 * 系统也会认为“有可能生成特殊的连接路径”。
+	 *
+	 * 即使 FDW 说“我可以做远程连接”（实现了接口），
+	 * 优化器还会进行最后一道安全检查：连接条件中是否有“伪常量”（Pseudo-constant）？
+	 *
+	 * 什么是伪常量？ 例如 WHERE remote_col = random()。
+	 * 虽然 random() 不涉及表中的列，但它在每一行可能都不一样（或者是易变的）。
+	 *
+	 */
     if ((joinrel->fdwroutine &&
          joinrel->fdwroutine->GetForeignJoinPaths) || /* 检查是否有外部数据包装器连接路径函数 */
         set_join_pathlist_hook) /* 或者设置了连接路径列表钩子 */
@@ -1619,77 +1638,135 @@ consider_parallel_mergejoin(PlannerInfo *root,
 								 merge_pathkeys, true);
 	}
 }
-
 /*
  * consider_parallel_nestloop
- *	  Try to build partial paths for a joinrel by joining a partial path for the
- *	  outer relation to a complete path for the inner relation.
+ *    尝试为连接结果关系（joinrel）构建部分路径（Partial Paths）。
+ *    方法是将外表的一个部分路径（Partial Path）与内表的一个完整路径（Complete Path）进行连接。
  *
- * 'joinrel' is the join relation
- * 'outerrel' is the outer join relation
- * 'innerrel' is the inner join relation
- * 'jointype' is the type of join to do
- * 'extra' contains additional input values
+ * 参数说明：
+ * 'joinrel': 正在构建的连接结果关系（Represents the join result）
+ * 'outerrel': 连接的外表（Outer Relation）
+ * 'innerrel': 连接的内表（Inner Relation）
+ * 'jointype': 连接类型（如 INNER, LEFT 等）
+ * 'extra': 包含额外信息的结构体（如 Semijoin 信息等）
  */
 static void
 consider_parallel_nestloop(PlannerInfo *root,
-						   RelOptInfo *joinrel,
-						   RelOptInfo *outerrel,
-						   RelOptInfo *innerrel,
-						   JoinType jointype,
-						   JoinPathExtraData *extra)
+                           RelOptInfo *joinrel,
+                           RelOptInfo *outerrel,
+                           RelOptInfo *innerrel,
+                           JoinType jointype,
+                           JoinPathExtraData *extra)
 {
-	JoinType	save_jointype = jointype;
-	ListCell   *lc1;
+    /* 
+     * 保存原始的连接类型。
+     * 因为如果原始类型是 JOIN_UNIQUE_INNER（通常用于 Semi Join 优化），
+     * 下面我们会暂时把它当做普通的 JOIN_INNER 来处理逻辑，
+     * 但在某些判断中还需要知道它原本是 JOIN_UNIQUE_INNER。
+     */
+    JoinType	save_jointype = jointype;
+    ListCell   *lc1;
 
-	if (jointype == JOIN_UNIQUE_INNER)
-		jointype = JOIN_INNER;
+    /*
+     * 如果连接类型是 JOIN_UNIQUE_INNER（意味着我们需要保证内表的唯一性），
+     * 将其视为普通的 JOIN_INNER 进行处理。后续我们会对内表路径添加 Unique 节点来满足唯一性要求。
+     */
+    if (jointype == JOIN_UNIQUE_INNER)
+        jointype = JOIN_INNER;
 
-	foreach(lc1, outerrel->partial_pathlist)
-	{
-		Path	   *outerpath = (Path *) lfirst(lc1);
-		List	   *pathkeys;
-		ListCell   *lc2;
+    /*
+     * 核心循环 1：遍历外表的所有【部分路径】(partial_pathlist)。
+     * 
+     * 举例：
+     * 如果外表很大（big_table），PostgreSQL 可能会为其生成一个 "Parallel Seq Scan" 路径，
+     * 这是一个 Partial Path，意味着如果你运行它，你只能得到表的一部分数据。
+     * 我们这里就是尝试用这个并行的扫描作为 NestLoop 的驱动端。
+     */
+    foreach(lc1, outerrel->partial_pathlist)
+    {
+        Path	   *outerpath = (Path *) lfirst(lc1);
+        List	   *pathkeys;
+        ListCell   *lc2;
 
-		/* Figure out what useful ordering any paths we create will have. */
-		pathkeys = build_join_pathkeys(root, joinrel, jointype,
-									   outerpath->pathkeys);
+        /* 
+         * 计算生成的连接路径会有什么样的排序（PathKeys）。
+         * NestLoop Join 的结果排序通常由外表的排序决定。
+         * 如果外表的并行路径是有序的（例如 Parallel Index Scan），那么 Join 的结果也是有序的。
+         */
+        pathkeys = build_join_pathkeys(root, joinrel, jointype,
+                                       outerpath->pathkeys);
 
-		/*
-		 * Try the cheapest parameterized paths; only those which will produce
-		 * an unparameterized path when joined to this outerrel will survive
-		 * try_partial_nestloop_path.  The cheapest unparameterized path is
-		 * also in this list.
-		 */
-		foreach(lc2, innerrel->cheapest_parameterized_paths)
-		{
-			Path	   *innerpath = (Path *) lfirst(lc2);
+        /*
+         * 核心循环 2：遍历内表的【最廉价参数化路径】(cheapest_parameterized_paths)。
+         * 
+         * 为什么是 "parameterized"（参数化）路径？
+         * NestLoop 的经典用法是 Index Nested Loop Join：
+         * 外表每扫描一行，把这一行的值作为"参数"传给内表，内表利用这个参数去查索引。
+         * 这种 "利用外部参数的索引扫描" 就是一种 Parameterized Path。
+         * 
+         * 注意：cheapest_parameterized_paths 列表里也包含了不带参数的最廉价全表扫描路径。
+         * 所以这个循环既覆盖了 "For each outer row -> Index Scan inner"，
+         * 也覆盖了 "For each outer row -> Seq Scan inner" (虽然通常很慢)。
+         */
+        foreach(lc2, innerrel->cheapest_parameterized_paths)
+        {
+            Path	   *innerpath = (Path *) lfirst(lc2);
 
-			/* Can't join to an inner path that is not parallel-safe */
-			if (!innerpath->parallel_safe)
-				continue;
+            /* 
+             * 关键检查：内表路径必须是【并行安全】(parallel_safe) 的。
+             * 
+             * 举例：
+             * 如果内表的路径是一个 Index Scan，通常是并行安全的，我们可以继续。
+             * 但如果内表的路径包含一个临时表扫描，或者调用了一个非并行安全的自定义函数，
+             * 那么让多个 Worker 同时执行这个路径是不安全的，必须跳过。
+             */
+            if (!innerpath->parallel_safe)
+                continue;
 
-			/*
-			 * If we're doing JOIN_UNIQUE_INNER, we can only use the inner's
-			 * cheapest_total_path, and we have to unique-ify it.  (We might
-			 * be able to relax this to allow other safe, unparameterized
-			 * inner paths, but right now create_unique_path is not on board
-			 * with that.)
-			 */
-			if (save_jointype == JOIN_UNIQUE_INNER)
-			{
-				if (innerpath != innerrel->cheapest_total_path)
-					continue;
-				innerpath = (Path *) create_unique_path(root, innerrel,
-														innerpath,
-														extra->sjinfo);
-				Assert(innerpath);
-			}
+            /*
+            /*
+             * 特殊处理 JOIN_UNIQUE_INNER (Semi Join 的一种实现策略)。
+             * 
+             * 这里的逻辑是：如果我们做半连接，并且要求内表唯一化，
+             * 目前代码限制只能使用内表的 cheapest_total_path（最廉价的完整路径），
+             * 并在其之上强制添加一个 Unique 节点（create_unique_path）。
+             */
+            if (save_jointype == JOIN_UNIQUE_INNER)
+            {
+                /* 目前只支持对最廉价路径做唯一化 */
+                if (innerpath != innerrel->cheapest_total_path)
+                    continue;
+                
+                /* 
+                 * 在内表路径上包裹一层 Unique 节点。
+                 * 举例：如果内表是 (Subquery Scan)，我们需要在这个扫描上面加一个 Unique 算子，
+                 * 确保对于外表的每一行，内表只返回唯一的匹配（或不返回）。
+                 */
+                innerpath = (Path *) create_unique_path(root, innerrel,
+                                                        innerpath,
+                                                        extra->sjinfo);
+                Assert(innerpath);
+            }
 
-			try_partial_nestloop_path(root, joinrel, outerpath, innerpath,
-									  pathkeys, jointype, extra);
-		}
-	}
+            /*
+             * 尝试构建并添加 Partial NestLoop 路径。
+             * 
+             * try_partial_nestloop_path 内部会做以下事情：
+             * 1. 检查 outerpath 和 innerpath 是否均有效。
+             * 2. 检查 innerpath 所需的参数是否都能由 outerpath 提供。
+             * 3. 计算 Cost（成本）。因为 outerpath 是 Partial 的，所以 Cost 会除以 Worker 数。
+             * 4. 创建一个 NestPath 节点（作为 Partial Path），并加入到 joinrel->partial_pathlist 中。
+             * 
+             * 最终生成的计划结构类似于：
+             * Gather
+             *   -> Nested Loop
+             *        -> Parallel Seq Scan (Outer, Partial)
+             *        -> Index Scan (Inner, Complete, using Outer's vars)
+             */
+            try_partial_nestloop_path(root, joinrel, outerpath, innerpath,
+                                      pathkeys, jointype, extra);
+        }
+    }
 }
 
 /*

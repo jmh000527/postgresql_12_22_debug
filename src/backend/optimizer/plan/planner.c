@@ -645,10 +645,19 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
     replace_empty_jointree(parse);
 
     /*
-     * 在WHERE和JOIN/ON子句中查找ANY和EXISTS类型的SubLink，
-     * 并尝试将其上拉转换为连接（join）。
-     * 注意：此步骤不会递归处理子查询；如果后续拉升了子查询，
-     * 其内部的SubLink会在拉升前被处理。
+     * 预处理步骤：上拉子链接 (SubLink Pull-up)。
+     *
+     * 在 WHERE 和 JOIN/ON 子句中查找 ANY 和 EXISTS 类型的 SubLink，
+     * 并尝试将其转换为 半连接 (Semi Join) 或 反半连接 (Anti Join)。
+     *
+     * 作用：
+     * 1. 消除作为表达式存在的子查询，将其转换为连接树中的节点。
+     * 2. 允许优化器将这些子查询与主查询的其他表一起参与连接顺序的规划，通常能获得更好的性能。
+     * 3. 例如：`WHERE x IN (SELECT id FROM t)` 通常会被转换为针对 t 的 Semi Join。
+     *
+     * 注意：此步骤只处理当前查询层级的 SubLink。它不会递归挖掘子查询内部。
+     * 如果后续有子查询被提升 (通过 pull_up_subqueries)，其内部的 SubLink 
+     * 会在那个子查询被规划时，或者在它被提升并合并到当前查询之前被处理。
      */
     if (parse->hasSubLinks)
         pull_up_sublinks(root);
