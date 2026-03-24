@@ -14,6 +14,395 @@ Outline系统提供以下核心能力：
 4. **动态管理**：无需修改应用代码即可启用/禁用Outline
 5. **自动生成Hint**：自动从执行计划生成Hint，无需手动编写（新功能）
 
+## 快速入门：构建、安装与测试
+
+本节提供完整的步骤指导，让初学者能够从零开始构建、安装PostgreSQL Outline功能，并进行完整的功能测试。
+
+### 前置要求
+
+在开始之前，请确保系统已安装以下软件：
+
+```bash
+# Ubuntu/Debian系统
+sudo apt-get update
+sudo apt-get install -y build-essential libreadline-dev zlib1g-dev flex bison
+
+# CentOS/RHEL系统
+sudo yum install -y gcc make readline-devel zlib-devel flex bison
+
+# macOS系统
+brew install readline
+```
+
+### 步骤1：获取源代码
+
+```bash
+# 克隆仓库
+git clone https://github.com/jmh000527/postgresql_12_22_debug.git
+cd postgresql_12_22_debug
+```
+
+### 步骤2：配置编译选项
+
+```bash
+# 配置PostgreSQL编译选项
+# --prefix 指定安装目录
+# --enable-debug 启用调试信息
+# --enable-cassert 启用断言检查
+./configure --prefix=/usr/local/pgsql --enable-debug --enable-cassert
+```
+
+**输出示例：**
+```
+checking build system type... x86_64-pc-linux-gnu
+checking host system type... x86_64-pc-linux-gnu
+...
+configure: creating ./config.status
+config.status: creating GNUmakefile
+config.status: creating src/Makefile.global
+...
+PostgreSQL configured successfully.
+```
+
+### 步骤3：编译源代码
+
+```bash
+# 使用多核编译（-j4表示使用4个CPU核心，可根据实际情况调整）
+make -j4
+
+# 如果编译成功，最后会显示：
+# All of PostgreSQL successfully made. Ready to install.
+```
+
+**编译时间：** 通常需要5-15分钟，取决于机器性能。
+
+### 步骤4：安装PostgreSQL
+
+```bash
+# 安装到指定目录
+sudo make install
+
+# 输出示例：
+# PostgreSQL installation complete.
+```
+
+### 步骤5：初始化数据库集群
+
+```bash
+# 创建postgres用户（如果不存在）
+sudo useradd -m postgres
+
+# 创建数据目录
+sudo mkdir -p /usr/local/pgsql/data
+sudo chown postgres:postgres /usr/local/pgsql/data
+
+# 切换到postgres用户
+sudo -u postgres bash
+
+# 初始化数据库集群
+/usr/local/pgsql/bin/initdb -D /usr/local/pgsql/data
+
+# 输出示例：
+# Success. You can now start the database server using:
+#     /usr/local/pgsql/bin/pg_ctl -D /usr/local/pgsql/data -l logfile start
+```
+
+### 步骤6：启动PostgreSQL服务
+
+```bash
+# 作为postgres用户启动数据库
+/usr/local/pgsql/bin/pg_ctl -D /usr/local/pgsql/data -l /usr/local/pgsql/logfile start
+
+# 输出示例：
+# waiting for server to start.... done
+# server started
+```
+
+### 步骤7：连接数据库并验证安装
+
+```bash
+# 连接到PostgreSQL
+/usr/local/pgsql/bin/psql -d postgres
+
+# 在psql提示符下执行：
+postgres=# SELECT version();
+# 应该显示PostgreSQL 12.22版本信息
+
+# 检查Outline功能是否可用
+postgres=# \d pg_outline
+# 应该显示pg_outline系统表的结构
+```
+
+### 步骤8：创建测试数据
+
+现在让我们创建完整的测试案例来验证Outline功能：
+
+```sql
+-- 创建测试表
+CREATE TABLE customers (
+    id INT PRIMARY KEY,
+    region VARCHAR(100),
+    name VARCHAR(100)
+);
+
+CREATE TABLE orders (
+    order_id INT PRIMARY KEY,
+    customer_id INT,
+    amount DECIMAL,
+    status VARCHAR(50)
+);
+
+-- 创建索引
+CREATE INDEX idx_customer_region ON customers(region);
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+CREATE INDEX idx_orders_status ON orders(status);
+
+-- 插入测试数据
+INSERT INTO customers
+SELECT i, 'region_' || (i % 10), 'customer_' || i
+FROM generate_series(1, 1000) i;
+
+INSERT INTO orders
+SELECT i, (i % 1000) + 1, random() * 1000,
+       CASE WHEN random() < 0.5 THEN 'pending' ELSE 'completed' END
+FROM generate_series(1, 5000) i;
+
+-- 分析表以更新统计信息
+ANALYZE customers;
+ANALYZE orders;
+```
+
+### 步骤9：测试基本Outline功能
+
+#### 测试1：手动创建Outline
+
+```sql
+-- 1. 创建一个简单的Outline
+SELECT pg_create_outline(
+    'outline_customer_by_region',
+    'SELECT * FROM customers WHERE region = $1',
+    'IndexScan(customers idx_customer_region)'
+);
+
+-- 预期输出：
+--  pg_create_outline
+-- -------------------
+--              16384
+-- (1 row)
+
+-- 2. 查看创建的Outline
+SELECT outlinename, outlinequery, outlinehints
+FROM pg_outline;
+
+-- 预期输出：
+--        outlinename        |              outlinequery               |               outlinehints
+-- --------------------------+-----------------------------------------+------------------------------------------
+--  outline_customer_by_region | select * from customers where region = $1 | IndexScan(customers idx_customer_region)
+
+-- 3. 执行匹配Outline的查询
+EXPLAIN SELECT * FROM customers WHERE region = 'region_5';
+
+-- 预期输出应包含：
+-- Index Scan using idx_customer_region on customers
+```
+
+#### 测试2：自动显示Outline Data
+
+```sql
+-- 1. 启用自动显示功能
+SET outline.display_hints = on;
+
+-- 2. 执行查询
+SELECT * FROM orders WHERE status = 'pending' LIMIT 5;
+
+-- 预期输出包含NOTICE消息：
+-- NOTICE:  Outline Data:
+-- /*+
+-- BEGIN_OUTLINE_DATA
+-- IndexScan(orders idx_orders_status)
+-- END_OUTLINE_DATA
+-- */
+
+-- 3. 对于连接查询
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'region_1'
+LIMIT 10;
+
+-- 预期输出包含多个Hint的NOTICE消息
+```
+
+#### 测试3：录制模式（sr_plan式）
+
+```sql
+-- 1. 启用录制模式
+SET outline.recording_mode = on;
+SET outline.display_hints = on;
+
+-- 2. 执行要录制的查询
+SELECT * FROM customers WHERE region = 'region_3';
+
+-- 预期输出：
+-- NOTICE:  Outline Data:
+-- /*+
+-- BEGIN_OUTLINE_DATA
+-- IndexScan(customers idx_customer_region)
+-- END_OUTLINE_DATA
+-- */
+-- NOTICE:  Created outline "auto_outline_12345_1" for query
+
+-- 3. 关闭录制模式
+SET outline.recording_mode = off;
+SET outline.display_hints = off;
+
+-- 4. 验证自动创建的Outline
+SELECT outlinename, outlinequery, outlinehints
+FROM pg_outline
+WHERE outlinename LIKE 'auto_outline%';
+
+-- 5. 测试回放（再次执行相同查询）
+SELECT * FROM customers WHERE region = 'region_3' LIMIT 5;
+
+-- 查询应自动使用之前录制的Outline
+```
+
+#### 测试4：Outline管理操作
+
+```sql
+-- 1. 禁用Outline
+SELECT pg_disable_outline('outline_customer_by_region');
+
+-- 2. 验证已禁用
+SELECT outlinename, outlineenabled FROM pg_outline;
+
+-- 3. 重新启用
+SELECT pg_enable_outline('outline_customer_by_region');
+
+-- 4. 删除Outline
+SELECT pg_drop_outline('outline_customer_by_region');
+
+-- 5. 确认已删除
+SELECT count(*) FROM pg_outline WHERE outlinename = 'outline_customer_by_region';
+-- 预期输出：0
+```
+
+### 步骤10：高级测试案例
+
+#### 测试5：多Hint的Outline
+
+```sql
+-- 创建包含多个Hint的Outline（使用OceanBase格式）
+SELECT pg_create_outline(
+    'outline_complex_join',
+    'SELECT c.name, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id WHERE c.region = $1',
+    '/*+
+    BEGIN_OUTLINE_DATA
+    IndexScan(customers idx_customer_region)
+    IndexScan(orders idx_orders_customer)
+    HashJoin(customers orders)
+    END_OUTLINE_DATA
+    */'
+);
+
+-- 验证Outline
+EXPLAIN SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'region_2';
+
+-- 预期输出应显示：
+-- Hash Join
+--   -> Index Scan using idx_customer_region on customers c
+--   -> Index Scan using idx_orders_customer on orders o
+```
+
+#### 测试6：强制顺序扫描
+
+```sql
+-- 创建强制SeqScan的Outline
+SELECT pg_create_outline(
+    'outline_force_seqscan',
+    'SELECT * FROM orders WHERE status = $1',
+    'SeqScan(orders)'
+);
+
+-- 执行查询并验证
+EXPLAIN SELECT * FROM orders WHERE status = 'pending';
+
+-- 预期输出应显示：
+-- Seq Scan on orders
+-- 而不是 Index Scan
+```
+
+### 故障排查
+
+如果遇到问题，请检查以下几点：
+
+1. **编译失败**
+   ```bash
+   # 检查是否安装了必需的开发工具
+   gcc --version
+   make --version
+   ```
+
+2. **服务无法启动**
+   ```bash
+   # 查看日志文件
+   cat /usr/local/pgsql/logfile
+
+   # 检查端口是否被占用
+   netstat -an | grep 5432
+   ```
+
+3. **pg_outline表不存在**
+   ```sql
+   -- 检查是否在正确的数据库中
+   SELECT current_database();
+
+   -- 检查是否有权限
+   SELECT current_user;
+   ```
+
+4. **Outline不生效**
+   ```sql
+   -- 检查Outline是否启用
+   SELECT outlinename, outlineenabled FROM pg_outline;
+
+   -- 检查查询是否匹配（规范化）
+   SET client_min_messages = DEBUG1;
+   -- 然后执行查询，查看日志中是否有"Applied outline"消息
+   ```
+
+### 清理测试环境
+
+测试完成后，可以清理测试数据：
+
+```sql
+-- 删除所有自动创建的Outline
+SELECT pg_drop_outline(outlinename)
+FROM pg_outline
+WHERE outlinename LIKE 'auto_outline%';
+
+-- 删除测试表
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS customers;
+
+-- 或者停止并删除整个数据库集群
+-- 退出psql，然后执行：
+# /usr/local/pgsql/bin/pg_ctl -D /usr/local/pgsql/data stop
+# sudo rm -rf /usr/local/pgsql/data
+```
+
+### 下一步
+
+恭喜！您已经成功构建、安装并测试了PostgreSQL Outline功能。接下来可以：
+
+1. 阅读下面的详细功能说明，了解更多高级特性
+2. 在实际应用场景中使用Outline功能
+3. 探索录制模式（sr_plan式）的更多用法
+4. 学习如何监控和优化Outline的效果
+
 ## 自动Outline生成功能（新增）
 
 ### 功能说明
