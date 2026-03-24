@@ -102,6 +102,7 @@ typedef struct HintState
 extern HintState *parse_hints(const char *hint_str);
 extern void free_hint_state(HintState *hstate);
 extern char *plan_to_hints(PlannedStmt *plan, const char *query_string);
+extern char *format_outline_data(const char *hints);
 extern HintState *get_hints_for_query(const char *query_string);
 
 /* Hint state management */
@@ -116,5 +117,9 @@ extern void outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 extern void outline_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 									 RelOptInfo *outerrel, RelOptInfo *innerrel,
 									 JoinType jointype, JoinPathExtraData *extra);
+
+/* GUC parameters and initialization */
+extern bool outline_display_hints;
+extern void outline_init_guc(void);
 
 #endif							/* OUTLINE_HINTS_H */

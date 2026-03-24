@@ -49,6 +49,7 @@
 #include "miscadmin.h"
 #include "nodes/print.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/outline_hints.h"
 #include "pgstat.h"
 #include "pg_trace.h"
 #include "parser/analyze.h"
@@ -1223,6 +1224,37 @@ exec_simple_query(const char *query_string)
 						 completionTag);
 
 		receiver->rDestroy(receiver);
+
+		/*
+		 * Display outline data if configured
+		 */
+		if (outline_display_hints && plantree_list != NIL)
+		{
+			ListCell   *lc;
+
+			foreach(lc, plantree_list)
+			{
+				PlannedStmt *pstmt = lfirst_node(PlannedStmt, lc);
+				char	   *hints;
+				char	   *outline_data;
+
+				/* Generate hints from the plan */
+				hints = plan_to_hints(pstmt, query_string);
+				if (hints != NULL)
+				{
+					/* Format in OceanBase/Oracle style */
+					outline_data = format_outline_data(hints);
+					if (outline_data != NULL)
+					{
+						/* Send as NOTICE message to client */
+						ereport(NOTICE,
+								(errmsg("Outline Data:\n%s", outline_data)));
+						pfree(outline_data);
+					}
+					pfree(hints);
+				}
+			}
+		}
 
 		PortalDrop(portal, false);
 
@@ -4055,6 +4087,11 @@ PostgresMain(int argc, char *argv[],
 	 */
 	if (!IsUnderPostmaster)
 		PgStartTime = GetCurrentTimestamp();
+
+	/*
+	 * Initialize outline system GUC parameters
+	 */
+	outline_init_guc();
 
 	/*
 	 * POSTGRES main processing loop begins here

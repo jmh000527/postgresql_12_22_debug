@@ -25,10 +25,10 @@
 #include "catalog/namespace.h"
 
 /* Forward declarations */
-static void extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset);
-static void extract_scan_hints(Scan *scan, StringInfo hints);
-static void extract_join_hints(Join *join, StringInfo hints);
-static char *get_rel_name(Index relid, List *rtable);
+static void extract_hints_from_plan(Plan *plan, StringInfo hints, List *rtable, int rtoffset);
+static void extract_scan_hints(Scan *scan, StringInfo hints, List *rtable);
+static void extract_join_hints(Join *join, StringInfo hints, List *rtable);
+static char *get_rel_name(Oid relid, List *rtable);
 
 /*
  * Convert a PlannedStmt to a hint string
@@ -47,7 +47,7 @@ plan_to_hints(PlannedStmt *pstmt, const char *query_string)
 	initStringInfo(&hints);
 
 	/* Extract hints from the plan tree */
-	extract_hints_from_plan(pstmt->planTree, &hints, 0);
+	extract_hints_from_plan(pstmt->planTree, &hints, pstmt->rtable, 0);
 
 	if (hints.len == 0)
 	{
@@ -59,10 +59,54 @@ plan_to_hints(PlannedStmt *pstmt, const char *query_string)
 }
 
 /*
+ * Format hints in OceanBase/Oracle outline data style
+ *
+ * Wraps hints in a comment block with BEGIN_OUTLINE_DATA/END_OUTLINE_DATA
+ * markers, similar to OceanBase and Oracle format.
+ */
+char *
+format_outline_data(const char *hints)
+{
+	StringInfoData outline;
+	char	   *line;
+	char	   *hints_copy;
+	char	   *saveptr;
+
+	if (hints == NULL || hints[0] == '\0')
+		return NULL;
+
+	initStringInfo(&outline);
+
+	/* Start outline data block */
+	appendStringInfoString(&outline, "/*+\n");
+	appendStringInfoString(&outline, "BEGIN_OUTLINE_DATA\n");
+
+	/* Add each hint on a separate line */
+	hints_copy = pstrdup(hints);
+	line = strtok_r(hints_copy, "\n", &saveptr);
+	while (line != NULL)
+	{
+		/* Skip empty lines */
+		if (line[0] != '\0')
+		{
+			appendStringInfo(&outline, "%s\n", line);
+		}
+		line = strtok_r(NULL, "\n", &saveptr);
+	}
+	pfree(hints_copy);
+
+	/* End outline data block */
+	appendStringInfoString(&outline, "END_OUTLINE_DATA\n");
+	appendStringInfoString(&outline, "*/");
+
+	return outline.data;
+}
+
+/*
  * Recursively extract hints from a plan node
  */
 static void
-extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset)
+extract_hints_from_plan(Plan *plan, StringInfo hints, List *rtable, int rtoffset)
 {
 	if (plan == NULL)
 		return;
@@ -76,16 +120,16 @@ extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset)
 		case T_BitmapIndexScan:
 		case T_BitmapHeapScan:
 		case T_TidScan:
-			extract_scan_hints((Scan *) plan, hints);
+			extract_scan_hints((Scan *) plan, hints, rtable);
 			break;
 
 		case T_NestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
-			extract_join_hints((Join *) plan, hints);
+			extract_join_hints((Join *) plan, hints, rtable);
 			/* Recursively process join inputs */
-			extract_hints_from_plan(plan->lefttree, hints, rtoffset);
-			extract_hints_from_plan(plan->righttree, hints, rtoffset);
+			extract_hints_from_plan(plan->lefttree, hints, rtable, rtoffset);
+			extract_hints_from_plan(plan->righttree, hints, rtable, rtoffset);
 			break;
 
 		case T_Append:
@@ -100,7 +144,7 @@ extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset)
 				{
 					Plan	   *subplan = (Plan *) lfirst(lc);
 
-					extract_hints_from_plan(subplan, hints, rtoffset);
+					extract_hints_from_plan(subplan, hints, rtable, rtoffset);
 				}
 			}
 			break;
@@ -109,7 +153,7 @@ extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset)
 			{
 				SubqueryScan *subscan = (SubqueryScan *) plan;
 
-				extract_hints_from_plan(subscan->subplan, hints,
+				extract_hints_from_plan(subscan->subplan, hints, rtable,
 									   subscan->scan.scanrelid);
 			}
 			break;
@@ -117,9 +161,9 @@ extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset)
 		default:
 			/* Recursively process left and right subtrees */
 			if (plan->lefttree)
-				extract_hints_from_plan(plan->lefttree, hints, rtoffset);
+				extract_hints_from_plan(plan->lefttree, hints, rtable, rtoffset);
 			if (plan->righttree)
-				extract_hints_from_plan(plan->righttree, hints, rtoffset);
+				extract_hints_from_plan(plan->righttree, hints, rtable, rtoffset);
 			break;
 	}
 }
@@ -128,18 +172,18 @@ extract_hints_from_plan(Plan *plan, StringInfo hints, int rtoffset)
  * Extract scan method hints from a scan node
  */
 static void
-extract_scan_hints(Scan *scan, StringInfo hints)
+extract_scan_hints(Scan *scan, StringInfo hints, List *rtable)
 {
 	RangeTblEntry *rte;
 	char	   *relname;
 
 	/* Get the range table entry */
-	rte = rt_fetch(scan->scanrelid, currentQueryEnv->rtable);
+	rte = rt_fetch(scan->scanrelid, rtable);
 	if (rte == NULL || rte->rtekind != RTE_RELATION)
 		return;
 
 	/* Get relation name */
-	relname = get_rel_name(rte->relid, NULL);
+	relname = get_rel_name(rte->relid, rtable);
 	if (relname == NULL)
 		return;
 
@@ -206,7 +250,7 @@ extract_scan_hints(Scan *scan, StringInfo hints)
  * Extract join method hints from a join node
  */
 static void
-extract_join_hints(Join *join, StringInfo hints)
+extract_join_hints(Join *join, StringInfo hints, List *rtable)
 {
 	char	   *outer_rel = NULL;
 	char	   *inner_rel = NULL;
@@ -217,19 +261,19 @@ extract_join_hints(Join *join, StringInfo hints)
 	if (IsA(outer_plan, Scan))
 	{
 		Scan	   *scan = (Scan *) outer_plan;
-		RangeTblEntry *rte = rt_fetch(scan->scanrelid, currentQueryEnv->rtable);
+		RangeTblEntry *rte = rt_fetch(scan->scanrelid, rtable);
 
 		if (rte && rte->rtekind == RTE_RELATION)
-			outer_rel = get_rel_name(rte->relid, NULL);
+			outer_rel = get_rel_name(rte->relid, rtable);
 	}
 
 	if (IsA(inner_plan, Scan))
 	{
 		Scan	   *scan = (Scan *) inner_plan;
-		RangeTblEntry *rte = rt_fetch(scan->scanrelid, currentQueryEnv->rtable);
+		RangeTblEntry *rte = rt_fetch(scan->scanrelid, rtable);
 
 		if (rte && rte->rtekind == RTE_RELATION)
-			inner_rel = get_rel_name(rte->relid, NULL);
+			inner_rel = get_rel_name(rte->relid, rtable);
 	}
 
 	if (outer_rel == NULL || inner_rel == NULL)
