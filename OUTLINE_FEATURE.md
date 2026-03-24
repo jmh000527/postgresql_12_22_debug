@@ -628,6 +628,186 @@ After completing these tests, you can:
 2. **Explore recording mode**: Check `RECORDING_MODE_TEST.md` for advanced recording mode examples
 3. **Try real workloads**: Apply Outlines to your actual queries
 4. **Monitor performance**: Use EXPLAIN ANALYZE to measure the impact of Outlines
+5. **Use inline hints**: Try `INLINE_HINTS_TEST.md` for inline hint syntax and examples
+
+## Inline Hints Feature
+
+### Overview
+
+The inline hints feature allows you to specify hints directly within SQL queries using special comment syntax. This is particularly useful when:
+- You have queries with multiple SELECT keywords (subqueries, CTEs)
+- You want to specify different hints for different parts of a complex query
+- You prefer to keep hints with the query rather than storing them separately
+
+### Syntax
+
+Inline hints use the format: `/*+ hint1 hint2 ... */`
+
+The comment must start with `/*+` (slash-star-plus) to be recognized as a hint comment. Regular comments starting with `/*` (without the plus) are ignored.
+
+### Basic Examples
+
+#### Single Table Query
+
+```sql
+-- Force Sequential Scan
+SELECT /*+ SeqScan(customers) */ * FROM customers WHERE region = 'region_5';
+
+-- Force Index Scan
+SELECT /*+ IndexScan(customers idx_customer_region) */ * FROM customers WHERE region = 'region_5';
+
+-- Disable Sequential Scan (force index usage)
+SELECT /*+ NoSeqScan(customers) */ * FROM customers WHERE id > 500;
+```
+
+#### Join Queries
+
+```sql
+-- Force Hash Join
+SELECT /*+ HashJoin(customers orders) */ c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'region_1';
+
+-- Force Nested Loop Join
+SELECT /*+ NestLoop(customers orders) */ c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'region_1';
+```
+
+### Multiple SELECT Statements
+
+The key feature of inline hints is support for multiple SELECT keywords with different hints:
+
+#### Subquery Example
+
+```sql
+-- Main query uses IndexScan, subquery uses SeqScan
+SELECT /*+ IndexScan(customers idx_customer_region) */ *
+FROM customers c
+WHERE c.region = 'region_5'
+  AND EXISTS (
+      SELECT /*+ SeqScan(orders) */ 1
+      FROM orders o
+      WHERE o.customer_id = c.id AND o.amount > 50
+  );
+```
+
+In this example:
+- The main query's customers table will use an Index Scan
+- The subquery's orders table will use a Sequential Scan
+
+#### CTE (Common Table Expression) Example
+
+```sql
+WITH high_value_orders AS (
+    SELECT /*+ SeqScan(orders) */ customer_id, SUM(amount) as total
+    FROM orders
+    WHERE amount > 50
+    GROUP BY customer_id
+)
+SELECT /*+ HashJoin(customers high_value_orders) */ c.name, h.total
+FROM customers c
+JOIN high_value_orders h ON c.id = h.customer_id;
+```
+
+### OceanBase-Compatible Format
+
+You can also use the OceanBase-style format with BEGIN_OUTLINE_DATA markers:
+
+```sql
+SELECT /*+
+BEGIN_OUTLINE_DATA
+IndexScan(customers idx_customer_region)
+HashJoin(customers orders)
+END_OUTLINE_DATA
+*/ c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'region_3';
+```
+
+### Hint Extraction and Merging
+
+When a query contains multiple inline hint comments, they are all extracted and merged together. For example:
+
+```sql
+SELECT /*+ IndexScan(customers idx_customer_region) */ c.name
+FROM customers c
+WHERE c.id IN (
+    SELECT /*+ SeqScan(orders) */ customer_id
+    FROM orders
+    WHERE amount > 75
+);
+```
+
+The system extracts: `IndexScan(customers idx_customer_region) SeqScan(orders)`
+
+Both hints are applied during query planning.
+
+### Priority and Precedence
+
+1. **Inline hints have highest priority**: If a query contains inline hints, they take precedence over stored outlines in the `pg_outline` catalog.
+2. **Stored outlines are fallback**: If no inline hints are present, the system checks for matching outlines in `pg_outline`.
+
+Example:
+
+```sql
+-- Create a stored outline
+SELECT pg_create_outline(
+    'outline1',
+    'SELECT * FROM customers WHERE region = $1',
+    'SeqScan(customers)'
+);
+
+-- This query uses the stored outline (SeqScan)
+SELECT * FROM customers WHERE region = 'region_5';
+
+-- This query overrides with inline hint (IndexScan)
+SELECT /*+ IndexScan(customers idx_customer_region) */ *
+FROM customers WHERE region = 'region_5';
+```
+
+### Supported Hint Types
+
+All hint types supported by the Outline system work with inline hints:
+
+**Scan Method Hints:**
+- `SeqScan(table)` - Force sequential scan
+- `IndexScan(table index)` - Force index scan with specific index
+- `NoSeqScan(table)` - Disable sequential scan
+- `NoIndexScan(table)` - Disable index scan
+
+**Join Method Hints:**
+- `NestLoop(table1 table2)` - Force nested loop join
+- `HashJoin(table1 table2)` - Force hash join
+- `MergeJoin(table1 table2)` - Force merge join
+
+### Debugging Inline Hints
+
+To see when inline hints are being extracted and applied:
+
+```sql
+SET client_min_messages = DEBUG1;
+
+SELECT /*+ SeqScan(customers) */ * FROM customers WHERE region = 'region_5';
+```
+
+You'll see debug messages like:
+```
+DEBUG:  Extracted inline hints: SeqScan(customers)
+DEBUG:  Applying inline hints from query
+```
+
+### Complete Test Suite
+
+For comprehensive examples and test cases, see `INLINE_HINTS_TEST.md` which includes:
+- Basic inline hint tests
+- Multiple SELECT statement tests
+- Subquery and CTE examples
+- Priority and precedence tests
+- Performance comparisons
 
 ## Architecture
 

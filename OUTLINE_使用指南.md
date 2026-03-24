@@ -402,6 +402,186 @@ DROP TABLE IF EXISTS customers;
 2. 在实际应用场景中使用Outline功能
 3. 探索录制模式（sr_plan式）的更多用法
 4. 学习如何监控和优化Outline的效果
+5. 尝试内联Hint功能，详见 `INLINE_HINTS_TEST.md`
+
+## 内联Hint功能
+
+### 概述
+
+内联Hint功能允许您直接在SQL查询中使用特殊注释语法指定Hint。这在以下场景特别有用：
+- 查询包含多个SELECT关键字（子查询、CTE）
+- 需要为复杂查询的不同部分指定不同的Hint
+- 希望将Hint与查询保持在一起而不是单独存储
+
+### 语法
+
+内联Hint使用格式：`/*+ hint1 hint2 ... */`
+
+注释必须以 `/*+`（斜杠-星号-加号）开始才会被识别为Hint注释。普通的 `/*` 注释（不带加号）会被忽略。
+
+### 基本示例
+
+#### 单表查询
+
+```sql
+-- 强制顺序扫描
+SELECT /*+ SeqScan(customers) */ * FROM customers WHERE region = 'region_5';
+
+-- 强制索引扫描
+SELECT /*+ IndexScan(customers idx_customer_region) */ * FROM customers WHERE region = 'region_5';
+
+-- 禁用顺序扫描（强制使用索引）
+SELECT /*+ NoSeqScan(customers) */ * FROM customers WHERE id > 500;
+```
+
+#### 连接查询
+
+```sql
+-- 强制Hash Join
+SELECT /*+ HashJoin(customers orders) */ c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'region_1';
+
+-- 强制Nested Loop Join
+SELECT /*+ NestLoop(customers orders) */ c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'region_1';
+```
+
+### 多个SELECT语句
+
+内联Hint的核心特性是支持在多个SELECT关键字处指定不同的Hint：
+
+#### 子查询示例
+
+```sql
+-- 主查询使用IndexScan，子查询使用SeqScan
+SELECT /*+ IndexScan(customers idx_customer_region) */ *
+FROM customers c
+WHERE c.region = 'region_5'
+  AND EXISTS (
+      SELECT /*+ SeqScan(orders) */ 1
+      FROM orders o
+      WHERE o.customer_id = c.id AND o.amount > 50
+  );
+```
+
+在这个例子中：
+- 主查询的customers表将使用索引扫描
+- 子查询的orders表将使用顺序扫描
+
+#### CTE（公共表表达式）示例
+
+```sql
+WITH high_value_orders AS (
+    SELECT /*+ SeqScan(orders) */ customer_id, SUM(amount) as total
+    FROM orders
+    WHERE amount > 50
+    GROUP BY customer_id
+)
+SELECT /*+ HashJoin(customers high_value_orders) */ c.name, h.total
+FROM customers c
+JOIN high_value_orders h ON c.id = h.customer_id;
+```
+
+### OceanBase兼容格式
+
+您也可以使用OceanBase风格的格式，使用BEGIN_OUTLINE_DATA标记：
+
+```sql
+SELECT /*+
+BEGIN_OUTLINE_DATA
+IndexScan(customers idx_customer_region)
+HashJoin(customers orders)
+END_OUTLINE_DATA
+*/ c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'region_3';
+```
+
+### Hint提取和合并
+
+当查询包含多个内联Hint注释时，它们会被全部提取并合并。例如：
+
+```sql
+SELECT /*+ IndexScan(customers idx_customer_region) */ c.name
+FROM customers c
+WHERE c.id IN (
+    SELECT /*+ SeqScan(orders) */ customer_id
+    FROM orders
+    WHERE amount > 75
+);
+```
+
+系统提取：`IndexScan(customers idx_customer_region) SeqScan(orders)`
+
+两个Hint都会在查询规划期间应用。
+
+### 优先级和优先权
+
+1. **内联Hint具有最高优先级**：如果查询包含内联Hint，它们优先于`pg_outline`目录中存储的Outline。
+2. **存储的Outline作为后备**：如果不存在内联Hint，系统会检查`pg_outline`中匹配的Outline。
+
+示例：
+
+```sql
+-- 创建存储的Outline
+SELECT pg_create_outline(
+    'outline1',
+    'SELECT * FROM customers WHERE region = $1',
+    'SeqScan(customers)'
+);
+
+-- 此查询使用存储的Outline（SeqScan）
+SELECT * FROM customers WHERE region = 'region_5';
+
+-- 此查询使用内联Hint覆盖（IndexScan）
+SELECT /*+ IndexScan(customers idx_customer_region) */ *
+FROM customers WHERE region = 'region_5';
+```
+
+### 支持的Hint类型
+
+Outline系统支持的所有Hint类型都可用于内联Hint：
+
+**扫描方法Hint：**
+- `SeqScan(table)` - 强制顺序扫描
+- `IndexScan(table index)` - 强制使用特定索引进行索引扫描
+- `NoSeqScan(table)` - 禁用顺序扫描
+- `NoIndexScan(table)` - 禁用索引扫描
+
+**连接方法Hint：**
+- `NestLoop(table1 table2)` - 强制嵌套循环连接
+- `HashJoin(table1 table2)` - 强制哈希连接
+- `MergeJoin(table1 table2)` - 强制归并连接
+
+### 调试内联Hint
+
+要查看何时提取和应用内联Hint：
+
+```sql
+SET client_min_messages = DEBUG1;
+
+SELECT /*+ SeqScan(customers) */ * FROM customers WHERE region = 'region_5';
+```
+
+您将看到调试消息：
+```
+DEBUG:  Extracted inline hints: SeqScan(customers)
+DEBUG:  Applying inline hints from query
+```
+
+### 完整测试套件
+
+有关全面的示例和测试用例，请参阅 `INLINE_HINTS_TEST.md`，其中包括：
+- 基本内联Hint测试
+- 多个SELECT语句测试
+- 子查询和CTE示例
+- 优先级和优先权测试
+- 性能比较
 
 ## 自动Outline生成功能（新增）
 

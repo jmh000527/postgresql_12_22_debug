@@ -575,3 +575,158 @@ record_outline_for_query(const char *query_string, const char *hints)
 	table_close(rel, RowExclusiveLock);
 	pfree(normalized_query);
 }
+
+/*
+ * extract_inline_hints - Extract hints from inline hint comments in query text
+ *
+ * This function scans the query string for inline hint comments in the format:
+ *   slash-star-plus hint1 hint2 ... star-slash
+ *
+ * These hints can appear after SELECT keywords or at other positions in the query.
+ * The function extracts all hint comments and merges them into a single HintState.
+ *
+ * Returns a HintState structure with all extracted hints, or NULL if no hints found.
+ */
+HintState *
+extract_inline_hints(const char *query_string)
+{
+	const char *p;
+	StringInfoData hints_buf;
+	HintState  *hstate = NULL;
+	bool		found_hints = false;
+
+	if (query_string == NULL || *query_string == '\0')
+		return NULL;
+
+	initStringInfo(&hints_buf);
+
+	/* Scan the query string for inline hint comments (slash-star-plus ... star-slash) */
+	p = query_string;
+	while (*p != '\0')
+	{
+		/* Look for comment start */
+		if (p[0] == '/' && p[1] == '*')
+		{
+			/* Check if this is a hint comment (starts with slash-star-plus) */
+			if (p[2] == '+')
+			{
+				const char *hint_start = p + 3;  /* Skip the hint marker */
+				const char *hint_end = strstr(hint_start, "*/");
+
+				if (hint_end != NULL)
+				{
+					const char *h;
+
+					/* Check if this is an OceanBase-style outline data comment */
+					const char *begin_marker = strstr(hint_start, "BEGIN_OUTLINE_DATA");
+					if (begin_marker != NULL && begin_marker < hint_end)
+					{
+						const char *outline_data_start = begin_marker + strlen("BEGIN_OUTLINE_DATA");
+
+						/* Find END_OUTLINE_DATA */
+						const char *end_marker = strstr(outline_data_start, "END_OUTLINE_DATA");
+						if (end_marker != NULL && end_marker < hint_end)
+						{
+							/* Extract hints between markers */
+							hint_start = outline_data_start;
+							hint_end = end_marker;
+						}
+					}
+
+					/* Extract and append hints from this comment */
+					if (hints_buf.len > 0)
+						appendStringInfoChar(&hints_buf, ' ');
+
+					/* Copy hints, skipping leading/trailing whitespace */
+					h = hint_start;
+					while (h < hint_end && isspace((unsigned char) *h))
+						h++;
+
+					while (h < hint_end)
+					{
+						/* Find end of this line or hint_end */
+						const char *line_end = h;
+						while (line_end < hint_end && *line_end != '\n' && *line_end != '\r')
+							line_end++;
+
+						/* Trim trailing whitespace from line */
+						const char *line_end_trim = line_end;
+						while (line_end_trim > h && isspace((unsigned char) *(line_end_trim - 1)))
+							line_end_trim--;
+
+						/* Copy non-empty lines */
+						if (line_end_trim > h)
+						{
+							if (hints_buf.len > 0 && hints_buf.data[hints_buf.len - 1] != ' ')
+								appendStringInfoChar(&hints_buf, ' ');
+							appendBinaryStringInfo(&hints_buf, h, line_end_trim - h);
+						}
+
+						/* Skip newline characters */
+						h = line_end;
+						while (h < hint_end && (*h == '\n' || *h == '\r'))
+							h++;
+					}
+
+					found_hints = true;
+
+					/* Move past this comment (skip the closing star-slash) */
+					p = hint_end + 2;
+					continue;
+				}
+			}
+		}
+
+		/* Skip string literals to avoid false matches */
+		if (*p == '\'')
+		{
+			p++;
+			while (*p != '\0')
+			{
+				if (*p == '\'')
+				{
+					/* Check for escaped quote */
+					if (*(p + 1) == '\'')
+						p += 2;
+					else
+					{
+						p++;
+						break;
+					}
+				}
+				else
+					p++;
+			}
+			continue;
+		}
+
+		/* Skip double-quoted identifiers */
+		if (*p == '"')
+		{
+			p++;
+			while (*p != '\0' && *p != '"')
+				p++;
+			if (*p == '"')
+				p++;
+			continue;
+		}
+
+		p++;
+	}
+
+	/* If we found hints, parse them */
+	if (found_hints && hints_buf.len > 0)
+	{
+		/* Null-terminate the hints string */
+		appendStringInfoChar(&hints_buf, '\0');
+
+		ereport(DEBUG1,
+				(errmsg("Extracted inline hints: %s", hints_buf.data)));
+
+		hstate = parse_hints(hints_buf.data);
+	}
+
+	pfree(hints_buf.data);
+
+	return hstate;
+}

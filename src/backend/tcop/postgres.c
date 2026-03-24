@@ -1145,15 +1145,30 @@ exec_simple_query(const char *query_string)
 												NULL, 0, NULL);
 
 		/*
-		 * Check if we should apply hints from an outline
+		 * Check if we should apply hints from inline comments or stored outlines
+		 * Priority: inline hints (slash-star-plus) have priority over pg_outline
 		 */
 		{
-			HintState *hstate = get_hints_for_query(query_string);
+			HintState *hstate = NULL;
+
+			/* First, try to extract inline hints from the query text */
+			hstate = extract_inline_hints(query_string);
 			if (hstate != NULL)
 			{
 				outline_set_hint_state(hstate);
 				ereport(DEBUG1,
-						(errmsg("Applying hints from outline for query")));
+						(errmsg("Applying inline hints from query")));
+			}
+			else
+			{
+				/* If no inline hints, check for stored outline in pg_outline */
+				hstate = get_hints_for_query(query_string);
+				if (hstate != NULL)
+				{
+					outline_set_hint_state(hstate);
+					ereport(DEBUG1,
+							(errmsg("Applying hints from outline for query")));
+				}
 			}
 		}
 

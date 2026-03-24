@@ -127,4 +127,7 @@ extern void outline_init_guc(void);
 extern char *normalize_query_string(const char *query_string);
 extern void record_outline_for_query(const char *query_string, const char *hints);
 
+/* Inline hint extraction from query text */
+extern HintState *extract_inline_hints(const char *query_string);
+
 #endif							/* OUTLINE_HINTS_H */
