@@ -20,6 +20,7 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "lib/stringinfo.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_outline.h"
 #include "catalog/namespace.h"
 #include "utils/syscache.h"
@@ -644,13 +645,16 @@ extract_inline_hints(const char *query_string)
 
 					while (h < hint_end)
 					{
+						const char *line_end;
+						const char *line_end_trim;
+
 						/* Find end of this line or hint_end */
-						const char *line_end = h;
+						line_end = h;
 						while (line_end < hint_end && *line_end != '\n' && *line_end != '\r')
 							line_end++;
 
 						/* Trim trailing whitespace from line */
-						const char *line_end_trim = line_end;
+						line_end_trim = line_end;
 						while (line_end_trim > h && isspace((unsigned char) *(line_end_trim - 1)))
 							line_end_trim--;
 
