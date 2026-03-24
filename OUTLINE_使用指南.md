@@ -22,13 +22,37 @@ Outline系统提供以下核心能力：
 
 ### 配置参数
 
+系统提供以下GUC配置参数：
+
+#### outline.display_hints
+
+**类型**: `boolean`
+**默认值**: `off`
+**上下文**: `PGC_USERSET` (可以在会话级别设置)
+**描述**: 控制是否在每次查询执行后自动生成并显示Outline Data
+
+当启用此参数时，PostgreSQL会：
+1. 在查询执行完成后自动分析执行计划
+2. 从执行计划中提取扫描和连接方法Hint
+3. 将Hint格式化为OceanBase/Oracle风格的Outline Data
+4. 通过NOTICE消息将结果显示到客户端
+
+**使用方法**：
 ```sql
--- 启用自动Outline显示
+-- 为当前会话启用
 SET outline.display_hints = on;
 
--- 禁用自动Outline显示（默认）
+-- 为当前会话禁用
 SET outline.display_hints = off;
+
+-- 为整个数据库设置默认值（需要超级用户权限）
+ALTER DATABASE mydb SET outline.display_hints = on;
 ```
+
+**注意事项**：
+- 此功能仅影响查询结果的显示，不影响查询执行性能
+- 对于复杂查询，生成Hint可能需要少量额外开销
+- 建议仅在需要分析执行计划时启用
 
 ### 使用示例
 
@@ -352,7 +376,7 @@ SELECT pg_enable_outline('outline_orders_by_customer');
 
 4. **子查询支持**：尚不支持子查询的Hint。
 
-5. **自动Outline创建**：当前需要手动创建Outline。未来版本可能从`EXPLAIN`输出自动捕获计划。
+**注意**：自动Outline生成功能已实现（通过`outline.display_hints`参数），但完全自动化的Outline创建和管理功能仍在开发中。
 
 ### 使用建议
 
@@ -417,8 +441,17 @@ SELECT pg_drop_outline('problematic_outline');
 ### 系统缓存
 
 实现添加了两个syscache条目用于快速Outline查找：
-- `OUTLINENAMENSP` - 按（名称，命名空间）查找
-- `OUTLINEOID` - 按OID查找
+- `OUTLINENAMENSP` - 按（名称，命名空间）查找，使用索引OutlineNameNspIndexId (OID: 6201)
+- `OUTLINEOID` - 按OID查找，使用索引OutlineOidIndexId (OID: 6200)
+
+### 目录对象标识符（OID）
+
+pg_outline系统使用以下OID范围：
+- **目录表**: pg_outline (OID: 9900)
+- **TOAST表**: pg_outline_toast (OID: 4187)
+- **TOAST索引**: pg_outline_toast_index (OID: 4188)
+- **OID索引**: pg_outline_oid_index (OID: 6200)
+- **名称命名空间索引**: pg_outline_name_nsp_index (OID: 6201)
 
 ### 优化器集成
 
@@ -438,11 +471,36 @@ Outline系统通过钩子与PostgreSQL优化器集成：
 - **关系名称**：必须匹配查询中的表名
 - **Hint类型**：扫描或连接方法规范
 
+### 自动Hint生成实现
+
+自动Hint生成功能的技术实现：
+
+1. **执行计划遍历**（`outline_plan.c`）：
+   - `plan_to_hints()` - 主入口函数，将PlannedStmt转换为Hint字符串
+   - `extract_hints_from_plan()` - 递归遍历计划树，提取扫描和连接Hint
+   - `extract_scan_hints()` - 识别SeqScan、IndexScan等扫描节点
+   - `extract_join_hints()` - 识别NestLoop、HashJoin、MergeJoin等连接节点
+
+2. **格式化输出**（`outline_plan.c`）：
+   - `format_outline_data()` - 将Hint列表格式化为OceanBase/Oracle风格
+   - 使用`/*+ BEGIN_OUTLINE_DATA ... END_OUTLINE_DATA */`格式
+   - 每个Hint占一行，便于阅读和复制
+
+3. **查询执行集成**（`postgres.c`）：
+   - 在查询执行完成后（`PortalRun`之后）检查`outline_display_hints`参数
+   - 如果启用，调用`plan_to_hints()`生成Hint
+   - 通过`ereport(NOTICE, ...)`将格式化的Outline Data发送到客户端
+
+4. **GUC参数管理**（`outline_guc.c`）：
+   - 定义`outline.display_hints`布尔参数
+   - 在PostgresMain初始化时注册GUC参数
+   - 用户可以通过SET命令动态控制功能开关
+
 ## 未来增强计划
 
 1. **查询指纹识别**：实现类似`pg_stat_statements`的查询规范化算法，以匹配具有不同字面值的查询。
 
-2. **自动捕获**：添加类似`pg_capture_outline(query_text)`的函数，自动执行查询并将其计划捕获为Hint。
+2. **增强自动捕获**：在现有的自动Hint生成（`outline.display_hints`）基础上，添加类似`pg_capture_outline(query_text)`的函数，可以一步完成查询执行、计划捕获和Outline创建。
 
 3. **导入/导出**：添加函数将Outline导出到SQL脚本，便于在不同环境之间迁移。
 
@@ -459,14 +517,19 @@ Outline系统通过钩子与PostgreSQL优化器集成：
 - `src/backend/optimizer/outline/outline_hints.c` - Hint解析
 - `src/backend/optimizer/outline/outline_plan.c` - 计划到Hint转换
 - `src/backend/optimizer/outline/outline_apply.c` - Hint应用
+- `src/backend/optimizer/outline/outline_guc.c` - GUC参数管理
 - `src/backend/utils/adt/pg_outline_funcs.c` - SQL函数
 
 ### 修改文件
 - `src/backend/optimizer/Makefile` - 添加outline子目录
+- `src/backend/optimizer/outline/Makefile` - 添加outline_guc.o
 - `src/backend/utils/adt/Makefile` - 添加pg_outline_funcs.o
 - `src/backend/utils/cache/syscache.c` - 添加outline系统缓存
+- `src/backend/tcop/postgres.c` - 集成自动Outline生成和显示
 - `src/include/utils/syscache.h` - 添加OUTLINENAMENSP和OUTLINEOID
 - `src/include/catalog/pg_proc.dat` - 注册SQL函数
+- `src/include/catalog/indexing.h` - 添加pg_outline索引定义
+- `src/include/catalog/toasting.h` - 添加pg_outline TOAST表定义
 - `src/backend/catalog/Makefile` - 添加pg_outline到目录构建
 
 ## 参考资料
