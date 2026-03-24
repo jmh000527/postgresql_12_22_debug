@@ -809,6 +809,569 @@ For comprehensive examples and test cases, see `INLINE_HINTS_TEST.md` which incl
 - Priority and precedence tests
 - Performance comparisons
 
+## Auto-generated Outline Feature
+
+### Overview
+
+The system now supports automatically generating Outline Data (hint data) from execution plans and displaying it in the terminal after each SQL execution. This feature is inspired by OceanBase and Oracle designs, using a similar output format.
+
+### Configuration Parameters
+
+The system provides the following GUC configuration parameter:
+
+#### outline.display_hints
+
+**Type**: `boolean`
+**Default**: `off`
+**Context**: `PGC_USERSET` (can be set at session level)
+**Description**: Controls whether to automatically generate and display Outline Data after each query execution
+
+When this parameter is enabled, PostgreSQL will:
+1. Automatically analyze the execution plan after query completion
+2. Extract scan and join method hints from the execution plan
+3. Format the hints in OceanBase/Oracle-style Outline Data
+4. Display the results to the client via NOTICE messages
+
+**Usage**:
+```sql
+-- Enable for current session
+SET outline.display_hints = on;
+
+-- Disable for current session
+SET outline.display_hints = off;
+
+-- Set as default for entire database (requires superuser privileges)
+ALTER DATABASE mydb SET outline.display_hints = on;
+```
+
+**Notes**:
+- This feature only affects query result display, not query execution performance
+- For complex queries, generating hints may incur a small additional overhead
+- It's recommended to enable this only when analyzing execution plans
+
+### Usage Examples
+
+```sql
+-- 1. Enable auto-display
+SET outline.display_hints = on;
+
+-- 2. Execute any SQL query
+SELECT * FROM orders WHERE customer_id = 123;
+
+-- 3. System automatically displays generated Outline Data
+NOTICE:  Outline Data:
+/*+
+BEGIN_OUTLINE_DATA
+IndexScan(orders idx_orders_customer)
+END_OUTLINE_DATA
+*/
+
+-- 4. For queries with joins
+SELECT o.*, c.name
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE c.region = 'Asia';
+
+NOTICE:  Outline Data:
+/*+
+BEGIN_OUTLINE_DATA
+IndexScan(customers idx_customers_region)
+IndexScan(orders idx_orders_customer)
+HashJoin(customers orders)
+END_OUTLINE_DATA
+*/
+```
+
+### Output Format
+
+The generated Outline Data uses standard SQL comment format, containing:
+
+- Start marker: `/*+ BEGIN_OUTLINE_DATA`
+- Hint list: Each hint on its own line
+- End marker: `END_OUTLINE_DATA */`
+
+This format is compatible with OceanBase and Oracle Outline formats, making it easy to understand and use manually.
+
+### Workflow
+
+1. **Execute Query**: PostgreSQL executes the SQL query and generates an execution plan
+2. **Extract Hints**: The system automatically traverses the execution plan tree, identifying scan and join methods
+3. **Format Output**: Extracted hints are formatted in OceanBase/Oracle style
+4. **Display Results**: Outline Data is sent to the client terminal via NOTICE messages
+
+### Application Scenarios
+
+1. **Learning Optimizer Behavior**: See which execution strategies PostgreSQL chose for specific queries
+2. **Quick Outline Creation**: Use auto-generated hints directly to create persistent outlines
+3. **Performance Analysis**: Understand execution plan details for optimization tuning
+4. **Documentation**: Save execution plan hints for critical queries as documentation
+
+### From Auto-generation to Manual Creation
+
+You can use auto-generated hints directly to create permanent outlines:
+
+```sql
+-- Step 1: Enable auto-display and execute query
+SET outline.display_hints = on;
+SELECT * FROM orders WHERE status = 'pending';
+
+-- Step 2: System displays Outline Data
+NOTICE:  Outline Data:
+/*+
+BEGIN_OUTLINE_DATA
+SeqScan(orders)
+END_OUTLINE_DATA
+*/
+
+-- Step 3: Copy hint content, create permanent outline
+SET outline.display_hints = off;  -- Optional, turn off auto-display
+
+SELECT pg_create_outline(
+    'outline_orders_pending',
+    'SELECT * FROM orders WHERE status = $1',
+    'SeqScan(orders)'  -- Use auto-generated hint
+);
+```
+
+## sr_plan-style Recording Mode
+
+### Overview
+
+Recording Mode is a powerful new feature inspired by sr_plan's design philosophy, allowing automatic recording and replay of SQL execution plans. Unlike manually creating outlines, recording mode can automatically capture execution plans and create outlines, greatly simplifying outline management workflow.
+
+### Configuration Parameters
+
+#### outline.recording_mode
+
+**Type**: `boolean`
+**Default**: `off`
+**Context**: `PGC_USERSET` (can be set at session level)
+**Description**: Enable automatic outline recording mode
+
+When recording mode is enabled:
+1. Every executed query is automatically analyzed
+2. Hints are extracted from the actual execution plan
+3. Outlines are automatically created and stored in the `pg_outline` table
+4. Unique names are generated for outlines (format: `auto_outline_<process_id>_<counter>`)
+
+**Usage**:
+```sql
+-- Enable recording mode
+SET outline.recording_mode = on;
+
+-- Execute query (plan will be automatically recorded)
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- Disable recording mode
+SET outline.recording_mode = off;
+```
+
+### Usage Workflow
+
+#### Step 1: Enable Recording Mode
+
+```sql
+-- Start recording
+SET outline.recording_mode = on;
+```
+
+#### Step 2: Execute SQL (optionally with manual hints)
+
+```sql
+-- Method 1: Execute SQL directly, record default execution plan
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- Method 2: Use manual hints to force a specific plan, then record
+-- (if you need to fix a specific execution strategy)
+SET enable_seqscan = off;  -- Force index usage
+SELECT * FROM customers WHERE region = 'Asia';
+SET enable_seqscan = on;   -- Restore default setting
+
+-- System automatically notifies:
+-- NOTICE:  Created outline "auto_outline_12345_1" for query
+```
+
+#### Step 3: Disable Recording Mode
+
+```sql
+SET outline.recording_mode = off;
+```
+
+#### Step 4: Verify Outline Creation
+
+```sql
+-- View auto-created outlines
+SELECT outlinename, outlinequery, outlinehints
+FROM pg_outline
+WHERE outlinename LIKE 'auto_outline%';
+```
+
+#### Step 5: Test Replay
+
+Now, when you execute the same query again, the system will automatically apply the recorded outline:
+
+```sql
+-- Execute same query (query will be normalized and matched)
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- System will automatically use previously recorded outline
+-- You can verify with EXPLAIN:
+EXPLAIN SELECT * FROM customers WHERE region = 'Asia';
+```
+
+### Query Normalization and Matching
+
+Recording mode uses intelligent query normalization to match queries:
+
+**Normalization Rules**:
+- Convert to lowercase (except string literals)
+- Collapse whitespace (multiple spaces merged into one)
+- Remove leading/trailing whitespace
+- Preserve string literals as-is
+
+**Matching Examples**:
+
+The following queries will all match the same outline:
+
+```sql
+-- Original query
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- Different case (outside SQL keywords)
+SELECT * FROM CUSTOMERS WHERE REGION = 'Asia';
+
+-- Different whitespace
+SELECT   *   FROM   customers   WHERE   region='Asia';
+
+-- All of these will use the same recorded outline!
+```
+
+### Complete Examples
+
+#### Example 1: Simple Query Recording and Replay
+
+```sql
+-- 1. Enable recording
+SET outline.recording_mode = on;
+SET outline.display_hints = on;  -- Optional: see recorded content
+
+-- 2. Execute query
+SELECT * FROM customers WHERE region = 'Asia';
+
+-- Output:
+-- NOTICE:  Outline Data:
+-- /*+
+-- BEGIN_OUTLINE_DATA
+-- IndexScan(customers idx_customer_region)
+-- END_OUTLINE_DATA
+-- */
+-- NOTICE:  Created outline "auto_outline_56789_1" for query
+
+-- 3. Disable recording
+SET outline.recording_mode = off;
+SET outline.display_hints = off;
+
+-- 4. Verify outline
+SELECT outlinename, outlinehints FROM pg_outline;
+--      outlinename      |               outlinehints
+-- ----------------------+------------------------------------------
+--  auto_outline_56789_1 | IndexScan(customers idx_customer_region)
+
+-- 5. Test replay (same query will automatically use outline)
+EXPLAIN SELECT * FROM customers WHERE region = 'Asia';
+-- Should show Index Scan using idx_customer_region
+```
+
+#### Example 2: Join Query Recording
+
+```sql
+-- 1. Enable recording
+SET outline.recording_mode = on;
+
+-- 2. Force specific join method (optional)
+SET enable_hashjoin = off;  -- Disable HashJoin
+SET enable_mergejoin = off; -- Disable MergeJoin
+
+-- 3. Execute join query
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'Asia';
+
+-- NOTICE:  Created outline "auto_outline_56789_2" for query
+
+-- 4. Restore settings and disable recording
+SET enable_hashjoin = on;
+SET enable_mergejoin = on;
+SET outline.recording_mode = off;
+
+-- 5. View recorded hints
+SELECT outlinename, outlinehints FROM pg_outline
+WHERE outlinename = 'auto_outline_56789_2';
+--      outlinename      |               outlinehints
+-- ----------------------+------------------------------------------
+--  auto_outline_56789_2 | IndexScan(customers idx_customer_region)
+--                       | SeqScan(orders)
+--                       | NestLoop(customers orders)
+
+-- 6. Subsequent executions will automatically use NestLoop join
+SELECT c.name, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE c.region = 'Asia';
+```
+
+### Comparison with Manual Outlines
+
+| Feature | Manual Outline (`pg_create_outline`) | Recording Mode (`outline.recording_mode`) |
+|---------|-------------------------------------|-------------------------------------------|
+| Creation Method | Manual function call | Automatic creation |
+| Outline Name | User-specified | Auto-generated |
+| Use Case | Fixed outlines with explicit control | Quick capture of current execution plan |
+| Learning Curve | Requires understanding hint syntax | No need to understand hint syntax |
+| Flexibility | High (precise control) | Medium (based on actual execution plan) |
+| Duplicate Handling | Allows overwrite | Automatically skips duplicates |
+
+### Best Practices
+
+1. **Pre-recording Preparation**
+   - Ensure statistics are up-to-date: `ANALYZE tables;`
+   - Test environment data distribution should be similar to production
+   - For critical queries, may need manual hints to guide the plan
+
+2. **Recording Timing**
+   - Record during off-peak business hours to minimize interference
+   - Ensure recorded queries are stable performance versions
+   - Use GUC parameters (like `enable_*` series) if specific plans are needed
+
+3. **Post-recording Verification**
+   - Use EXPLAIN to check recorded plans
+   - Verify replay effect in test environment
+   - Monitor whether query performance meets expectations
+
+4. **Outline Management**
+   - Regularly check auto-created outlines
+   - Rename important auto_outlines to meaningful names
+   - Delete outlines that are no longer needed
+
+### Troubleshooting
+
+**Issue 1: Outline not created**
+- Check if `outline.recording_mode` is `on`
+- Confirm query executed successfully (no errors)
+- Check logs for error messages
+
+**Issue 2: Query not using outline**
+- Check if outline is enabled: `SELECT * FROM pg_outline WHERE outlineenabled = false;`
+- Verify normalized query matches: use `EXPLAIN` to check
+- Confirm outline hint format is correct
+
+**Issue 3: Duplicate recording of same query**
+- System automatically detects and skips existing outlines
+- To update, first delete old outline: `SELECT pg_drop_outline('outline_name');`
+
+### Technical Implementation Details
+
+Core implementation of recording mode includes:
+
+1. **Query Normalization**: `normalize_query_string()` function
+   - Handles case conversion
+   - Standardizes whitespace
+   - Preserves string literals
+
+2. **Outline Lookup**: `get_hints_for_query()` function
+   - Normalizes query string
+   - Searches for matches in `pg_outline`
+   - Parses and applies hints
+
+3. **Auto-recording**: `record_outline_for_query()` function
+   - Detects duplicate outlines
+   - Generates unique names
+   - Inserts into system catalog
+
+4. **Optimizer Integration**
+   - Injects hints before query planning
+   - Captures plan after query execution
+   - Implemented via PostgreSQL optimizer hooks
+
+### Differences from sr_plan
+
+While inspired by sr_plan's design philosophy, the implementation is fundamentally different:
+
+| Feature | sr_plan | This Implementation (Outline-based) |
+|---------|---------|-------------------------------------|
+| Plan Fixing Method | Direct plan tree serialization | Influence optimizer via hint injection |
+| Flexibility | Fixes entire plan tree | Partial constraints (only hint-covered parts) |
+| Adaptability | May fail with statistics changes | Hints guide, optimizer can still optimize details |
+| Implementation Complexity | Requires plan tree serialization/deserialization | Based on existing hint mechanism |
+| Maintenance Cost | High (plan format changes require adaptation) | Low (hint syntax relatively stable) |
+
+## Practical Application Scenarios
+
+### Scenario 1: Preventing Execution Plan Changes
+
+**Problem**: A critical query in production experiences performance degradation after statistics update causes the execution plan to change.
+
+**Solution**:
+```sql
+-- Step 1: Use EXPLAIN to view current good execution plan
+EXPLAIN SELECT * FROM orders WHERE customer_id = 123;
+
+-- Step 2: Create outline based on execution plan
+-- Assuming current plan uses index scan, we want to fix it
+SELECT pg_create_outline(
+    'outline_orders_by_customer',
+    'SELECT * FROM orders WHERE customer_id = $1',
+    'IndexScan(orders idx_orders_customer_id)'
+);
+```
+
+### Scenario 2: Optimizing Complex Join Queries
+
+**Problem**: Multi-table join query execution plan is unstable, sometimes choosing inefficient join order.
+
+**Solution**:
+```sql
+-- Create outline with fixed join methods
+SELECT pg_create_outline(
+    'outline_sales_report',
+    'SELECT c.name, o.total, p.product_name
+     FROM customers c
+     JOIN orders o ON c.id = o.customer_id
+     JOIN products p ON o.product_id = p.id
+     WHERE c.region = $1',
+    E'IndexScan(customers idx_region)\nHashJoin(customers orders)\nHashJoin(orders products)'
+);
+```
+
+### Scenario 3: Handling Data Volume Changes
+
+**Problem**: After table data volume grows, optimizer chooses inappropriate execution plan.
+
+**Solution**:
+```sql
+-- For small tables force index use, for large tables force sequential scan
+SELECT pg_create_outline(
+    'outline_large_table_scan',
+    'SELECT * FROM large_table WHERE status IN ($1, $2, $3)',
+    'SeqScan(large_table)'  -- Sequential scan more efficient for large range queries
+);
+```
+
+## Best Practices
+
+### 1. Naming Conventions
+
+Recommend using clear naming conventions:
+- Use prefix `outline_`
+- Include table name or business function description
+- Examples: `outline_orders_by_status`, `outline_user_login_query`
+
+### 2. Monitoring and Verification
+
+After creating an outline, verification should be performed:
+
+```sql
+-- Step 1: Check if outline is taking effect
+EXPLAIN (ANALYZE, VERBOSE)
+SELECT * FROM orders WHERE customer_id = 123;
+
+-- Step 2: Compare execution time with and without outline
+-- Test with outline disabled
+SELECT pg_disable_outline('outline_orders_by_customer');
+-- Run query and record time
+-- Test with outline enabled
+SELECT pg_enable_outline('outline_orders_by_customer');
+-- Run query and record time
+```
+
+### 3. Documentation
+
+Create documentation for each outline:
+- Creation reason
+- Expected performance improvement
+- Related business scenarios
+- Creation date and creator
+
+### 4. Regular Review
+
+Regularly review outline effectiveness:
+- Quarterly check if outlines are still necessary
+- Evaluate changes in data volume and query patterns
+- Remove outdated outlines
+
+## Notes and Limitations
+
+### Current Limitations
+
+1. **Query Normalization**: Current implementation stores original query text. Future versions will implement query normalization/fingerprinting to match similar queries with different literal values.
+
+2. **Join Hint Matching**: Join hints currently have limited matching logic. Future enhancements will improve tracking of relation names in complex join trees.
+
+3. **Leading Hints**: The `LEADING` hint type for controlling join order is defined but not yet implemented.
+
+4. **Subquery Support**: Hints for subqueries are not yet supported (Note: Inline hints feature now supports this).
+
+**Note**: Auto-generated outline feature is implemented (via `outline.display_hints` parameter), but fully automated outline creation and management features are still in development.
+
+### Usage Recommendations
+
+1. **Permission Management**: Only superusers can create, modify, and delete outlines, ensuring production environment security.
+
+2. **Performance Testing**: Before applying outlines in production, thoroughly validate in test environment.
+
+3. **Version Compatibility**: After upgrading PostgreSQL versions, re-validate outline effectiveness.
+
+4. **Avoid Overuse**: Don't create outlines for all queries, only for critical and problematic queries.
+
+## Troubleshooting
+
+### Issue 1: Outline Not Taking Effect
+
+**Check Steps**:
+```sql
+-- 1. Confirm outline is enabled
+SELECT outlinename, outlineenabled
+FROM pg_outline
+WHERE outlinename = 'your_outline_name';
+
+-- 2. Confirm query text matches
+-- Query text must match exactly (including spaces and case)
+```
+
+### Issue 2: Performance Not Improving
+
+**Possible Causes**:
+- Inappropriate hint selection
+- Outdated statistics
+- Hardware resource limitations
+
+**Solutions**:
+```sql
+-- Update statistics
+ANALYZE table_name;
+
+-- Try different hint combinations
+SELECT pg_drop_outline('old_outline');
+SELECT pg_create_outline('new_outline', 'query', 'different_hints');
+```
+
+### Issue 3: Query Errors
+
+**Common Causes**:
+- Referenced index does not exist
+- Table name spelling error
+- Hint syntax error
+
+**Solutions**:
+```sql
+-- Check if index exists
+\d table_name
+
+-- Drop problematic outline
+SELECT pg_drop_outline('problematic_outline');
+```
+
 ## Architecture
 
 ### Components
