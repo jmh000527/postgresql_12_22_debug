@@ -23,6 +23,7 @@
 #include "catalog/pg_outline.h"
 #include "catalog/namespace.h"
 #include "utils/syscache.h"
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -31,6 +32,7 @@
 #include "catalog/pg_type.h"
 #include "parser/scansup.h"
 #include "miscadmin.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include <ctype.h>

@@ -50,6 +50,7 @@
 #include "nodes/print.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/outline_hints.h"
+#include "optimizer/paths.h"
 #include "pgstat.h"
 #include "pg_trace.h"
 #include "parser/analyze.h"
