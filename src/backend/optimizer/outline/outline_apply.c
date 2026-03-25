@@ -23,6 +23,7 @@
 #include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
 #include "utils/lsyscache.h"
+#include "utils/guc.h"
 
 /* Module-level state */
 static HintState *current_hint_state = NULL;
@@ -130,6 +131,109 @@ find_join_hint(HintState *hstate, RelOptInfo *outerrel, RelOptInfo *innerrel)
 }
 
 /*
+ * Check if a Rows hint applies to this relation or join
+ */
+static RowsHint *
+find_rows_hint(HintState *hstate, RelOptInfo *rel, PlannerInfo *root)
+{
+	ListCell   *lc;
+
+	if (hstate == NULL || !hstate->enabled)
+		return NULL;
+
+	foreach(lc, hstate->hints)
+	{
+		Hint	   *hint = (Hint *) lfirst(lc);
+
+		if (hint->type == HINT_TYPE_ROWS)
+		{
+			RowsHint   *rows_hint = &hint->hint.rows;
+			int			nrelnames = list_length(rows_hint->relnames);
+
+			/* For base relations, match single relation name */
+			if (nrelnames == 1 && rel->reloptkind == RELOPT_BASEREL)
+			{
+				char *relname = (char *) linitial(rows_hint->relnames);
+				RangeTblEntry *rte = root->simple_rte_array[rel->relid];
+
+				if (rte && rte->rtekind == RTE_RELATION)
+				{
+					char *actual_relname = get_rel_name(rte->relid);
+					if (actual_relname && pg_strcasecmp(relname, actual_relname) == 0)
+						return rows_hint;
+				}
+			}
+			/* For join relations, would need more complex matching */
+			/* TODO: Implement join relation matching */
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * Check if a Parallel hint applies to this relation
+ */
+static ParallelHint *
+find_parallel_hint(HintState *hstate, Index relid, RangeTblEntry *rte)
+{
+	ListCell   *lc;
+	char	   *relname;
+
+	if (hstate == NULL || !hstate->enabled)
+		return NULL;
+
+	if (rte->rtekind != RTE_RELATION)
+		return NULL;
+
+	relname = get_rel_name(rte->relid);
+	if (relname == NULL)
+		return NULL;
+
+	foreach(lc, hstate->hints)
+	{
+		Hint	   *hint = (Hint *) lfirst(lc);
+
+		if (hint->type == HINT_TYPE_PARALLEL)
+		{
+			ParallelHint   *parallel_hint = &hint->hint.parallel;
+
+			if (pg_strcasecmp(parallel_hint->relname, relname) == 0)
+				return parallel_hint;
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * Apply Set hints (GUC parameter overrides)
+ */
+static void
+apply_set_hints(HintState *hstate)
+{
+	ListCell   *lc;
+
+	if (hstate == NULL || !hstate->enabled)
+		return;
+
+	foreach(lc, hstate->hints)
+	{
+		Hint	   *hint = (Hint *) lfirst(lc);
+
+		if (hint->type == HINT_TYPE_SET)
+		{
+			SetHint *set_hint = &hint->hint.set;
+
+			/* Apply the GUC setting for this query */
+			(void) set_config_option(set_hint->name, set_hint->value,
+									 PGC_USERSET, PGC_S_SESSION,
+									 GUC_ACTION_SAVE, true, 0, false);
+		}
+	}
+}
+
+/*
  * Hook function for set_rel_pathlist
  *
  * This function is called when paths are being generated for a relation.
@@ -140,8 +244,45 @@ outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 						Index rti, RangeTblEntry *rte)
 {
 	ScanHint   *hint;
+	RowsHint   *rows_hint;
+	ParallelHint *parallel_hint;
 	ListCell   *lc;
 	List	   *paths_to_keep = NIL;
+
+	/* Apply Set hints if we haven't already */
+	static bool set_hints_applied = false;
+	if (!set_hints_applied && current_hint_state != NULL)
+	{
+		apply_set_hints(current_hint_state);
+		set_hints_applied = true;
+	}
+
+	/* Check if there's a Rows hint for this relation */
+	rows_hint = find_rows_hint(current_hint_state, rel, root);
+	if (rows_hint != NULL)
+	{
+		/* Override the estimated row count */
+		rel->rows = rows_hint->rows;
+		/* Recalculate tuple fraction if needed */
+		rel->tuples = rows_hint->rows;
+	}
+
+	/* Check if there's a Parallel hint for this relation */
+	parallel_hint = find_parallel_hint(current_hint_state, rti, rte);
+	if (parallel_hint != NULL)
+	{
+		if (parallel_hint->force_parallel && parallel_hint->nworkers > 0)
+		{
+			/* Force parallel execution with specified number of workers */
+			rel->consider_parallel = true;
+			rel->rel_parallel_workers = parallel_hint->nworkers;
+		}
+		else if (!parallel_hint->force_parallel)
+		{
+			/* Disable parallel execution */
+			rel->consider_parallel = false;
+		}
+	}
 
 	/* Check if there's a scan hint for this relation */
 	hint = find_scan_hint(current_hint_state, rti, rte);

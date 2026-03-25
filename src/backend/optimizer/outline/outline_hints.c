@@ -37,6 +37,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include <ctype.h>
+#include <string.h>
 
 /*
  * Parse a hint string and return a HintState structure
@@ -224,6 +225,125 @@ parse_hints(const char *hint_str)
 				hint->hint.join.relname1 = rel1;
 				hint->hint.join.relname2 = rel2;
 				hint->hint.join.method = JOIN_HINT_MERGEJOIN;
+				hstate->hints = lappend(hstate->hints, hint);
+			}
+			else
+				pfree(hint);
+		}
+		/* Parse Rows hint */
+		else if (pg_strcasecmp(hint_name, "Rows") == 0)
+		{
+			char	   *argcopy;
+			char	   *token;
+			char	   *saveptr;
+			List	   *relnames = NIL;
+			double		rows = 0;
+			char	   *endptr;
+
+			argcopy = pstrdup(args);
+
+			/* Parse space-separated arguments: rel1 [rel2 ...] rows */
+			token = strtok_r(argcopy, " ", &saveptr);
+			while (token != NULL)
+			{
+				char *next_token = strtok_r(NULL, " ", &saveptr);
+				if (next_token == NULL)
+				{
+					/* This is the last token, should be the row count */
+					rows = strtod(token, &endptr);
+					if (endptr == token || *endptr != '\0')
+					{
+						/* Invalid row count, skip hint */
+						list_free(relnames);
+						pfree(argcopy);
+						pfree(hint);
+						break;
+					}
+				}
+				else
+				{
+					/* This is a relation name */
+					relnames = lappend(relnames, pstrdup(token));
+				}
+				token = next_token;
+			}
+
+			if (relnames != NIL && rows > 0)
+			{
+				hint->type = HINT_TYPE_ROWS;
+				hint->hint.rows.type = HINT_TYPE_ROWS;
+				hint->hint.rows.relnames = relnames;
+				hint->hint.rows.rows = rows;
+				hstate->hints = lappend(hstate->hints, hint);
+			}
+			else
+			{
+				list_free(relnames);
+				pfree(hint);
+			}
+
+			pfree(argcopy);
+		}
+		/* Parse Parallel hint */
+		else if (pg_strcasecmp(hint_name, "Parallel") == 0)
+		{
+			char	   *relname;
+			char	   *nworkers_str;
+			char	   *space;
+			int			nworkers;
+			char	   *endptr;
+
+			relname = pstrdup(args);
+			space = strchr(relname, ' ');
+			if (space != NULL)
+			{
+				*space = '\0';
+				nworkers_str = space + 1;
+				nworkers = strtol(nworkers_str, &endptr, 10);
+
+				if (endptr != nworkers_str && *endptr == '\0' && nworkers >= 0)
+				{
+					hint->type = HINT_TYPE_PARALLEL;
+					hint->hint.parallel.type = HINT_TYPE_PARALLEL;
+					hint->hint.parallel.relname = relname;
+					hint->hint.parallel.nworkers = nworkers;
+					hint->hint.parallel.force_parallel = true;
+					hstate->hints = lappend(hstate->hints, hint);
+				}
+				else
+					pfree(hint);
+			}
+			else
+				pfree(hint);
+		}
+		/* Parse NoParallel hint */
+		else if (pg_strcasecmp(hint_name, "NoParallel") == 0)
+		{
+			hint->type = HINT_TYPE_PARALLEL;
+			hint->hint.parallel.type = HINT_TYPE_PARALLEL;
+			hint->hint.parallel.relname = pstrdup(args);
+			hint->hint.parallel.nworkers = 0;
+			hint->hint.parallel.force_parallel = false;
+			hstate->hints = lappend(hstate->hints, hint);
+		}
+		/* Parse Set hint */
+		else if (pg_strcasecmp(hint_name, "Set") == 0)
+		{
+			char	   *param_name;
+			char	   *param_value;
+			char	   *space;
+
+			param_name = pstrdup(args);
+			space = strchr(param_name, ' ');
+			if (space != NULL)
+			{
+				*space = '\0';
+				param_value = pstrdup(space + 1);
+
+				hint->type = HINT_TYPE_SET;
+				hint->hint.set.type = HINT_TYPE_SET;
+				hint->hint.set.name = param_name;
+				hint->hint.set.value = param_value;
 				hstate->hints = lappend(hstate->hints, hint);
 			}
 			else

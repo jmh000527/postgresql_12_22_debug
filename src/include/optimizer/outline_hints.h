@@ -24,7 +24,10 @@ typedef enum HintType
 {
 	HINT_TYPE_SCAN_METHOD,		/* Scan method hints (SeqScan, IndexScan, etc.) */
 	HINT_TYPE_JOIN_METHOD,		/* Join method hints (NestLoop, HashJoin, MergeJoin) */
-	HINT_TYPE_LEADING			/* Join order hints */
+	HINT_TYPE_LEADING,			/* Join order hints */
+	HINT_TYPE_ROWS,				/* Row count estimation hints */
+	HINT_TYPE_PARALLEL,			/* Parallelization control hints */
+	HINT_TYPE_SET				/* GUC parameter override hints */
 } HintType;
 
 /* Scan method hints */
@@ -78,6 +81,31 @@ typedef struct LeadingHint
 	List	   *relnames;		/* List of relation names in join order */
 } LeadingHint;
 
+/* Hint structure for row count estimation */
+typedef struct RowsHint
+{
+	HintType	type;			/* HINT_TYPE_ROWS */
+	List	   *relnames;		/* List of relation names (1 for base rel, 2+ for join) */
+	double		rows;			/* Estimated number of rows */
+} RowsHint;
+
+/* Hint structure for parallelization control */
+typedef struct ParallelHint
+{
+	HintType	type;			/* HINT_TYPE_PARALLEL */
+	char	   *relname;		/* Relation name */
+	int			nworkers;		/* Number of parallel workers (0 = disable) */
+	bool		force_parallel;	/* true for Parallel hint, false for NoParallel */
+} ParallelHint;
+
+/* Hint structure for GUC parameter override */
+typedef struct SetHint
+{
+	HintType	type;			/* HINT_TYPE_SET */
+	char	   *name;			/* GUC parameter name */
+	char	   *value;			/* GUC parameter value */
+} SetHint;
+
 /* Generic hint structure */
 typedef struct Hint
 {
@@ -87,6 +115,9 @@ typedef struct Hint
 		ScanHint	scan;
 		JoinHint	join;
 		LeadingHint	leading;
+		RowsHint	rows;
+		ParallelHint parallel;
+		SetHint		set;
 	} hint;
 } Hint;
 
