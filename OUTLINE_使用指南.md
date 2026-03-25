@@ -335,6 +335,93 @@ EXPLAIN SELECT * FROM orders WHERE status = 'pending';
 -- 而不是 Index Scan
 ```
 
+#### 测试7：测试Leading Hint - 连接顺序控制
+
+Leading hint允许完全控制连接顺序，支持简单语法和嵌套语法：
+
+```sql
+-- 创建测试表用于连接顺序测试
+CREATE TABLE t1 (id int PRIMARY KEY, data text);
+CREATE TABLE t2 (id int PRIMARY KEY, t1_id int, data text);
+CREATE TABLE t3 (id int PRIMARY KEY, t2_id int, data text);
+CREATE TABLE t4 (id int PRIMARY KEY, t3_id int, data text);
+
+INSERT INTO t1 SELECT i, 'data_' || i FROM generate_series(1, 100) i;
+INSERT INTO t2 SELECT i, (i % 100) + 1, 'data_' || i FROM generate_series(1, 500) i;
+INSERT INTO t3 SELECT i, (i % 500) + 1, 'data_' || i FROM generate_series(1, 200) i;
+INSERT INTO t4 SELECT i, (i % 200) + 1, 'data_' || i FROM generate_series(1, 300) i;
+
+ANALYZE t1, t2, t3, t4;
+
+-- 测试7a：简单的左到右连接顺序
+SELECT pg_create_outline(
+    'test_leading_simple',
+    'SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t2.id = t3.t2_id',
+    'Leading(t1 t2 t3)'
+);
+
+-- 验证连接顺序：t1 -> t2 -> t3
+EXPLAIN SELECT * FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t2.id = t3.t2_id;
+
+-- 测试7b：嵌套语法用于bushy连接树
+SELECT pg_create_outline(
+    'test_leading_nested',
+    'SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t1.id = t3.t2_id JOIN t4 ON t2.id = t4.t3_id',
+    'Leading(((t1 t2) (t3 t4)))'
+);
+
+-- 验证bushy连接：(t1 JOIN t2)与(t3 JOIN t4)并行，然后连接结果
+EXPLAIN SELECT * FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t1.id = t3.t2_id
+JOIN t4 ON t2.id = t4.t3_id;
+
+-- 测试7c：复杂的多层嵌套
+SELECT pg_create_outline(
+    'test_leading_complex',
+    'SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t2.id = t3.t2_id JOIN t4 ON t3.id = t4.t3_id',
+    'Leading((((t1 t2) t3) t4))'
+);
+
+-- 验证复杂嵌套：((t1 JOIN t2) JOIN t3) JOIN t4
+EXPLAIN SELECT * FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t2.id = t3.t2_id
+JOIN t4 ON t3.id = t4.t3_id;
+```
+
+**预期行为：**
+- 简单语法创建左深连接树：t1 → t2 → t3
+- 嵌套语法创建bushy树：并行连接然后组合
+- 复杂嵌套完全控制连接树结构
+- PostgreSQL自动验证外连接约束
+- 如果提示的连接顺序无效，系统会回退到标准连接搜索
+
+#### 测试8：测试内联Leading Hint
+
+```sql
+-- 内联hint不需要创建outline
+SELECT /*+ Leading(t2 t1 t3) */
+    t1.id, t2.data, t3.data
+FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t2.id = t3.t2_id
+WHERE t1.id < 50;
+
+-- 内联嵌套语法
+SELECT /*+ Leading((t1 t2) t3) */
+    t1.id, t2.data, t3.data
+FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t2.id = t3.t2_id
+WHERE t1.id < 50;
+
+-- 清理测试表
+DROP TABLE t4, t3, t2, t1;
+```
+
 ### 故障排查
 
 如果遇到问题，请检查以下几点：
@@ -1365,7 +1452,7 @@ SELECT pg_enable_outline('outline_orders_by_customer');
 
 2. **连接Hint匹配**：连接Hint目前具有有限的匹配逻辑。未来将增强对复杂连接树中关系名称的跟踪。
 
-3. **Leading Hint**：用于控制连接顺序的`LEADING` Hint类型已定义但尚未实现。
+3. **Leading Hint**：用于控制连接顺序的`LEADING` Hint类型已完全实现，支持简单语法和嵌套语法，可完全控制连接顺序，包括bushy连接树的构建。
 
 4. **子查询支持**：尚不支持子查询的Hint。
 

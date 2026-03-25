@@ -136,7 +136,7 @@ Outline特性是PostgreSQL的查询优化器扩展功能，通过提示(Hint)机
 typedef enum HintType {
     HINT_TYPE_SCAN_METHOD,    // 扫描方法提示
     HINT_TYPE_JOIN_METHOD,    // 连接方法提示
-    HINT_TYPE_LEADING         // 连接顺序提示（未完全实现）
+    HINT_TYPE_LEADING         // 连接顺序提示（已完全实现）
 } HintType;
 
 // 扫描方法提示
@@ -1206,7 +1206,7 @@ COPY pg_outline FROM '/tmp/outlines.csv' CSV HEADER;
    - 不同绑定变量值的查询被视为不同查询
 
 2. **Hint功能**
-   - Leading hint（连接顺序）未完全实现
+   - Leading hint（连接顺序）已完全实现，支持简单和嵌套语法
    - 不支持子查询的独立Hint控制（部分通过内联Hint缓解）
 
 3. **统计信息**
@@ -1242,11 +1242,7 @@ COPY pg_outline FROM '/tmp/outlines.csv' CSV HEADER;
 
 #### 14.2.2 中期改进
 
-1. **完整Leading hint**
-   - 完全控制连接顺序
-   - 语法: `Leading((t1 t2) t3)`
-
-2. **Schema级隔离**
+1. **Schema级隔离**
    - 每个schema独立的Outline空间
    - 避免命名冲突
 
@@ -1465,11 +1461,13 @@ SELECT pg_drop_outline('problematic_outline');
 | NoHashJoin | `NoHashJoin(t1 t2 ...)` | 禁用哈希连接 |
 | NoMergeJoin | `NoMergeJoin(t1 t2 ...)` | 禁用归并连接 |
 
-#### 连接顺序Hint（部分实现）
+#### 连接顺序Hint（已完全实现）
 
 | Hint | 语法 | 说明 |
 |------|------|------|
-| Leading | `Leading((t1 t2) t3)` | 指定连接顺序 |
+| Leading | `Leading(t1 t2 t3)` | 指定左到右连接顺序 |
+| Leading | `Leading((t1 t2) t3)` | 嵌套语法，支持bushy连接树 |
+| Leading | `Leading(((t1 t2) t3) (t4 t5))` | 多层嵌套，完整控制连接结构 |
 
 ### 16.2 系统视图参考
 

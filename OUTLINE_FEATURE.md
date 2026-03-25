@@ -520,6 +520,93 @@ EXPLAIN SELECT * FROM customers WHERE id > 500;
    Index Cond: (id > 500)
 ```
 
+#### Test 7: Test Leading Hints - Join Order Control
+
+Leading hints allow full control over join order, supporting both simple and nested syntax:
+
+```sql
+-- Create test tables for join order testing
+CREATE TABLE t1 (id int PRIMARY KEY, data text);
+CREATE TABLE t2 (id int PRIMARY KEY, t1_id int, data text);
+CREATE TABLE t3 (id int PRIMARY KEY, t2_id int, data text);
+CREATE TABLE t4 (id int PRIMARY KEY, t3_id int, data text);
+
+INSERT INTO t1 SELECT i, 'data_' || i FROM generate_series(1, 100) i;
+INSERT INTO t2 SELECT i, (i % 100) + 1, 'data_' || i FROM generate_series(1, 500) i;
+INSERT INTO t3 SELECT i, (i % 500) + 1, 'data_' || i FROM generate_series(1, 200) i;
+INSERT INTO t4 SELECT i, (i % 200) + 1, 'data_' || i FROM generate_series(1, 300) i;
+
+ANALYZE t1, t2, t3, t4;
+
+-- Test 7a: Simple left-to-right join order
+SELECT pg_create_outline(
+    'test_leading_simple',
+    'SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t2.id = t3.t2_id',
+    'Leading(t1 t2 t3)'
+);
+
+-- Verify the join order: t1 -> t2 -> t3
+EXPLAIN SELECT * FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t2.id = t3.t2_id;
+
+-- Test 7b: Nested syntax for bushy join trees
+SELECT pg_create_outline(
+    'test_leading_nested',
+    'SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t1.id = t3.t2_id JOIN t4 ON t2.id = t4.t3_id',
+    'Leading(((t1 t2) (t3 t4)))'
+);
+
+-- Verify bushy join: (t1 JOIN t2) in parallel with (t3 JOIN t4), then join results
+EXPLAIN SELECT * FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t1.id = t3.t2_id
+JOIN t4 ON t2.id = t4.t3_id;
+
+-- Test 7c: Complex multi-level nesting
+SELECT pg_create_outline(
+    'test_leading_complex',
+    'SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id JOIN t3 ON t2.id = t3.t2_id JOIN t4 ON t3.id = t4.t3_id',
+    'Leading((((t1 t2) t3) t4))'
+);
+
+-- Verify complex nesting: ((t1 JOIN t2) JOIN t3) JOIN t4
+EXPLAIN SELECT * FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t2.id = t3.t2_id
+JOIN t4 ON t3.id = t4.t3_id;
+```
+
+**Expected Behavior:**
+- Simple syntax creates left-deep join trees: t1 → t2 → t3
+- Nested syntax creates bushy trees: parallel joins then combine
+- Complex nesting fully controls the join tree structure
+- PostgreSQL automatically validates outer join constraints
+- If a hinted join order is invalid, the system falls back to standard join search
+
+#### Test 8: Test Inline Leading Hints
+
+```sql
+-- Inline hints don't require creating outlines
+SELECT /*+ Leading(t2 t1 t3) */
+    t1.id, t2.data, t3.data
+FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t2.id = t3.t2_id
+WHERE t1.id < 50;
+
+-- Inline nested syntax
+SELECT /*+ Leading((t1 t2) t3) */
+    t1.id, t2.data, t3.data
+FROM t1
+JOIN t2 ON t1.id = t2.t1_id
+JOIN t3 ON t2.id = t3.t2_id
+WHERE t1.id < 50;
+
+-- Cleanup test tables
+DROP TABLE t4, t3, t2, t1;
+```
+
 ### Step 10: Advanced Testing - Query Normalization
 
 Test that the Outline system properly matches queries regardless of whitespace and case:
@@ -1335,7 +1422,7 @@ Regularly review outline effectiveness:
 
 2. **Join Hint Matching**: Join hints currently have limited matching logic. Future enhancements will improve tracking of relation names in complex join trees.
 
-3. **Leading Hints**: The `LEADING` hint type for controlling join order is defined but not yet implemented.
+3. **Leading Hints**: The `LEADING` hint type for controlling join order is fully implemented, supporting both simple and nested syntax for complete control over join order, including bushy join trees.
 
 4. **Subquery Support**: Hints for subqueries are not yet supported (Note: Inline hints feature now supports this).
 
@@ -1670,7 +1757,11 @@ Currently, hints are matched by:
 
 2. **Join Hint Matching**: Join hints currently have limited matching logic. Enhancing this to track relation names through complex join trees is planned.
 
-3. **Leading Hints**: The `LEADING` hint type for controlling join order is defined but not yet implemented.
+3. **Leading Hints**: The `LEADING` hint type for controlling join order is fully implemented with complete support for:
+   - Simple left-to-right join order: `Leading(t1 t2 t3)`
+   - Nested parentheses for bushy joins: `Leading((t1 t2) (t3 t4))`
+   - Complex multi-level nesting: `Leading(((t1 t2) t3) (t4 t5))`
+   - Automatic validation of outer join constraints
 
 4. **Subquery Support**: Hints for subqueries are not yet supported.
 
