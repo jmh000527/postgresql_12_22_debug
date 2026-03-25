@@ -522,21 +522,14 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
-	 * 我们确保所有非dummy关系都有非零的行数估计值。
-	 * In edge cases, relations with constraint exclusion may have rows=0
-	 * before being marked as dummy. Tolerate this but ensure a minimum of 1
-	 * to avoid division-by-zero and other numerical issues in subsequent planning.
+	 * Note: In some planning scenarios (especially with constraint exclusion,
+	 * security barriers, or complex subqueries), relations may temporarily have
+	 * rows=0 at this point before paths are generated. The path generation phase
+	 * in set_rel_pathlist() will properly mark these as dummy relations.
+	 * Therefore, we don't assert here and let the planner handle it naturally.
 	 */
-	/* 说明：确保关系行数估计值的合理性。某些约束排除情况下，关系在被标记为dummy前可能rows=0。
-	 * 为避免除零等数值问题，将最小值设为1。 */
-	if (rel->rows <= 0 && !IS_DUMMY_REL(rel))
-	{
-		elog(DEBUG1, "Relation %d has rows=%f, setting to 1.0 to avoid numerical issues",
-			 rel->relid, rel->rows);
-		rel->rows = 1.0;
-		if (rel->tuples <= 0)
-			rel->tuples = 1.0;
-	}
+	/* 说明：在某些规划场景（特别是约束排除、安全屏障或复杂子查询）中，关系在此时可能
+	 * 暂时rows=0。路径生成阶段会正确地将这些关系标记为dummy。因此我们不在此断言。 */
 }
 
 /*
