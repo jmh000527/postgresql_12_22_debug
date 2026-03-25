@@ -30,6 +30,15 @@ RETURNS BOOLEAN
 AS 'MODULE_PATHNAME', 'pg_outline_create'
 LANGUAGE C STRICT;
 
+-- Simplified function to create an outline from SQL with inline hints
+CREATE OR REPLACE FUNCTION pg_outline_create_from_sql(
+    outline_name TEXT,
+    query_with_hints TEXT
+)
+RETURNS BOOLEAN
+AS 'MODULE_PATHNAME', 'pg_outline_create_from_sql'
+LANGUAGE C STRICT;
+
 -- Function to drop an outline
 CREATE OR REPLACE FUNCTION pg_outline_drop(
     outline_name TEXT

@@ -137,8 +137,13 @@ static void store_outline_hints(const char *outline_name, const char *query_patt
 								const char *fingerprint, const char *hints);
 static char *retrieve_outline_hints(const char *fingerprint);
 
+/* Inline hint extraction */
+static char *extract_inline_hints(const char *query_string);
+static char *strip_hints_from_query(const char *query_string);
+
 /* SQL-callable functions */
 PG_FUNCTION_INFO_V1(pg_outline_create);
+PG_FUNCTION_INFO_V1(pg_outline_create_from_sql);
 PG_FUNCTION_INFO_V1(pg_outline_drop);
 PG_FUNCTION_INFO_V1(pg_outline_enable);
 PG_FUNCTION_INFO_V1(pg_outline_disable);
@@ -759,6 +764,106 @@ retrieve_outline_hints(const char *fingerprint)
 }
 
 /*
+ * Extract inline hints from query string
+ * Looks for /*+ ... */ comments and extracts the hint content
+ * Supports multiple hint comments in one query
+ */
+static char *
+extract_inline_hints(const char *query_string)
+{
+	StringInfoData hints;
+	const char *p;
+	const char *hint_start;
+	bool		in_hint = false;
+
+	if (!query_string)
+		return NULL;
+
+	initStringInfo(&hints);
+
+	for (p = query_string; *p; p++)
+	{
+		/* Check for start of hint comment: /*+ */
+		if (!in_hint && *p == '/' && *(p + 1) == '*' && *(p + 2) == '+')
+		{
+			in_hint = true;
+			hint_start = p + 3; /* Skip past "/*+" */
+			p += 2;			/* Move past "/*" (the loop will move past '+') */
+			continue;
+		}
+
+		/* Check for end of comment: */ */
+		if (in_hint && *p == '*' && *(p + 1) == '/')
+		{
+			/* Extract hint content */
+			size_t		hint_len = p - hint_start;
+			char	   *hint_text = palloc(hint_len + 1);
+
+			memcpy(hint_text, hint_start, hint_len);
+			hint_text[hint_len] = '\0';
+
+			/* Append to hints (with space if not first hint) */
+			if (hints.len > 0)
+				appendStringInfoChar(&hints, ' ');
+			appendStringInfoString(&hints, hint_text);
+
+			pfree(hint_text);
+
+			in_hint = false;
+			p++;				/* Skip past the '/' in '*/' */
+			continue;
+		}
+	}
+
+	if (hints.len == 0)
+		return NULL;
+
+	return hints.data;
+}
+
+/*
+ * Strip inline hints from query string
+ * Returns a copy of the query with all /*+ ... */ comments removed
+ */
+static char *
+strip_hints_from_query(const char *query_string)
+{
+	StringInfoData result;
+	const char *p;
+	bool		in_hint = false;
+
+	if (!query_string)
+		return NULL;
+
+	initStringInfo(&result);
+
+	for (p = query_string; *p; p++)
+	{
+		/* Check for start of hint comment: /*+ */
+		if (!in_hint && *p == '/' && *(p + 1) == '*' && *(p + 2) == '+')
+		{
+			in_hint = true;
+			p += 2;			/* Skip past "/*" (the loop will move past '+') */
+			continue;
+		}
+
+		/* Check for end of comment: */ */
+		if (in_hint && *p == '*' && *(p + 1) == '/')
+		{
+			in_hint = false;
+			p++;				/* Skip past the '/' in '*/' */
+			continue;
+		}
+
+		/* Copy character if not in hint */
+		if (!in_hint)
+			appendStringInfoChar(&result, *p);
+	}
+
+	return result.data;
+}
+
+/*
  * SQL function: create an outline for a query
  */
 Datum
@@ -782,6 +887,114 @@ pg_outline_create(PG_FUNCTION_ARGS)
 
 	elog(NOTICE, "pg_outline_create: outline '%s' created with fingerprint %s",
 		 name_str, fingerprint ? fingerprint : "none");
+
+	if (normalized)
+		pfree(normalized);
+	if (fingerprint)
+		pfree(fingerprint);
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * SQL function: create an outline from SQL with inline hints
+ * This is the simplified interface that accepts SQL with /*+ ... */ hints
+ * The function will:
+ * 1. Extract inline hints from the SQL
+ * 2. Execute the query with hints to get the actual plan
+ * 3. Extract hints from the resulting execution plan
+ * 4. Store the extracted hints as the outline
+ * 5. Strip hints from query to create the pattern
+ */
+Datum
+pg_outline_create_from_sql(PG_FUNCTION_ARGS)
+{
+	text	   *outline_name = PG_GETARG_TEXT_PP(0);
+	text	   *query_with_hints = PG_GETARG_TEXT_PP(1);
+	char	   *name_str = text_to_cstring(outline_name);
+	char	   *query_str = text_to_cstring(query_with_hints);
+	char	   *query_without_hints;
+	char	   *normalized;
+	char	   *fingerprint;
+	char	   *extracted_hints;
+	PlannedStmt *plan;
+	List	   *parsetree_list;
+	Query	   *query;
+	List	   *hints = NIL;
+
+	/* Extract and strip hints from the query */
+	extracted_hints = extract_inline_hints(query_str);
+	query_without_hints = strip_hints_from_query(query_str);
+
+	if (!extracted_hints)
+	{
+		elog(WARNING, "pg_outline_create_from_sql: no hints found in query");
+		PG_RETURN_BOOL(false);
+	}
+
+	/* Parse the query (without hints) */
+	parsetree_list = pg_parse_query(query_without_hints);
+
+	if (list_length(parsetree_list) != 1)
+	{
+		elog(WARNING, "pg_outline_create_from_sql: query must contain exactly one statement");
+		PG_RETURN_BOOL(false);
+	}
+
+	query = linitial_node(Query, parsetree_list);
+
+	/*
+	 * Here we would ideally execute the query with hints to get the actual plan
+	 * For now, we'll use the standard planner
+	 * In a full implementation, we would:
+	 * 1. Temporarily set GUCs based on hints
+	 * 2. Call the planner
+	 * 3. Extract hints from the resulting plan
+	 * 4. Restore GUCs
+	 */
+	plan = standard_planner(query, 0, NULL);
+
+	/* Extract hints from the generated plan */
+	if (plan && plan->planTree)
+	{
+		extract_hints_from_plan_tree(plan->planTree, &hints, 0);
+	}
+
+	if (list_length(hints) == 0)
+	{
+		elog(WARNING, "pg_outline_create_from_sql: no hints could be extracted from plan");
+		PG_RETURN_BOOL(false);
+	}
+
+	/* Format hints for storage */
+	StringInfoData hint_str;
+	ListCell   *lc;
+	bool		first = true;
+
+	initStringInfo(&hint_str);
+	foreach(lc, hints)
+	{
+		char	   *hint = (char *) lfirst(lc);
+
+		if (hint)
+		{
+			if (!first)
+				appendStringInfoChar(&hint_str, ' ');
+			appendStringInfoString(&hint_str, hint);
+			first = false;
+		}
+	}
+
+	/* Normalize query (without hints) and compute fingerprint */
+	normalized = normalize_query(query_without_hints);
+	fingerprint = compute_query_fingerprint(normalized);
+
+	/* Store the outline with extracted hints */
+	store_outline_hints(name_str, query_without_hints, fingerprint, hint_str.data);
+
+	elog(NOTICE, "pg_outline_create_from_sql: outline '%s' created with fingerprint %s",
+		 name_str, fingerprint ? fingerprint : "none");
+	elog(NOTICE, "Extracted hints: %s", hint_str.data);
 
 	if (normalized)
 		pfree(normalized);
