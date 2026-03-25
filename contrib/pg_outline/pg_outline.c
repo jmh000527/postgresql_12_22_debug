@@ -60,6 +60,11 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/hashutils.h"
+#include "executor/spi.h"
+#include "lib/stringinfo.h"
+#include "common/md5.h"
+#include "catalog/pg_class.h"
 
 PG_MODULE_MAGIC;
 
@@ -102,6 +107,9 @@ typedef struct OutlineInfo
 /* Current outline being processed */
 static OutlineInfo *current_outline = NULL;
 
+/* Current PlannedStmt for relation name resolution */
+static PlannedStmt *current_plannedstmt = NULL;
+
 /* Function declarations */
 void		_PG_init(void);
 void		_PG_fini(void);
@@ -119,6 +127,15 @@ static char *get_leading_hint(Plan *plan);
 static char *get_relation_name(Index relid, PlannedStmt *plan);
 static void display_outline_data(void);
 static StringInfo format_outline_data(List *hints);
+
+/* Query fingerprinting */
+static char *normalize_query(const char *query_string);
+static char *compute_query_fingerprint(const char *normalized_query);
+
+/* Hint storage and retrieval */
+static void store_outline_hints(const char *outline_name, const char *query_pattern,
+								const char *fingerprint, const char *hints);
+static char *retrieve_outline_hints(const char *fingerprint);
 
 /* SQL-callable functions */
 PG_FUNCTION_INFO_V1(pg_outline_create);
@@ -195,18 +212,44 @@ _PG_fini(void)
 }
 
 /*
- * Planner hook: generate outline hints from the plan
+ * Planner hook: generate outline hints from the plan and apply stored hints
  */
 static PlannedStmt *
 outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 {
 	PlannedStmt *result;
+	char	   *query_fingerprint = NULL;
+	char	   *stored_hints = NULL;
+
+	/* Try to retrieve stored hints if in manual mode */
+	if (pg_outline_enabled && strcmp(pg_outline_mode, "manual") == 0 && debug_query_string)
+	{
+		char	   *normalized = normalize_query(debug_query_string);
+
+		if (normalized)
+		{
+			query_fingerprint = compute_query_fingerprint(normalized);
+			if (query_fingerprint)
+			{
+				stored_hints = retrieve_outline_hints(query_fingerprint);
+				if (stored_hints)
+				{
+					elog(DEBUG1, "pg_outline: found stored hints for query");
+					/* TODO: Parse and apply hints before planning */
+				}
+			}
+			pfree(normalized);
+		}
+	}
 
 	/* Call previous hook or standard planner */
 	if (prev_planner_hook)
 		result = prev_planner_hook(parse, cursorOptions, boundParams);
 	else
 		result = standard_planner(parse, cursorOptions, boundParams);
+
+	/* Save PlannedStmt for relation name resolution */
+	current_plannedstmt = result;
 
 	/* Generate outline if enabled and in auto mode */
 	if (pg_outline_enabled && strcmp(pg_outline_mode, "auto") == 0)
@@ -347,29 +390,38 @@ static char *
 get_scan_method_hint(Plan *plan)
 {
 	StringInfoData hint;
+	char	   *relname;
 
 	initStringInfo(&hint);
 
 	switch (nodeTag(plan))
 	{
 		case T_SeqScan:
-			appendStringInfo(&hint, "SeqScan(%s)",
-							 ((Scan *) plan)->scanrelid > 0 ? "table" : "unknown");
+			relname = get_relation_name(((Scan *) plan)->scanrelid, current_plannedstmt);
+			appendStringInfo(&hint, "SeqScan(%s)", relname ? relname : "unknown");
+			if (relname)
+				pfree(relname);
 			return hint.data;
 
 		case T_IndexScan:
-			appendStringInfo(&hint, "IndexScan(%s)",
-							 ((Scan *) plan)->scanrelid > 0 ? "table" : "unknown");
+			relname = get_relation_name(((Scan *) plan)->scanrelid, current_plannedstmt);
+			appendStringInfo(&hint, "IndexScan(%s)", relname ? relname : "unknown");
+			if (relname)
+				pfree(relname);
 			return hint.data;
 
 		case T_IndexOnlyScan:
-			appendStringInfo(&hint, "IndexOnlyScan(%s)",
-							 ((Scan *) plan)->scanrelid > 0 ? "table" : "unknown");
+			relname = get_relation_name(((Scan *) plan)->scanrelid, current_plannedstmt);
+			appendStringInfo(&hint, "IndexOnlyScan(%s)", relname ? relname : "unknown");
+			if (relname)
+				pfree(relname);
 			return hint.data;
 
 		case T_BitmapHeapScan:
-			appendStringInfo(&hint, "BitmapScan(%s)",
-							 ((Scan *) plan)->scanrelid > 0 ? "table" : "unknown");
+			relname = get_relation_name(((Scan *) plan)->scanrelid, current_plannedstmt);
+			appendStringInfo(&hint, "BitmapScan(%s)", relname ? relname : "unknown");
+			if (relname)
+				pfree(relname);
 			return hint.data;
 
 		default:
@@ -420,6 +472,48 @@ get_leading_hint(Plan *plan)
 {
 	/* For now, we'll implement a simplified version */
 	/* A full implementation would track the join order through the tree */
+	return NULL;
+}
+
+/*
+ * Get relation name from relid using PlannedStmt
+ */
+static char *
+get_relation_name(Index relid, PlannedStmt *plan)
+{
+	RangeTblEntry *rte;
+	char	   *relname = NULL;
+
+	if (plan == NULL || relid == 0 || relid > list_length(plan->rtable))
+		return NULL;
+
+	rte = rt_fetch(relid, plan->rtable);
+
+	if (rte->rtekind == RTE_RELATION)
+	{
+		Relation	rel = relation_open(rte->relid, NoLock);
+
+		relname = pstrdup(RelationGetRelationName(rel));
+		relation_close(rel, NoLock);
+
+		/* Include alias if different from table name */
+		if (rte->eref && rte->eref->aliasname &&
+			strcmp(relname, rte->eref->aliasname) != 0)
+		{
+			char	   *result = psprintf("%s AS %s", relname, rte->eref->aliasname);
+
+			pfree(relname);
+			return result;
+		}
+
+		return relname;
+	}
+	else if (rte->rtekind == RTE_SUBQUERY && rte->eref)
+	{
+		/* For subqueries, use the alias */
+		return pstrdup(rte->eref->aliasname);
+	}
+
 	return NULL;
 }
 
@@ -484,6 +578,187 @@ display_outline_data(void)
 }
 
 /*
+ * Normalize query by replacing literals with placeholders
+ * This is a simplified implementation - a production version would use
+ * more sophisticated normalization
+ */
+static char *
+normalize_query(const char *query_string)
+{
+	StringInfoData normalized;
+	const char *p;
+	bool		in_string = false;
+	bool		in_comment = false;
+
+	if (!query_string)
+		return NULL;
+
+	initStringInfo(&normalized);
+
+	for (p = query_string; *p; p++)
+	{
+		if (in_comment)
+		{
+			if (*p == '\n')
+				in_comment = false;
+			continue;
+		}
+
+		if (in_string)
+		{
+			if (*p == '\'')
+			{
+				in_string = false;
+				appendStringInfoString(&normalized, " ? ");
+			}
+			continue;
+		}
+
+		/* Start of string literal */
+		if (*p == '\'')
+		{
+			in_string = true;
+			continue;
+		}
+
+		/* Start of comment */
+		if (*p == '-' && *(p + 1) == '-')
+		{
+			in_comment = true;
+			continue;
+		}
+
+		/* Replace numbers with placeholder */
+		if (isdigit(*p))
+		{
+			while (isdigit(*p) || *p == '.')
+				p++;
+			p--;
+			appendStringInfoString(&normalized, " ? ");
+			continue;
+		}
+
+		/* Normalize whitespace */
+		if (isspace(*p))
+		{
+			appendStringInfoChar(&normalized, ' ');
+			while (isspace(*(p + 1)))
+				p++;
+			continue;
+		}
+
+		appendStringInfoChar(&normalized, tolower(*p));
+	}
+
+	return normalized.data;
+}
+
+/*
+ * Compute MD5 fingerprint of normalized query
+ */
+static char *
+compute_query_fingerprint(const char *normalized_query)
+{
+	uint8		hash[MD5_DIGEST_LENGTH];
+	StringInfoData fingerprint;
+	int			i;
+
+	if (!normalized_query)
+		return NULL;
+
+	/* Compute MD5 hash */
+	if (!pg_md5_hash(normalized_query, strlen(normalized_query), hash))
+		return NULL;
+
+	/* Convert to hex string */
+	initStringInfo(&fingerprint);
+	for (i = 0; i < MD5_DIGEST_LENGTH; i++)
+		appendStringInfo(&fingerprint, "%02x", hash[i]);
+
+	return fingerprint.data;
+}
+
+/*
+ * Store outline hints in database using SPI
+ */
+static void
+store_outline_hints(const char *outline_name, const char *query_pattern,
+					const char *fingerprint, const char *hints)
+{
+	int			ret;
+	StringInfoData query;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "pg_outline: SPI_connect failed");
+		return;
+	}
+
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "INSERT INTO pg_outline_data (outline_name, query_pattern, hint_string, enabled) "
+					 "VALUES (%s, %s, %s, true) "
+					 "ON CONFLICT (outline_name) DO UPDATE SET "
+					 "query_pattern = EXCLUDED.query_pattern, "
+					 "hint_string = EXCLUDED.hint_string, "
+					 "updated_at = CURRENT_TIMESTAMP",
+					 quote_literal_cstr(outline_name),
+					 quote_literal_cstr(query_pattern),
+					 quote_literal_cstr(hints));
+
+	ret = SPI_execute(query.data, false, 0);
+
+	if (ret != SPI_OK_INSERT && ret != SPI_OK_INSERT_RETURNING)
+		elog(WARNING, "pg_outline: failed to store outline");
+
+	SPI_finish();
+}
+
+/*
+ * Retrieve outline hints from database using SPI
+ */
+static char *
+retrieve_outline_hints(const char *fingerprint)
+{
+	int			ret;
+	char	   *hints = NULL;
+	StringInfoData query;
+
+	if (!fingerprint)
+		return NULL;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(WARNING, "pg_outline: SPI_connect failed");
+		return NULL;
+	}
+
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "SELECT hint_string FROM pg_outline_data "
+					 "WHERE enabled = true "
+					 "LIMIT 1");
+
+	ret = SPI_execute(query.data, true, 1);
+
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+		HeapTuple	tuple = SPI_tuptable->vals[0];
+		bool		isnull;
+		Datum		hint_datum;
+
+		hint_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+		if (!isnull)
+			hints = pstrdup(TextDatumGetCString(hint_datum));
+	}
+
+	SPI_finish();
+
+	return hints;
+}
+
+/*
  * SQL function: create an outline for a query
  */
 Datum
@@ -492,12 +767,26 @@ pg_outline_create(PG_FUNCTION_ARGS)
 	text	   *outline_name = PG_GETARG_TEXT_PP(0);
 	text	   *query_text = PG_GETARG_TEXT_PP(1);
 	text	   *hints_text = PG_GETARG_TEXT_PP(2);
+	char	   *name_str = text_to_cstring(outline_name);
+	char	   *query_str = text_to_cstring(query_text);
+	char	   *hints_str = text_to_cstring(hints_text);
+	char	   *normalized;
+	char	   *fingerprint;
 
-	/* TODO: Implement outline creation logic */
-	/* This would store the outline in a catalog table */
+	/* Normalize query and compute fingerprint */
+	normalized = normalize_query(query_str);
+	fingerprint = compute_query_fingerprint(normalized);
 
-	elog(NOTICE, "pg_outline_create: outline '%s' created",
-		 text_to_cstring(outline_name));
+	/* Store the outline */
+	store_outline_hints(name_str, query_str, fingerprint, hints_str);
+
+	elog(NOTICE, "pg_outline_create: outline '%s' created with fingerprint %s",
+		 name_str, fingerprint ? fingerprint : "none");
+
+	if (normalized)
+		pfree(normalized);
+	if (fingerprint)
+		pfree(fingerprint);
 
 	PG_RETURN_BOOL(true);
 }
@@ -509,11 +798,30 @@ Datum
 pg_outline_drop(PG_FUNCTION_ARGS)
 {
 	text	   *outline_name = PG_GETARG_TEXT_PP(0);
+	char	   *name_str = text_to_cstring(outline_name);
+	int			ret;
+	StringInfoData query;
 
-	/* TODO: Implement outline dropping logic */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "pg_outline: SPI_connect failed");
 
-	elog(NOTICE, "pg_outline_drop: outline '%s' dropped",
-		 text_to_cstring(outline_name));
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "DELETE FROM pg_outline_data WHERE outline_name = %s",
+					 quote_literal_cstr(name_str));
+
+	ret = SPI_execute(query.data, false, 0);
+
+	if (ret < 0 || SPI_processed == 0)
+	{
+		SPI_finish();
+		elog(WARNING, "pg_outline_drop: outline '%s' not found", name_str);
+		PG_RETURN_BOOL(false);
+	}
+
+	SPI_finish();
+
+	elog(NOTICE, "pg_outline_drop: outline '%s' dropped", name_str);
 
 	PG_RETURN_BOOL(true);
 }
@@ -525,11 +833,31 @@ Datum
 pg_outline_enable(PG_FUNCTION_ARGS)
 {
 	text	   *outline_name = PG_GETARG_TEXT_PP(0);
+	char	   *name_str = text_to_cstring(outline_name);
+	int			ret;
+	StringInfoData query;
 
-	/* TODO: Implement outline enabling logic */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "pg_outline: SPI_connect failed");
 
-	elog(NOTICE, "pg_outline_enable: outline '%s' enabled",
-		 text_to_cstring(outline_name));
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "UPDATE pg_outline_data SET enabled = true, updated_at = CURRENT_TIMESTAMP "
+					 "WHERE outline_name = %s",
+					 quote_literal_cstr(name_str));
+
+	ret = SPI_execute(query.data, false, 0);
+
+	if (ret < 0 || SPI_processed == 0)
+	{
+		SPI_finish();
+		elog(WARNING, "pg_outline_enable: outline '%s' not found", name_str);
+		PG_RETURN_BOOL(false);
+	}
+
+	SPI_finish();
+
+	elog(NOTICE, "pg_outline_enable: outline '%s' enabled", name_str);
 
 	PG_RETURN_BOOL(true);
 }
@@ -541,11 +869,31 @@ Datum
 pg_outline_disable(PG_FUNCTION_ARGS)
 {
 	text	   *outline_name = PG_GETARG_TEXT_PP(0);
+	char	   *name_str = text_to_cstring(outline_name);
+	int			ret;
+	StringInfoData query;
 
-	/* TODO: Implement outline disabling logic */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "pg_outline: SPI_connect failed");
 
-	elog(NOTICE, "pg_outline_disable: outline '%s' disabled",
-		 text_to_cstring(outline_name));
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "UPDATE pg_outline_data SET enabled = false, updated_at = CURRENT_TIMESTAMP "
+					 "WHERE outline_name = %s",
+					 quote_literal_cstr(name_str));
+
+	ret = SPI_execute(query.data, false, 0);
+
+	if (ret < 0 || SPI_processed == 0)
+	{
+		SPI_finish();
+		elog(WARNING, "pg_outline_disable: outline '%s' not found", name_str);
+		PG_RETURN_BOOL(false);
+	}
+
+	SPI_finish();
+
+	elog(NOTICE, "pg_outline_disable: outline '%s' disabled", name_str);
 
 	PG_RETURN_BOOL(true);
 }
@@ -556,10 +904,9 @@ pg_outline_disable(PG_FUNCTION_ARGS)
 Datum
 pg_outline_list(PG_FUNCTION_ARGS)
 {
-	/* TODO: Implement outline listing logic */
-	/* This would return a set of records from the catalog table */
-
-	elog(NOTICE, "pg_outline_list: listing outlines");
+	/* This function is implemented in SQL in the --1.0.sql file */
+	/* Just return void as it's a placeholder */
+	elog(NOTICE, "pg_outline_list: use SELECT * FROM pg_outline_list() for listing");
 
 	PG_RETURN_VOID();
 }
