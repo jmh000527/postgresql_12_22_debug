@@ -255,8 +255,14 @@ parse_hints(const char *hint_str)
 				if (next_token == NULL)
 				{
 					/* This is the last token, should be the row count */
-					rows = strtod(token, &endptr);
-					if (endptr == token || *endptr != '\0')
+					/* Support both #count and plain count syntax */
+					if (token[0] == '#')
+						rows = strtod(token + 1, &endptr);
+					else
+						rows = strtod(token, &endptr);
+					
+					if (endptr == token || (endptr == token + 1 && token[0] == '#') || 
+					    *endptr != '\0')
 					{
 						/* Invalid row count, skip hint */
 						list_free(relnames);
@@ -581,6 +587,10 @@ get_hints_for_query(const char *query_string)
 	ScanKeyData		scankey;
 	HintState	   *hstate = NULL;
 	Oid				nspid;
+
+	/* Must be in transaction state to access catalog */
+	if (!IsTransactionState())
+		return NULL;
 
 	if (query_string == NULL)
 		return NULL;
