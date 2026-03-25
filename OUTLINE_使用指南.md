@@ -558,6 +558,33 @@ Outline系统支持的所有Hint类型都可用于内联Hint：
 - `HashJoin(table1 table2)` - 强制哈希连接
 - `MergeJoin(table1 table2)` - 强制归并连接
 
+**行数估算Hint：**
+- `Rows(table row_count)` - 覆盖行数估算
+- `Rows(table1 table2 row_count)` - 覆盖连接结果估算
+
+**并行化控制Hint：**
+- `Parallel(table num_workers)` - 强制并行执行
+- `NoParallel(table)` - 禁用并行执行
+
+**GUC参数覆盖Hint：**
+- `Set(parameter value)` - 临时覆盖GUC参数
+
+**示例：**
+```sql
+-- 行数覆盖
+SELECT /*+ Rows(customers 10000) */ * FROM customers;
+
+-- 并行化控制
+SELECT /*+ Parallel(large_table 8) */ * FROM large_table;
+
+-- GUC参数覆盖
+SELECT /*+ Set(random_page_cost 1.1) */ * FROM orders;
+
+-- 组合多种Hint类型
+SELECT /*+ Rows(customers 5000) Parallel(orders 4) HashJoin(customers orders) */
+  * FROM customers JOIN orders ON customers.id = orders.customer_id;
+```
+
 ### 调试内联Hint
 
 要查看何时提取和应用内联Hint：
@@ -1050,6 +1077,102 @@ NoIndexScan(表名)                -- 禁用索引扫描
 NestLoop(表1 表2)                -- 强制使用嵌套循环连接
 HashJoin(表1 表2)                -- 强制使用哈希连接
 MergeJoin(表1 表2)               -- 强制使用归并连接
+```
+
+### 行数估算Hint
+
+```sql
+Rows(表名 行数)                            -- 覆盖单个表的行数估算
+Rows(表1 表2 行数)                         -- 覆盖连接结果的行数估算
+Rows(表1 表2 表3 行数)                     -- 覆盖多表连接的行数估算
+```
+
+**用途**：当统计信息不准确或过时时，覆盖优化器的行数估算。
+
+**使用场景**：
+- 纠正`ANALYZE`统计信息过时导致的估算错误
+- 通过操纵基数估算来强制特定的连接顺序
+- 处理优化器无法检测到的数据倾斜
+
+**示例**：
+```sql
+-- 覆盖customers表的估算
+SELECT pg_create_outline(
+    'fix_customers_estimate',
+    'SELECT * FROM customers WHERE region = $1',
+    'Rows(customers 5000)'
+);
+```
+
+### 并行化控制Hint
+
+```sql
+Parallel(表名 工作进程数)                   -- 强制并行扫描并指定工作进程数
+NoParallel(表名)                            -- 禁用并行执行
+```
+
+**用途**：控制表扫描的并行度。
+
+**使用场景**：
+- 为大表扫描强制启用并行执行
+- 为OLTP工作负载禁用并行化以减少开销
+- 微调工作进程数以获得最佳性能
+
+**示例**：
+```sql
+-- 为大表扫描强制使用8个并行工作进程
+SELECT pg_create_outline(
+    'parallelize_huge_table',
+    'SELECT * FROM huge_table WHERE status = $1',
+    'Parallel(huge_table 8)'
+);
+
+-- 为小型OLTP查询禁用并行化
+SELECT pg_create_outline(
+    'no_parallel_oltp',
+    'SELECT * FROM users WHERE id = $1',
+    'NoParallel(users)'
+);
+```
+
+### GUC参数覆盖Hint
+
+```sql
+Set(参数名 值)                              -- 临时覆盖GUC参数
+```
+
+**用途**：在查询规划期间临时调整成本参数和其他GUC设置。
+
+**常用参数**：
+- `random_page_cost` - 随机磁盘页访问成本（默认：4.0）
+- `seq_page_cost` - 顺序磁盘页访问成本（默认：1.0）
+- `cpu_tuple_cost` - 处理一个元组的成本（默认：0.01）
+- `cpu_operator_cost` - 处理一个操作符的成本（默认：0.0025）
+- `work_mem` - 排序/哈希操作的内存
+- `enable_seqscan`、`enable_indexscan`等 - 启用/禁用特定计划类型
+
+**示例**：
+```sql
+-- 针对SSD优化，降低随机页访问成本
+SELECT pg_create_outline(
+    'ssd_optimized',
+    'SELECT * FROM orders WHERE customer_id = $1',
+    'Set(random_page_cost 1.1) IndexScan(orders idx_customer)'
+);
+
+-- 为复杂查询增加工作内存
+SELECT pg_create_outline(
+    'large_sort',
+    'SELECT * FROM large_table ORDER BY created_at',
+    'Set(work_mem 256MB)'
+);
+
+-- 组合多个Set hint与其他hint
+SELECT pg_create_outline(
+    'complex_optimization',
+    'SELECT * FROM t1 JOIN t2 ON t1.id = t2.fk',
+    E'Set(random_page_cost 1.1)\nSet(work_mem 128MB)\nHashJoin(t1 t2)'
+);
 ```
 
 ## 使用示例

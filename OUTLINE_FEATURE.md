@@ -784,6 +784,33 @@ All hint types supported by the Outline system work with inline hints:
 - `HashJoin(table1 table2)` - Force hash join
 - `MergeJoin(table1 table2)` - Force merge join
 
+**Row Count Estimation Hints:**
+- `Rows(table row_count)` - Override row count estimate
+- `Rows(table1 table2 row_count)` - Override join result estimate
+
+**Parallelization Control Hints:**
+- `Parallel(table num_workers)` - Force parallel execution
+- `NoParallel(table)` - Disable parallel execution
+
+**GUC Parameter Override Hints:**
+- `Set(parameter value)` - Temporarily override GUC parameter
+
+**Examples:**
+```sql
+-- Row count override
+SELECT /*+ Rows(customers 10000) */ * FROM customers;
+
+-- Parallelization control
+SELECT /*+ Parallel(large_table 8) */ * FROM large_table;
+
+-- GUC parameter override
+SELECT /*+ Set(random_page_cost 1.1) */ * FROM orders;
+
+-- Combine multiple hint types
+SELECT /*+ Rows(customers 5000) Parallel(orders 4) HashJoin(customers orders) */
+  * FROM customers JOIN orders ON customers.id = orders.customer_id;
+```
+
 ### Debugging Inline Hints
 
 To see when inline hints are being extracted and applied:
@@ -1439,6 +1466,102 @@ NoIndexScan(table_name)      -- Disable index scan
 NestLoop(table1 table2)      -- Force nested loop join
 HashJoin(table1 table2)      -- Force hash join
 MergeJoin(table1 table2)     -- Force merge join
+```
+
+### Row Count Estimation Hints
+
+```sql
+Rows(table_name row_count)                    -- Override row count for a single table
+Rows(table1 table2 row_count)                 -- Override row count for a join result
+Rows(table1 table2 table3 row_count)          -- Override row count for multi-table join
+```
+
+**Purpose**: Override the optimizer's row count estimates when statistics are inaccurate or stale.
+
+**Use Cases**:
+- Correct optimizer estimates when `ANALYZE` statistics are outdated
+- Force specific join orders by manipulating cardinality estimates
+- Handle data skew that the optimizer doesn't detect
+
+**Example**:
+```sql
+-- Override estimate for customers table
+SELECT pg_create_outline(
+    'fix_customers_estimate',
+    'SELECT * FROM customers WHERE region = $1',
+    'Rows(customers 5000)'
+);
+```
+
+### Parallelization Control Hints
+
+```sql
+Parallel(table_name num_workers)              -- Force parallel scan with specified workers
+NoParallel(table_name)                         -- Disable parallel execution
+```
+
+**Purpose**: Control the degree of parallelism for table scans.
+
+**Use Cases**:
+- Force parallel execution for large table scans
+- Disable parallelization for OLTP workloads to reduce overhead
+- Fine-tune worker count for optimal performance
+
+**Examples**:
+```sql
+-- Force 8 parallel workers for large table scan
+SELECT pg_create_outline(
+    'parallelize_huge_table',
+    'SELECT * FROM huge_table WHERE status = $1',
+    'Parallel(huge_table 8)'
+);
+
+-- Disable parallelization for small OLTP query
+SELECT pg_create_outline(
+    'no_parallel_oltp',
+    'SELECT * FROM users WHERE id = $1',
+    'NoParallel(users)'
+);
+```
+
+### GUC Parameter Override Hints
+
+```sql
+Set(parameter_name value)                      -- Temporarily override GUC parameter
+```
+
+**Purpose**: Temporarily adjust cost parameters and other GUC settings during query planning.
+
+**Commonly Used Parameters**:
+- `random_page_cost` - Cost of random disk page access (default: 4.0)
+- `seq_page_cost` - Cost of sequential disk page access (default: 1.0)
+- `cpu_tuple_cost` - Cost of processing one tuple (default: 0.01)
+- `cpu_operator_cost` - Cost of processing one operator (default: 0.0025)
+- `work_mem` - Memory for sort/hash operations
+- `enable_seqscan`, `enable_indexscan`, etc. - Enable/disable specific plan types
+
+**Examples**:
+```sql
+-- Optimize for SSD by reducing random page cost
+SELECT pg_create_outline(
+    'ssd_optimized',
+    'SELECT * FROM orders WHERE customer_id = $1',
+    'Set(random_page_cost 1.1) IndexScan(orders idx_customer)'
+);
+
+-- Increase work memory for complex query
+SELECT pg_create_outline(
+    'large_sort',
+    'SELECT * FROM large_table ORDER BY created_at',
+    'Set(work_mem 256MB)'
+);
+
+-- Combine multiple Set hints with other hints
+SELECT pg_create_outline(
+    'complex_optimization',
+    'SELECT * FROM t1 JOIN t2 ON t1.id = t2.fk',
+    E'Set(random_page_cost 1.1)\nSet(work_mem 128MB)\nHashJoin(t1 t2)'
+);
 ```
 
 ## Usage Examples
