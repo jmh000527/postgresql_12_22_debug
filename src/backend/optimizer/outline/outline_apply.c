@@ -45,21 +45,11 @@ outline_hints_init(void)
 	current_hint_state = NULL;
 
 	/*
-	 * TEMPORARILY DISABLED: join_search_hook registration
-	 *
-	 * The join_search_hook is causing catalog cache access issues during
-	 * error recovery and transaction rollback. When errors occur, the
-	 * optimizer may continue planning even after a transaction has been
-	 * aborted, leading to catalog cache lookups outside of transaction
-	 * contexts.
-	 *
-	 * This causes TRAP assertions: FailedAssertion("!(IsTransactionState())")
-	 * in catcache.c line 1214.
-	 *
-	 * TODO: Investigate proper transaction state handling in join search hook
-	 * or implement a more robust cleanup mechanism during error recovery.
+	 * Register join_search_hook to enable Leading hint support.
+	 * The hook includes IsTransactionState() checks to safely handle
+	 * error recovery and transaction rollback scenarios.
 	 */
-	/* join_search_hook = outline_join_search; */
+	join_search_hook = outline_join_search;
 }
 
 /*
