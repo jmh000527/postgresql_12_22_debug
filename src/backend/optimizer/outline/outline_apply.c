@@ -317,9 +317,13 @@ outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	if (rows_hint != NULL)
 	{
 		/* Override the estimated row count */
-		rel->rows = rows_hint->rows;
-		/* Recalculate tuple fraction if needed */
-		rel->tuples = rows_hint->rows;
+		/* Ensure row count is always positive to avoid assertion failures */
+		if (rows_hint->rows > 0)
+		{
+			rel->rows = rows_hint->rows;
+			/* Recalculate tuple fraction if needed */
+			rel->tuples = rows_hint->rows;
+		}
 	}
 
 	/* Check if there's a Parallel hint for this relation */

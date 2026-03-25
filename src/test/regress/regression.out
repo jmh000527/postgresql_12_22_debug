@@ -1,213 +1,213 @@
-test tablespace                   ... ok          234 ms
-parallel group (20 tests):  char int2 varchar name oid pg_lsn int4 regproc text txid boolean bit money uuid float4 int8 float8 numeric rangetypes enum
-     boolean                      ... ok          122 ms
-     char                         ... ok           41 ms
-     name                         ... ok           71 ms
-     varchar                      ... ok           64 ms
-     text                         ... ok          109 ms
-     int2                         ... ok           56 ms
-     int4                         ... ok           88 ms
-     int8                         ... ok          147 ms
-     oid                          ... ok           75 ms
-     float4                       ... ok          125 ms
-     float8                       ... ok          145 ms
-     bit                          ... ok          121 ms
-     numeric                      ... ok          533 ms
-     txid                         ... ok          109 ms
-     uuid                         ... ok          122 ms
-     enum                         ... FAILED (test process exited with exit code 2)      636 ms
-     money                        ... ok          119 ms
-     rangetypes                   ... ok          626 ms
-     pg_lsn                       ... ok           65 ms
-     regproc                      ... ok           78 ms
-parallel group (19 tests):  strings lseg line box path polygon numerology time date point timestamp tstypes circle macaddr8 interval macaddr timestamptz timetz inet
-     strings                      ... FAILED (test process exited with exit code 2)       17 ms
-     numerology                   ... FAILED (test process exited with exit code 2)       22 ms
-     point                        ... FAILED (test process exited with exit code 2)       24 ms
-     lseg                         ... FAILED (test process exited with exit code 2)       14 ms
-     line                         ... FAILED (test process exited with exit code 2)       14 ms
-     box                          ... FAILED (test process exited with exit code 2)       14 ms
-     path                         ... FAILED (test process exited with exit code 2)       17 ms
-     polygon                      ... FAILED (test process exited with exit code 2)       18 ms
-     circle                       ... FAILED (test process exited with exit code 2)       25 ms
-     date                         ... FAILED (test process exited with exit code 2)       11 ms
-     time                         ... FAILED (test process exited with exit code 2)       10 ms
-     timetz                       ... FAILED (test process exited with exit code 2)       18 ms
-     timestamp                    ... FAILED (test process exited with exit code 2)       13 ms
-     timestamptz                  ... FAILED (test process exited with exit code 2)       17 ms
-     interval                     ... FAILED (test process exited with exit code 2)       14 ms
-     inet                         ... FAILED (test process exited with exit code 2)       16 ms
-     macaddr                      ... FAILED (test process exited with exit code 2)       15 ms
-     macaddr8                     ... FAILED (test process exited with exit code 2)       12 ms
-     tstypes                      ... FAILED (test process exited with exit code 2)        9 ms
-parallel group (10 tests):  misc_sanity regex type_sanity horology oidjoins database opr_sanity geometry comments expressions
-     geometry                     ... FAILED (test process exited with exit code 2)       18 ms
-     horology                     ... FAILED (test process exited with exit code 2)       16 ms
-     regex                        ... FAILED (test process exited with exit code 2)       13 ms
-     oidjoins                     ... FAILED (test process exited with exit code 2)       16 ms
-     type_sanity                  ... FAILED (test process exited with exit code 2)       13 ms
-     opr_sanity                   ... FAILED (test process exited with exit code 2)       16 ms
-     misc_sanity                  ... FAILED (test process exited with exit code 2)       12 ms
-     comments                     ... FAILED (test process exited with exit code 2)       16 ms
-     expressions                  ... FAILED (test process exited with exit code 2)       16 ms
-     database                     ... FAILED (test process exited with exit code 2)       15 ms
-test create_function_1            ... ok           17 ms
-test create_type                  ... ok           20 ms
-test create_table                 ... ok          413 ms
-test create_function_2            ... ok           11 ms
-parallel group (5 tests):  copyselect copydml insert insert_conflict copy
-     copy                         ... FAILED (test process exited with exit code 2)      976 ms
-     copyselect                   ... ok           30 ms
-     copydml                      ... ok           36 ms
-     insert                       ... ok          508 ms
-     insert_conflict              ... FAILED (test process exited with exit code 2)      700 ms
-parallel group (4 tests):  create_misc create_operator create_procedure create_schema
-     create_misc                  ... FAILED (test process exited with exit code 2)       22 ms
-     create_operator              ... FAILED (test process exited with exit code 2)       22 ms
-     create_procedure             ... FAILED (test process exited with exit code 2)       23 ms
-     create_schema                ... FAILED (test process exited with exit code 2)       23 ms
-parallel group (5 tests):  create_index index_including_gist create_index_spgist create_view index_including
-     create_index                 ... FAILED (test process exited with exit code 2)        9 ms
-     create_index_spgist          ... FAILED (test process exited with exit code 2)       10 ms
-     create_view                  ... FAILED (test process exited with exit code 2)        9 ms
-     index_including              ... FAILED (test process exited with exit code 2)        9 ms
-     index_including_gist         ... FAILED (test process exited with exit code 2)        8 ms
-parallel group (16 tests):  triggers roleattributes create_function_3 create_cast inherit drop_if_exists create_aggregate typed_table vacuum infinite_recurse constraints select updatable_views hash_func create_am errors
-     create_aggregate             ... FAILED (test process exited with exit code 2)       20 ms
-     create_function_3            ... FAILED (test process exited with exit code 2)       17 ms
-     create_cast                  ... FAILED (test process exited with exit code 2)       18 ms
-     constraints                  ... FAILED (test process exited with exit code 2)       21 ms
-     triggers                     ... FAILED (test process exited with exit code 2)       15 ms
-     select                       ... FAILED (test process exited with exit code 2)       21 ms
-     inherit                      ... FAILED (test process exited with exit code 2)       17 ms
-     typed_table                  ... FAILED (test process exited with exit code 2)       19 ms
-     vacuum                       ... FAILED (test process exited with exit code 2)       19 ms
-     drop_if_exists               ... FAILED (test process exited with exit code 2)       17 ms
-     updatable_views              ... FAILED (test process exited with exit code 2)       15 ms
-     roleattributes               ... FAILED (test process exited with exit code 2)        6 ms
-     create_am                    ... FAILED (test process exited with exit code 2)       16 ms
-     hash_func                    ... FAILED (test process exited with exit code 2)       15 ms
-     errors                       ... FAILED (test process exited with exit code 2)       16 ms
-     infinite_recurse             ... FAILED (test process exited with exit code 2)        9 ms
-test sanity_check                 ... FAILED (test process exited with exit code 2)        3 ms
-parallel group (20 tests):  select_distinct select_into select_having select_distinct_on select_implicit subselect case random hash_index union prepared_xacts namespace delete arrays update transactions join aggregates btree_index portals
-     select_into                  ... FAILED (test process exited with exit code 2)       21 ms
-     select_distinct              ... FAILED (test process exited with exit code 2)       21 ms
-     select_distinct_on           ... FAILED (test process exited with exit code 2)       21 ms
-     select_implicit              ... FAILED (test process exited with exit code 2)       24 ms
-     select_having                ... FAILED (test process exited with exit code 2)       21 ms
-     subselect                    ... FAILED (test process exited with exit code 2)       25 ms
-     union                        ... FAILED (test process exited with exit code 2)       25 ms
-     case                         ... FAILED (test process exited with exit code 2)       24 ms
-     join                         ... FAILED (test process exited with exit code 2)     1129 ms
-     aggregates                   ... FAILED (test process exited with exit code 2)     1129 ms
-     transactions                 ... FAILED (test process exited with exit code 2)     1122 ms
-     random                       ... failed (ignored) (test process exited with exit code 2)       19 ms
-     portals                      ... FAILED (test process exited with exit code 2)     1337 ms
-     arrays                       ... FAILED      609 ms
-     btree_index                  ... FAILED (test process exited with exit code 2)     1119 ms
-     hash_index                   ... FAILED (test process exited with exit code 2)       13 ms
-     update                       ... ok          964 ms
-     delete                       ... ok           78 ms
-     namespace                    ... FAILED (test process exited with exit code 2)       14 ms
-     prepared_xacts               ... FAILED (test process exited with exit code 2)       13 ms
-parallel group (20 tests):  brin gin spgist security_label privileges lock init_privs replica_identity gist collate rowsecurity matview join_hash identity object_address tablesample drop_operator password generated groupingsets
-     brin                         ... FAILED (test process exited with exit code 2)       17 ms
-     gin                          ... FAILED (test process exited with exit code 2)       15 ms
-     gist                         ... FAILED (test process exited with exit code 2)       24 ms
-     spgist                       ... FAILED (test process exited with exit code 2)       14 ms
-     privileges                   ... FAILED (test process exited with exit code 2)       17 ms
-     init_privs                   ... FAILED (test process exited with exit code 2)       21 ms
-     security_label               ... FAILED (test process exited with exit code 2)       14 ms
-     collate                      ... FAILED (test process exited with exit code 2)       23 ms
-     matview                      ... FAILED (test process exited with exit code 2)       27 ms
-     lock                         ... FAILED (test process exited with exit code 2)       18 ms
-     replica_identity             ... FAILED (test process exited with exit code 2)       13 ms
-     rowsecurity                  ... FAILED (test process exited with exit code 2)       16 ms
-     object_address               ... FAILED (test process exited with exit code 2)       19 ms
-     tablesample                  ... FAILED (test process exited with exit code 2)       19 ms
-     groupingsets                 ... FAILED (test process exited with exit code 2)       20 ms
-     drop_operator                ... FAILED (test process exited with exit code 2)       17 ms
-     password                     ... FAILED (test process exited with exit code 2)       17 ms
-     identity                     ... FAILED (test process exited with exit code 2)       15 ms
-     generated                    ... FAILED (test process exited with exit code 2)       17 ms
-     join_hash                    ... FAILED (test process exited with exit code 2)       14 ms
-parallel group (11 tests):  tidscan alter_operator misc_functions create_table_like alter_generic async misc sysviews tsrf dbsize tid
-     create_table_like            ... FAILED (test process exited with exit code 2)       12 ms
-     alter_generic                ... FAILED (test process exited with exit code 2)       12 ms
-     alter_operator               ... FAILED (test process exited with exit code 2)       10 ms
-     misc                         ... FAILED (test process exited with exit code 2)       13 ms
-     async                        ... FAILED (test process exited with exit code 2)       12 ms
-     dbsize                       ... FAILED (test process exited with exit code 2)       13 ms
-     misc_functions               ... FAILED (test process exited with exit code 2)       10 ms
-     sysviews                     ... FAILED (test process exited with exit code 2)       12 ms
-     tsrf                         ... FAILED (test process exited with exit code 2)       12 ms
-     tid                          ... FAILED (test process exited with exit code 2)       12 ms
-     tidscan                      ... FAILED (test process exited with exit code 2)        8 ms
-parallel group (5 tests):  rules psql psql_crosstab amutils stats_ext
-     rules                        ... FAILED (test process exited with exit code 2)        4 ms
-     psql                         ... FAILED (test process exited with exit code 2)        5 ms
-     psql_crosstab                ... FAILED (test process exited with exit code 2)        6 ms
-     amutils                      ... FAILED (test process exited with exit code 2)        6 ms
-     stats_ext                    ... FAILED (test process exited with exit code 2)        6 ms
-test select_parallel              ... FAILED (test process exited with exit code 2)      418 ms
-test write_parallel               ... FAILED (test process exited with exit code 2)       34 ms
-parallel group (2 tests):  publication subscription
-     publication                  ... ok           92 ms
-     subscription                 ... FAILED (test process exited with exit code 2)      447 ms
-parallel group (17 tests):  select_views portals_p2 foreign_key dependency tsearch bitmapops window cluster guc combocid foreign_data indirect_toast tsdicts equivclass advisory_lock xmlmap functional_deps
-     select_views                 ... FAILED (test process exited with exit code 2)       43 ms
-     portals_p2                   ... FAILED (test process exited with exit code 2)       42 ms
-     foreign_key                  ... FAILED (test process exited with exit code 2)       43 ms
-     cluster                      ... FAILED (test process exited with exit code 2)       43 ms
-     dependency                   ... FAILED (test process exited with exit code 2)       40 ms
-     guc                          ... FAILED (test process exited with exit code 2)       42 ms
-     bitmapops                    ... FAILED (test process exited with exit code 2)       40 ms
-     combocid                     ... FAILED (test process exited with exit code 2)       41 ms
-     tsearch                      ... FAILED (test process exited with exit code 2)       38 ms
-     tsdicts                      ... FAILED (test process exited with exit code 2)       37 ms
-     foreign_data                 ... FAILED (test process exited with exit code 2)       36 ms
-     window                       ... FAILED (test process exited with exit code 2)       34 ms
-     xmlmap                       ... FAILED (test process exited with exit code 2)       38 ms
-     functional_deps              ... FAILED (test process exited with exit code 2)       38 ms
-     advisory_lock                ... FAILED (test process exited with exit code 2)       37 ms
-     indirect_toast               ... FAILED (test process exited with exit code 2)       35 ms
-     equivclass                   ... FAILED (test process exited with exit code 2)       36 ms
+test tablespace                   ... ok          162 ms
+parallel group (20 tests):  char name varchar oid int2 pg_lsn regproc int4 boolean uuid float4 text int8 txid float8 money bit enum numeric rangetypes
+     boolean                      ... ok           96 ms
+     char                         ... ok           36 ms
+     name                         ... ok           65 ms
+     varchar                      ... ok           69 ms
+     text                         ... ok          100 ms
+     int2                         ... ok           81 ms
+     int4                         ... ok           92 ms
+     int8                         ... ok          105 ms
+     oid                          ... ok           72 ms
+     float4                       ... ok           98 ms
+     float8                       ... ok          119 ms
+     bit                          ... ok          125 ms
+     numeric                      ... ok          300 ms
+     txid                         ... ok          100 ms
+     uuid                         ... ok           88 ms
+     enum                         ... ok          144 ms
+     money                        ... ok          114 ms
+     rangetypes                   ... ok          322 ms
+     pg_lsn                       ... ok           81 ms
+     regproc                      ... ok           80 ms
+parallel group (19 tests):  time line circle lseg timetz numerology path point macaddr8 macaddr tstypes inet interval date strings box polygon timestamp timestamptz
+     strings                      ... ok          170 ms
+     numerology                   ... ok           67 ms
+     point                        ... ok           76 ms
+     lseg                         ... ok           51 ms
+     line                         ... ok           34 ms
+     box                          ... ok          191 ms
+     path                         ... ok           66 ms
+     polygon                      ... ok          239 ms
+     circle                       ... ok           47 ms
+     date                         ... ok          130 ms
+     time                         ... ok           30 ms
+     timetz                       ... ok           50 ms
+     timestamp                    ... ok          387 ms
+     timestamptz                  ... ok          411 ms
+     interval                     ... ok          113 ms
+     inet                         ... ok           99 ms
+     macaddr                      ... ok           79 ms
+     macaddr8                     ... ok           73 ms
+     tstypes                      ... ok           78 ms
+parallel group (10 tests):  comments misc_sanity expressions geometry horology type_sanity database oidjoins opr_sanity regex
+     geometry                     ... ok          129 ms
+     horology                     ... ok          133 ms
+     regex                        ... ok          374 ms
+     oidjoins                     ... ok          229 ms
+     type_sanity                  ... ok          178 ms
+     opr_sanity                   ... ok          356 ms
+     misc_sanity                  ... ok           73 ms
+     comments                     ... ok           13 ms
+     expressions                  ... ok           74 ms
+     database                     ... ok          203 ms
+test create_function_1            ... ok           10 ms
+test create_type                  ... ok           16 ms
+test create_table                 ... ok          274 ms
+test create_function_2            ... ok            9 ms
+parallel group (5 tests):  copydml copyselect insert_conflict copy insert
+     copy                         ... ok          322 ms
+     copyselect                   ... ok           34 ms
+     copydml                      ... ok           33 ms
+     insert                       ... ok          332 ms
+     insert_conflict              ... ok          139 ms
+parallel group (4 tests):  create_operator create_schema create_procedure create_misc
+     create_misc                  ... ok           71 ms
+     create_operator              ... ok           21 ms
+     create_procedure             ... ok           38 ms
+     create_schema                ... ok           31 ms
+parallel group (5 tests):  index_including_gist index_including create_view create_index_spgist create_index
+     create_index                 ... ok          672 ms
+     create_index_spgist          ... ok          475 ms
+     create_view                  ... ok          320 ms
+     index_including              ... ok          305 ms
+     index_including_gist         ... ok          297 ms
+parallel group (16 tests):  create_cast create_aggregate errors hash_func roleattributes create_function_3 drop_if_exists select typed_table create_am infinite_recurse constraints vacuum inherit updatable_views triggers
+     create_aggregate             ... ok           67 ms
+     create_function_3            ... ok          105 ms
+     create_cast                  ... ok           46 ms
+     constraints                  ... ok          348 ms
+     triggers                     ... ok          986 ms
+     select                       ... ok          158 ms
+     inherit                      ... ok          656 ms
+     typed_table                  ... ok          176 ms
+     vacuum                       ... ok          378 ms
+     drop_if_exists               ... ok          105 ms
+     updatable_views              ... FAILED      723 ms
+     roleattributes               ... ok           87 ms
+     create_am                    ... ok          199 ms
+     hash_func                    ... ok           77 ms
+     errors                       ... ok           69 ms
+     infinite_recurse             ... ok          297 ms
+test sanity_check                 ... ok          119 ms
+parallel group (20 tests):  select_distinct_on select_distinct random select_having delete namespace case select_implicit select_into prepared_xacts transactions portals union subselect arrays aggregates hash_index update btree_index join
+     select_into                  ... ok          198 ms
+     select_distinct              ... ok           54 ms
+     select_distinct_on           ... ok           37 ms
+     select_implicit              ... ok          132 ms
+     select_having                ... ok           86 ms
+     subselect                    ... ok          425 ms
+     union                        ... ok          415 ms
+     case                         ... ok          114 ms
+     join                         ... ok          776 ms
+     aggregates                   ... ok          598 ms
+     transactions                 ... ok          291 ms
+     random                       ... ok           78 ms
+     portals                      ... ok          329 ms
+     arrays                       ... ok          442 ms
+     btree_index                  ... ok          697 ms
+     hash_index                   ... ok          598 ms
+     update                       ... ok          667 ms
+     delete                       ... ok           90 ms
+     namespace                    ... ok           97 ms
+     prepared_xacts               ... ok          192 ms
+parallel group (20 tests):  init_privs drop_operator security_label lock tablesample object_address collate password groupingsets replica_identity identity matview gin generated spgist brin rowsecurity gist join_hash privileges
+     brin                         ... ok         1169 ms
+     gin                          ... ok          885 ms
+     gist                         ... ok         1435 ms
+     spgist                       ... ok         1154 ms
+     privileges                   ... FAILED     1897 ms
+     init_privs                   ... ok           53 ms
+     security_label               ... ok          121 ms
+     collate                      ... ok          385 ms
+     matview                      ... ok          859 ms
+     lock                         ... ok          152 ms
+     replica_identity             ... ok          545 ms
+     rowsecurity                  ... FAILED     1190 ms
+     object_address               ... ok          254 ms
+     tablesample                  ... ok          238 ms
+     groupingsets                 ... ok          408 ms
+     drop_operator                ... ok           52 ms
+     password                     ... ok          406 ms
+     identity                     ... ok          557 ms
+     generated                    ... ok          873 ms
+     join_hash                    ... ok         1731 ms
+parallel group (11 tests):  async dbsize alter_operator tsrf tid tidscan misc_functions sysviews alter_generic misc create_table_like
+     create_table_like            ... ok          228 ms
+     alter_generic                ... ok          134 ms
+     alter_operator               ... ok           43 ms
+     misc                         ... ok          141 ms
+     async                        ... ok           30 ms
+     dbsize                       ... ok           35 ms
+     misc_functions               ... ok          107 ms
+     sysviews                     ... ok          114 ms
+     tsrf                         ... FAILED       58 ms
+     tid                          ... ok           58 ms
+     tidscan                      ... ok           86 ms
+parallel group (5 tests):  amutils psql_crosstab psql rules stats_ext
+     rules                        ... ok          352 ms
+     psql                         ... ok          193 ms
+     psql_crosstab                ... ok           28 ms
+     amutils                      ... ok           26 ms
+     stats_ext                    ... FAILED      599 ms
+test select_parallel              ... ok          640 ms
+test write_parallel               ... ok           39 ms
+parallel group (2 tests):  subscription publication
+     publication                  ... ok           62 ms
+     subscription                 ... ok           19 ms
+parallel group (17 tests):  portals_p2 advisory_lock xmlmap combocid guc functional_deps tsdicts equivclass dependency select_views tsearch window bitmapops cluster indirect_toast foreign_data foreign_key
+     select_views                 ... ok          356 ms
+     portals_p2                   ... ok           60 ms
+     foreign_key                  ... ok         1038 ms
+     cluster                      ... ok          546 ms
+     dependency                   ... ok          198 ms
+     guc                          ... ok          143 ms
+     bitmapops                    ... ok          495 ms
+     combocid                     ... ok          123 ms
+     tsearch                      ... ok          375 ms
+     tsdicts                      ... ok          145 ms
+     foreign_data                 ... FAILED      743 ms
+     window                       ... ok          479 ms
+     xmlmap                       ... ok          105 ms
+     functional_deps              ... ok          133 ms
+     advisory_lock                ... ok           79 ms
+     indirect_toast               ... ok          653 ms
+     equivclass                   ... ok          159 ms
 parallel group (6 tests):  json_encoding jsonpath_encoding jsonpath jsonb_jsonpath json jsonb
-     json                         ... ok          171 ms
-     jsonb                        ... ok          331 ms
-     json_encoding                ... ok           26 ms
-     jsonpath                     ... ok           55 ms
-     jsonpath_encoding            ... ok           32 ms
-     jsonb_jsonpath               ... ok           94 ms
-parallel group (18 tests):  conversion prepare returning limit xml plancache polymorphism temp with truncate largeobject domain rowtypes copy2 alter_table sequence rangefuncs plpgsql
-     plancache                    ... ok          313 ms
-     limit                        ... FAILED      254 ms
-     plpgsql                      ... FAILED (test process exited with exit code 2)     1918 ms
-     copy2                        ... FAILED (test process exited with exit code 2)     1445 ms
-     temp                         ... ok          546 ms
-     domain                       ... ok          964 ms
-     rangefuncs                   ... FAILED (test process exited with exit code 2)     1638 ms
-     prepare                      ... ok          139 ms
-     conversion                   ... ok           53 ms
-     truncate                     ... ok          786 ms
-     alter_table                  ... FAILED (test process exited with exit code 2)     1443 ms
-     sequence                     ... FAILED (test process exited with exit code 2)     1453 ms
-     polymorphism                 ... ok          442 ms
-     rowtypes                     ... FAILED      971 ms
-     returning                    ... ok          154 ms
-     largeobject                  ... ok          804 ms
-     with                         ... FAILED      607 ms
-     xml                          ... ok          263 ms
-parallel group (7 tests):  partition_join partition_prune reloptions indexing partition_aggregate hash_part partition_info
-     partition_join               ... FAILED (test process exited with exit code 2)       11 ms
-     partition_prune              ... FAILED (test process exited with exit code 2)       10 ms
-     reloptions                   ... FAILED (test process exited with exit code 2)        9 ms
-     hash_part                    ... FAILED (test process exited with exit code 2)       10 ms
-     indexing                     ... FAILED (test process exited with exit code 2)        9 ms
-     partition_aggregate          ... FAILED (test process exited with exit code 2)        9 ms
-     partition_info               ... FAILED (test process exited with exit code 2)       10 ms
-test event_trigger                ... FAILED (test process exited with exit code 2)        4 ms
-test fast_default                 ... FAILED (test process exited with exit code 2)        3 ms
-test stats                        ... FAILED (test process exited with exit code 2)        3 ms
-test outline_hints                ... FAILED (test process exited with exit code 2)        3 ms
+     json                         ... ok          105 ms
+     jsonb                        ... ok          219 ms
+     json_encoding                ... ok           14 ms
+     jsonpath                     ... ok           37 ms
+     jsonpath_encoding            ... ok           17 ms
+     jsonb_jsonpath               ... ok           62 ms
+parallel group (18 tests):  conversion limit prepare plancache returning xml temp polymorphism copy2 sequence with largeobject rangefuncs rowtypes truncate domain plpgsql alter_table
+     plancache                    ... ok          182 ms
+     limit                        ... ok           77 ms
+     plpgsql                      ... ok         1004 ms
+     copy2                        ... ok          399 ms
+     temp                         ... ok          315 ms
+     domain                       ... ok          527 ms
+     rangefuncs                   ... ok          507 ms
+     prepare                      ... ok          124 ms
+     conversion                   ... ok           60 ms
+     truncate                     ... ok          522 ms
+     alter_table                  ... ok         1306 ms
+     sequence                     ... ok          439 ms
+     polymorphism                 ... ok          354 ms
+     rowtypes                     ... ok          521 ms
+     returning                    ... ok          199 ms
+     largeobject                  ... ok          460 ms
+     with                         ... ok          441 ms
+     xml                          ... ok          200 ms
+parallel group (7 tests):  hash_part reloptions partition_info partition_join partition_aggregate indexing partition_prune
+     partition_join               ... ok          359 ms
+     partition_prune              ... ok          746 ms
+     reloptions                   ... ok           71 ms
+     hash_part                    ... ok           46 ms
+     indexing                     ... ok          717 ms
+     partition_aggregate          ... ok          698 ms
+     partition_info               ... ok           78 ms
+test event_trigger                ... ok           86 ms
+test fast_default                 ... ok          115 ms
+test stats                        ... ok          574 ms
+test outline_hints                ... FAILED       68 ms
