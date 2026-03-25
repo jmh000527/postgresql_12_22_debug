@@ -39,6 +39,9 @@
 #include <ctype.h>
 #include <string.h>
 
+/* Forward declarations for helper functions */
+static List *parse_leading_hint_args(const char *args);
+
 /*
  * Parse a hint string and return a HintState structure
  *
@@ -50,6 +53,8 @@
  *   NestLoop(table1 table2)
  *   HashJoin(table1 table2)
  *   MergeJoin(table1 table2)
+ *   Leading(t1 t2 t3)              -- Simple join order
+ *   Leading((t1 t2) t3)            -- Nested join order
  */
 HintState *
 parse_hints(const char *hint_str)
@@ -349,6 +354,22 @@ parse_hints(const char *hint_str)
 			else
 				pfree(hint);
 		}
+		/* Parse Leading hint */
+		else if (pg_strcasecmp(hint_name, "Leading") == 0)
+		{
+			List	   *relnames;
+
+			relnames = parse_leading_hint_args(args);
+			if (relnames != NIL)
+			{
+				hint->type = HINT_TYPE_LEADING;
+				hint->hint.leading.type = HINT_TYPE_LEADING;
+				hint->hint.leading.relnames = relnames;
+				hstate->hints = lappend(hstate->hints, hint);
+			}
+			else
+				pfree(hint);
+		}
 		else
 		{
 			/* Unknown hint, skip it */
@@ -364,6 +385,81 @@ parse_hints(const char *hint_str)
 
 	pfree(str);
 	return hstate;
+}
+
+/*
+ * parse_leading_hint_args - Parse Leading hint arguments
+ *
+ * This function parses the arguments of a Leading hint, which can be:
+ * - Simple: "t1 t2 t3" -> list of table names in order
+ * - Nested: "(t1 t2) t3" -> parentheses indicate join grouping
+ *
+ * The function returns a list of strings representing the join order.
+ * For nested syntax, the parentheses structure is preserved in the list
+ * by using special markers: "(" and ")" as list elements.
+ *
+ * Examples:
+ *   "t1 t2 t3" -> ("t1", "t2", "t3")
+ *   "(t1 t2) t3" -> ("(", "t1", "t2", ")", "t3")
+ *   "((t1 t2) t3) t4" -> ("(", "(", "t1", "t2", ")", "t3", ")", "t4")
+ */
+static List *
+parse_leading_hint_args(const char *args)
+{
+	List	   *relnames = NIL;
+	const char *p = args;
+	char	   *token_start;
+	StringInfoData token;
+
+	if (args == NULL || *args == '\0')
+		return NIL;
+
+	initStringInfo(&token);
+
+	while (*p != '\0')
+	{
+		/* Skip whitespace */
+		while (*p && isspace((unsigned char) *p))
+			p++;
+
+		if (*p == '\0')
+			break;
+
+		/* Handle opening parenthesis */
+		if (*p == '(')
+		{
+			relnames = lappend(relnames, pstrdup("("));
+			p++;
+			continue;
+		}
+
+		/* Handle closing parenthesis */
+		if (*p == ')')
+		{
+			relnames = lappend(relnames, pstrdup(")"));
+			p++;
+			continue;
+		}
+
+		/* Parse a table name token */
+		token_start = (char *) p;
+		resetStringInfo(&token);
+
+		while (*p && !isspace((unsigned char) *p) && *p != '(' && *p != ')')
+		{
+			appendStringInfoChar(&token, *p);
+			p++;
+		}
+
+		if (token.len > 0)
+		{
+			relnames = lappend(relnames, pstrdup(token.data));
+		}
+	}
+
+	pfree(token.data);
+
+	return relnames;
 }
 
 /*
