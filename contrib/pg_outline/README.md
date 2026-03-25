@@ -133,7 +133,12 @@ The extension supports various hint types similar to pg_hint_plan:
 
 ### Join Order Hints
 
-- `Leading(table1 table2 table3)` - Specify join order
+- `Leading(...)` - Specify join order using nested parentheses format to control join tree structure
+  - Simple order: `Leading(t1 t2 t3)` - join left to right
+  - Nested format: `Leading((t1 t2) (t3 t4))` - join t1 and t2 first, then t3 and t4, finally join the results
+  - Complex nested: `Leading(((t1 t2) t3) t4)` - precisely control each step of join order
+
+**Note**: pg_outline automatically generates Leading hints in nested parentheses format to accurately represent the join order in the plan tree. This format is consistent with pg_hint_plan syntax.
 
 ## Outline Data Format
 
@@ -155,11 +160,29 @@ Example:
 /*+
 BEGIN_OUTLINE_DATA
 SeqScan(test_table1)
-HashJoin(test_table1 test_table2)
-Leading(test_table1 test_table2)
+IndexScan(test_table2)
+HashJoin(...)
+Leading((test_table1 test_table2))
 END_OUTLINE_DATA
 */
 ```
+
+For complex multi-table joins:
+
+```sql
+SELECT * FROM t1
+  JOIN t2 ON t1.id = t2.t1_id
+  JOIN t3 ON t2.id = t3.t2_id
+  JOIN t4 ON t3.id = t4.t3_id;
+```
+
+The generated Leading hint might look like:
+
+```
+Leading(((t1 t2) t3) t4)
+```
+
+This indicates: join t1 and t2 first, then join the result with t3, and finally with t4.
 
 ## Catalog Tables
 

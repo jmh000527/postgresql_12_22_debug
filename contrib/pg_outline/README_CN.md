@@ -133,7 +133,12 @@ SELECT pg_outline_drop('my_outline');
 
 ### 连接顺序 Hints
 
-- `Leading(table1 table2 table3)` - 指定连接顺序
+- `Leading(...)` - 指定连接顺序，使用嵌套括号格式控制连接树结构
+  - 简单顺序: `Leading(t1 t2 t3)` - 从左到右连接
+  - 嵌套格式: `Leading((t1 t2) (t3 t4))` - 先连接 t1 和 t2，再连接 t3 和 t4，最后连接两个结果
+  - 复杂嵌套: `Leading(((t1 t2) t3) t4)` - 精确控制每一步的连接顺序
+
+**注意**: pg_outline 自动生成的 Leading hint 采用嵌套括号格式，以准确表示计划树的连接顺序。这种格式与 pg_hint_plan 的语法一致。
 
 ## Outline 数据格式
 
@@ -155,11 +160,29 @@ END_OUTLINE_DATA
 /*+
 BEGIN_OUTLINE_DATA
 SeqScan(test_table1)
-HashJoin(test_table1 test_table2)
-Leading(test_table1 test_table2)
+IndexScan(test_table2)
+HashJoin(...)
+Leading((test_table1 test_table2))
 END_OUTLINE_DATA
 */
 ```
+
+对于复杂的多表连接:
+
+```sql
+SELECT * FROM t1
+  JOIN t2 ON t1.id = t2.t1_id
+  JOIN t3 ON t2.id = t3.t2_id
+  JOIN t4 ON t3.id = t4.t3_id;
+```
+
+生成的 Leading hint 可能类似:
+
+```
+Leading(((t1 t2) t3) t4)
+```
+
+这表示: 先连接 t1 和 t2，然后将结果与 t3 连接，最后与 t4 连接。
 
 ## 系统表
 
