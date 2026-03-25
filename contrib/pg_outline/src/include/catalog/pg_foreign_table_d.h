@@ -1,0 +1,1 @@
+/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/contrib/pg_outline/src/backend/catalog/pg_foreign_table_d.h

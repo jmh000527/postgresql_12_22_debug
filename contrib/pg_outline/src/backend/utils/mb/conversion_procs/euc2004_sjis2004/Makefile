@@ -1,0 +1,1 @@
+/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/backend/utils/mb/conversion_procs/euc2004_sjis2004/Makefile
