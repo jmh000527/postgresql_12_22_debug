@@ -133,6 +133,8 @@ static void extract_hints_from_plan_tree(Plan *plan, List **hints, int level);
 static char *get_scan_method_hint(Plan *plan);
 static char *get_join_method_hint(Plan *plan);
 static char *get_leading_hint(Plan *plan);
+static char *get_leading_hint_from_join(Plan *plan);
+static char *extract_relation_names_from_plan(Plan *plan);
 static char *get_relation_name(Index relid, PlannedStmt *plan);
 static void display_outline_data(void);
 static StringInfo format_outline_data(List *hints);
@@ -377,10 +379,13 @@ extract_hints_from_plan_tree(Plan *plan, List **hints, int level)
 	if (hint_str)
 		*hints = lappend(*hints, hint_str);
 
-	/* Extract leading (join order) hints */
-	hint_str = get_leading_hint(plan);
-	if (hint_str)
-		*hints = lappend(*hints, hint_str);
+	/* Extract leading (join order) hints - only at top level (level 0) */
+	if (level == 0)
+	{
+		hint_str = get_leading_hint(plan);
+		if (hint_str)
+			*hints = lappend(*hints, hint_str);
+	}
 
 	/* Recurse into child plans */
 	if (plan->lefttree)
@@ -483,14 +488,140 @@ get_join_method_hint(Plan *plan)
 }
 
 /*
+ * Extract relation names from a plan tree recursively
+ * Returns a string representation suitable for Leading hint
+ * For join nodes, returns nested format: (left right)
+ * For scan nodes, returns the relation name
+ */
+static char *
+extract_relation_names_from_plan(Plan *plan)
+{
+	StringInfoData result;
+	char	   *left_str;
+	char	   *right_str;
+	char	   *relname;
+
+	if (plan == NULL)
+		return NULL;
+
+	initStringInfo(&result);
+
+	/* Check if this is a join node */
+	switch (nodeTag(plan))
+	{
+		case T_NestLoop:
+		case T_HashJoin:
+		case T_MergeJoin:
+			/* Recursively get relation names from left and right subtrees */
+			left_str = extract_relation_names_from_plan(plan->lefttree);
+			right_str = extract_relation_names_from_plan(plan->righttree);
+
+			if (left_str && right_str)
+			{
+				/* Build nested format: (left right) */
+				appendStringInfo(&result, "(%s %s)", left_str, right_str);
+				pfree(left_str);
+				pfree(right_str);
+				return result.data;
+			}
+			else
+			{
+				/* Cleanup and return NULL if either side is missing */
+				if (left_str)
+					pfree(left_str);
+				if (right_str)
+					pfree(right_str);
+				return NULL;
+			}
+
+		case T_SeqScan:
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+		case T_BitmapHeapScan:
+			/* Extract relation name from scan node */
+			relname = get_relation_name(((Scan *) plan)->scanrelid, current_plannedstmt);
+			if (relname)
+			{
+				/* Use just the base relation name (without AS alias part) */
+				char	   *space_pos = strchr(relname, ' ');
+
+				if (space_pos)
+				{
+					/* Extract just the base name before " AS " */
+					size_t		len = space_pos - relname;
+					char	   *base_name = palloc(len + 1);
+
+					memcpy(base_name, relname, len);
+					base_name[len] = '\0';
+					pfree(relname);
+					return base_name;
+				}
+				return relname;
+			}
+			return NULL;
+
+		default:
+			/* For other node types, try to recurse into child plans */
+			if (plan->lefttree)
+			{
+				left_str = extract_relation_names_from_plan(plan->lefttree);
+				if (left_str)
+					return left_str;
+			}
+			if (plan->righttree)
+			{
+				right_str = extract_relation_names_from_plan(plan->righttree);
+				if (right_str)
+					return right_str;
+			}
+			return NULL;
+	}
+}
+
+/*
+ * Generate Leading hint from a join plan tree
+ * Returns nested parentheses format like: Leading((t1 t2) (t3 t4))
+ */
+static char *
+get_leading_hint_from_join(Plan *plan)
+{
+	StringInfoData hint;
+	char	   *relation_names;
+
+	if (plan == NULL)
+		return NULL;
+
+	/* Only generate Leading hint for join nodes */
+	switch (nodeTag(plan))
+	{
+		case T_NestLoop:
+		case T_HashJoin:
+		case T_MergeJoin:
+			/* Extract nested relation names from the join tree */
+			relation_names = extract_relation_names_from_plan(plan);
+			if (relation_names)
+			{
+				initStringInfo(&hint);
+				appendStringInfo(&hint, "Leading%s", relation_names);
+				pfree(relation_names);
+				return hint.data;
+			}
+			return NULL;
+
+		default:
+			return NULL;
+	}
+}
+
+/*
  * Generate leading (join order) hint for a plan node
  */
 static char *
 get_leading_hint(Plan *plan)
 {
-	/* For now, we'll implement a simplified version */
-	/* A full implementation would track the join order through the tree */
-	return NULL;
+	/* Generate Leading hint only for the top-level join */
+	/* This will be called from extract_hints_from_plan_tree */
+	return get_leading_hint_from_join(plan);
 }
 
 /*
