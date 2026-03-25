@@ -23,6 +23,7 @@
 #include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
 #include "nodes/parsenodes.h"
+#include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/guc.h"
 #include "catalog/pg_class.h"
@@ -542,7 +543,8 @@ parse_leading_hint_tree(List *relnames, int *pos, List **remaining_rels, Planner
 	int			i = *pos;
 
 	/* Iterate through the relnames list from current position */
-	for_each_from(lc, relnames, i)
+	lc = list_nth_cell(relnames, i);
+	for_each_cell(lc, lc)
 	{
 		char	   *token = (char *) lfirst(lc);
 

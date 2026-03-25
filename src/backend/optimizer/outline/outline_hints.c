@@ -408,7 +408,6 @@ parse_leading_hint_args(const char *args)
 {
 	List	   *relnames = NIL;
 	const char *p = args;
-	char	   *token_start;
 	StringInfoData token;
 
 	if (args == NULL || *args == '\0')
@@ -442,7 +441,6 @@ parse_leading_hint_args(const char *args)
 		}
 
 		/* Parse a table name token */
-		token_start = (char *) p;
 		resetStringInfo(&token);
 
 		while (*p && !isspace((unsigned char) *p) && *p != '(' && *p != ')')
