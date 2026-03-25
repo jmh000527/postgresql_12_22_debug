@@ -25,6 +25,7 @@
 #include <math.h>
 
 #include "access/genam.h"
+#include "common/md5.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
@@ -394,8 +395,8 @@ extract_hints_from_plan_tree(Plan *plan, List **hints, int level)
 
 		foreach(lc, plan->initPlan)
 		{
-			SubPlan    *subplan = (SubPlan *) lfirst(lc);
 			/* Note: we'd need access to PlannedStmt to get actual subplan */
+			(void) lc; /* unused in current implementation */
 		}
 	}
 }
@@ -676,23 +677,16 @@ normalize_query(const char *query_string)
 static char *
 compute_query_fingerprint(const char *normalized_query)
 {
-	uint8		hash[MD5_DIGEST_LENGTH];
-	StringInfoData fingerprint;
-	int			i;
+	char		hexsum[33];  /* MD5 hex string: 32 chars + null terminator */
 
 	if (!normalized_query)
 		return NULL;
 
-	/* Compute MD5 hash */
-	if (!pg_md5_hash(normalized_query, strlen(normalized_query), hash))
+	/* Compute MD5 hash - pg_md5_hash outputs hexadecimal string directly */
+	if (!pg_md5_hash(normalized_query, strlen(normalized_query), hexsum))
 		return NULL;
 
-	/* Convert to hex string */
-	initStringInfo(&fingerprint);
-	for (i = 0; i < MD5_DIGEST_LENGTH; i++)
-		appendStringInfo(&fingerprint, "%02x", hash[i]);
-
-	return fingerprint.data;
+	return pstrdup(hexsum);
 }
 
 /*
@@ -783,6 +777,9 @@ typedef struct QueryHintCollector
 	List	   *hints;		/* List of strings: each Query's hints */
 	int			query_index; /* Current Query index */
 } QueryHintCollector;
+
+/* Forward declaration */
+static void collect_query_hints_recursive(Query *query, QueryHintCollector *collector);
 
 /*
  * Context structure for SubLink collector walker
@@ -1027,7 +1024,7 @@ store_outline_with_query_hints(const char *outline_name, const char *query_patte
 
 /*
  * Extract inline hints from query string with position information
- * Looks for /*+ ... */ comments and records both the hint content and its location
+ * Looks for slash-star-plus ... star-slash comments and records both the hint content and its location
  * Returns a list of QueryHintPosition structures
  */
 static List *
@@ -1044,17 +1041,17 @@ extract_inline_hints_with_positions(const char *query_string)
 
 	for (p = query_string; *p; p++)
 	{
-		/* Check for start of hint comment: /*+ */
+		/* Check for start of hint comment: slash-star-plus */
 		if (!in_hint && *p == '/' && *(p + 1) == '*' && *(p + 2) == '+')
 		{
 			in_hint = true;
 			hint_begin_loc = p - query_string;
-			hint_start = p + 3; /* Skip past "/*+" */
-			p += 2;			/* Move past "/*" (the loop will move past '+') */
+			hint_start = p + 3; /* Skip past the opening */
+			p += 2;			/* Move past slash-star (the loop will move past plus) */
 			continue;
 		}
 
-		/* Check for end of comment: */ */
+		/* Check for end of comment: star-slash */
 		if (in_hint && *p == '*' && *(p + 1) == '/')
 		{
 			/* Extract hint content */
@@ -1066,13 +1063,13 @@ extract_inline_hints_with_positions(const char *query_string)
 			hint_text[hint_len] = '\0';
 
 			pos->hint_location = hint_begin_loc;
-			pos->hint_end = (p - query_string) + 2; /* Include "*/" */
+			pos->hint_end = (p - query_string) + 2; /* Include closing */
 			pos->hint_text = hint_text;
 
 			hint_positions = lappend(hint_positions, pos);
 
 			in_hint = false;
-			p++;				/* Skip past the '/' in '*/' */
+			p++;				/* Skip past the slash in star-slash */
 			continue;
 		}
 	}
@@ -1082,7 +1079,7 @@ extract_inline_hints_with_positions(const char *query_string)
 
 /*
  * Strip inline hints from query string
- * Returns a copy of the query with all /*+ ... */ comments removed
+ * Returns a copy of the query with all hint comments removed
  */
 static char *
 strip_hints_from_query(const char *query_string)
@@ -1098,19 +1095,19 @@ strip_hints_from_query(const char *query_string)
 
 	for (p = query_string; *p; p++)
 	{
-		/* Check for start of hint comment: /*+ */
+		/* Check for start of hint comment: slash-star-plus */
 		if (!in_hint && *p == '/' && *(p + 1) == '*' && *(p + 2) == '+')
 		{
 			in_hint = true;
-			p += 2;			/* Skip past "/*" (the loop will move past '+') */
+			p += 2;			/* Skip past slash-star (the loop will move past plus) */
 			continue;
 		}
 
-		/* Check for end of comment: */ */
+		/* Check for end of comment: star-slash */
 		if (in_hint && *p == '*' && *(p + 1) == '/')
 		{
 			in_hint = false;
-			p++;				/* Skip past the '/' in '*/' */
+			p++;				/* Skip past the slash in star-slash */
 			continue;
 		}
 
@@ -1310,7 +1307,7 @@ pg_outline_create(PG_FUNCTION_ARGS)
 
 /*
  * SQL function: create an outline from SQL with inline hints
- * This is the simplified interface that accepts SQL with /*+ ... */ hints
+ * This is the simplified interface that accepts SQL with hint comments
  * The function will:
  * 1. Extract inline hints with their positions from the SQL
  * 2. Parse the query (with hints still in source for location tracking)
@@ -1331,12 +1328,13 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 	char	   *fingerprint;
 	List	   *hint_positions;
 	PlannedStmt *plan;
-	List	   *parsetree_list;
 	Query	   *query;
 	RawStmt	   *raw_stmt;
 	List	   *raw_parsetree_list;
 	List	   *hints = NIL;
-	int			query_count = 0;
+	StringInfoData hint_str;
+	ListCell   *lc;
+	bool		first = true;
 
 	/* Extract hint positions from the query */
 	hint_positions = extract_inline_hints_with_positions(query_str);
@@ -1390,10 +1388,6 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 	}
 
 	/* Format hints for storage */
-	StringInfoData hint_str;
-	ListCell   *lc;
-	bool		first = true;
-
 	initStringInfo(&hint_str);
 	foreach(lc, hints)
 	{
