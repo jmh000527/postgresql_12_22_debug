@@ -1,0 +1,268 @@
+make -C ./src/backend generated-headers
+make[1]: Entering directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/backend'
+make -C catalog distprep generated-header-symlinks
+make[2]: Entering directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/backend/catalog'
+make[2]: Nothing to be done for 'distprep'.
+make[2]: Nothing to be done for 'generated-header-symlinks'.
+make[2]: Leaving directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/backend/catalog'
+make -C utils distprep generated-header-symlinks
+make[2]: Entering directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/backend/utils'
+make[2]: Nothing to be done for 'distprep'.
+make[2]: Nothing to be done for 'generated-header-symlinks'.
+make[2]: Leaving directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/backend/utils'
+make[1]: Leaving directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/backend'
+rm -rf '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug'/tmp_install
+/usr/bin/mkdir -p '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug'/tmp_install/log
+make -C '.' DESTDIR='/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug'/tmp_install install >'/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug'/tmp_install/log/install.log 2>&1
+make -j1 -C src/test/regress checkprep >>'/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug'/tmp_install/log/install.log 2>&1
+make -C src/test/regress check
+make[1]: Entering directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/test/regress'
+make -C ../../../src/port all
+make[2]: Entering directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/port'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/port'
+make -C ../../../src/common all
+make[2]: Entering directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/common'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/common'
+make -C ../../../contrib/spi
+make[2]: Entering directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/contrib/spi'
+make[2]: Nothing to be done for 'all'.
+make[2]: Leaving directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/contrib/spi'
+rm -rf ./testtablespace
+mkdir ./testtablespace
+PATH="/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/tmp_install/usr/local/pgsql/bin:$PATH" LD_LIBRARY_PATH="/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/tmp_install/usr/local/pgsql/lib"  ../../../src/test/regress/pg_regress --temp-instance=./tmp_check --inputdir=. --bindir=     --dlpath=. --max-concurrent-tests=20  --schedule=./parallel_schedule  
+============== creating temporary instance            ==============
+============== initializing database system           ==============
+============== starting postmaster                    ==============
+running on port 54486 with PID 18077
+============== creating database "regression"         ==============
+CREATE DATABASE
+ALTER DATABASE
+============== running regression test queries        ==============
+test tablespace                   ... ok          256 ms
+parallel group (20 tests):  varchar txid oid name char pg_lsn int4 regproc int2 uuid money boolean text int8 float4 float8 bit numeric rangetypes enum
+     boolean                      ... ok          139 ms
+     char                         ... ok           73 ms
+     name                         ... ok           67 ms
+     varchar                      ... ok           49 ms
+     text                         ... ok          139 ms
+     int2                         ... ok          125 ms
+     int4                         ... ok          112 ms
+     int8                         ... ok          144 ms
+     oid                          ... ok           56 ms
+     float4                       ... ok          147 ms
+     float8                       ... ok          160 ms
+     bit                          ... ok          172 ms
+     numeric                      ... ok          502 ms
+     txid                         ... ok           41 ms
+     uuid                         ... ok          121 ms
+     enum                         ... FAILED (test process exited with exit code 2)      752 ms
+     money                        ... ok          130 ms
+     rangetypes                   ... ok          647 ms
+     pg_lsn                       ... ok           86 ms
+     regproc                      ... ok          109 ms
+parallel group (19 tests):  strings line box path polygon circle point numerology lseg date timestamptz time interval tstypes inet timestamp timetz macaddr8 macaddr
+     strings                      ... FAILED (test process exited with exit code 2)       15 ms
+     numerology                   ... FAILED (test process exited with exit code 2)       21 ms
+     point                        ... FAILED (test process exited with exit code 2)       21 ms
+     lseg                         ... FAILED (test process exited with exit code 2)       23 ms
+     line                         ... FAILED (test process exited with exit code 2)       14 ms
+     box                          ... FAILED (test process exited with exit code 2)       14 ms
+     path                         ... FAILED (test process exited with exit code 2)       15 ms
+     polygon                      ... FAILED (test process exited with exit code 2)       19 ms
+     circle                       ... FAILED (test process exited with exit code 2)       20 ms
+     date                         ... FAILED (test process exited with exit code 2)       12 ms
+     time                         ... FAILED (test process exited with exit code 2)       17 ms
+     timetz                       ... FAILED (test process exited with exit code 2)       18 ms
+     timestamp                    ... FAILED (test process exited with exit code 2)       18 ms
+     timestamptz                  ... FAILED (test process exited with exit code 2)       13 ms
+     interval                     ... FAILED (test process exited with exit code 2)       15 ms
+     inet                         ... FAILED (test process exited with exit code 2)       15 ms
+     macaddr                      ... FAILED (test process exited with exit code 2)       17 ms
+     macaddr8                     ... FAILED (test process exited with exit code 2)       16 ms
+     tstypes                      ... FAILED (test process exited with exit code 2)       14 ms
+parallel group (10 tests):  comments geometry expressions misc_sanity horology type_sanity oidjoins database regex opr_sanity
+     geometry                     ... FAILED       40 ms
+     horology                     ... FAILED      228 ms
+     regex                        ... ok          503 ms
+     oidjoins                     ... ok          286 ms
+     type_sanity                  ... FAILED      258 ms
+     opr_sanity                   ... FAILED      616 ms
+     misc_sanity                  ... ok          140 ms
+     comments                     ... ok           36 ms
+     expressions                  ... ok          125 ms
+     database                     ... ok          335 ms
+test create_function_1            ... ok           12 ms
+test create_type                  ... ok           21 ms
+test create_table                 ... ok          446 ms
+test create_function_2            ... ok           11 ms
+parallel group (5 tests):  copyselect copydml insert insert_conflict copy
+     copy                         ... FAILED (test process exited with exit code 2)      927 ms
+     copyselect                   ... ok           34 ms
+     copydml                      ... ok           51 ms
+     insert                       ... ok          517 ms
+     insert_conflict              ... FAILED (test process exited with exit code 2)      785 ms
+parallel group (4 tests):  create_procedure create_misc create_operator create_schema
+     create_misc                  ... FAILED (test process exited with exit code 2)       28 ms
+     create_operator              ... FAILED (test process exited with exit code 2)       28 ms
+     create_procedure             ... FAILED (test process exited with exit code 2)       26 ms
+     create_schema                ... FAILED (test process exited with exit code 2)       27 ms
+parallel group (5 tests):  create_index create_view index_including create_index_spgist index_including_gist
+     create_index                 ... FAILED (test process exited with exit code 2)        4 ms
+     create_index_spgist          ... FAILED (test process exited with exit code 2)        8 ms
+     create_view                  ... FAILED (test process exited with exit code 2)        7 ms
+     index_including              ... FAILED (test process exited with exit code 2)        8 ms
+     index_including_gist         ... FAILED (test process exited with exit code 2)        9 ms
+parallel group (16 tests):  create_aggregate triggers create_cast inherit create_function_3 select typed_table constraints vacuum errors infinite_recurse drop_if_exists create_am roleattributes updatable_views hash_func
+     create_aggregate             ... FAILED (test process exited with exit code 2)       18 ms
+     create_function_3            ... FAILED (test process exited with exit code 2)       20 ms
+     create_cast                  ... FAILED (test process exited with exit code 2)       18 ms
+     constraints                  ... FAILED (test process exited with exit code 2)       23 ms
+     triggers                     ... FAILED (test process exited with exit code 2)       17 ms
+     select                       ... FAILED (test process exited with exit code 2)       19 ms
+     inherit                      ... FAILED (test process exited with exit code 2)       17 ms
+     typed_table                  ... FAILED (test process exited with exit code 2)       20 ms
+     vacuum                       ... FAILED (test process exited with exit code 2)       22 ms
+     drop_if_exists               ... FAILED (test process exited with exit code 2)       22 ms
+     updatable_views              ... FAILED (test process exited with exit code 2)       24 ms
+     roleattributes               ... FAILED (test process exited with exit code 2)       21 ms
+     create_am                    ... FAILED (test process exited with exit code 2)       20 ms
+     hash_func                    ... FAILED (test process exited with exit code 2)       21 ms
+     errors                       ... FAILED (test process exited with exit code 2)       18 ms
+     infinite_recurse             ... FAILED (test process exited with exit code 2)       18 ms
+test sanity_check                 ... FAILED (test process exited with exit code 2)        3 ms
+parallel group (20 tests):  select_into select_distinct select_distinct_on case subselect union select_having aggregates select_implicit transactions namespace btree_index hash_index update portals random arrays delete prepared_xacts join
+     select_into                  ... FAILED (test process exited with exit code 2)       14 ms
+     select_distinct              ... FAILED (test process exited with exit code 2)       24 ms
+     select_distinct_on           ... FAILED (test process exited with exit code 2)       24 ms
+     select_implicit              ... FAILED (test process exited with exit code 2)       23 ms
+     select_having                ... FAILED (test process exited with exit code 2)       23 ms
+     subselect                    ... FAILED (test process exited with exit code 2)       20 ms
+     union                        ... FAILED (test process exited with exit code 2)       21 ms
+     case                         ... FAILED (test process exited with exit code 2)       19 ms
+     join                         ... FAILED (test process exited with exit code 2)       29 ms
+     aggregates                   ... FAILED (test process exited with exit code 2)       16 ms
+     transactions                 ... FAILED (test process exited with exit code 2)       18 ms
+     random                       ... failed (ignored) (test process exited with exit code 2)       22 ms
+     portals                      ... FAILED (test process exited with exit code 2)       20 ms
+     arrays                       ... FAILED (test process exited with exit code 2)       22 ms
+     btree_index                  ... FAILED (test process exited with exit code 2)       18 ms
+     hash_index                   ... FAILED (test process exited with exit code 2)       19 ms
+     update                       ... FAILED (test process exited with exit code 2)       19 ms
+     delete                       ... FAILED (test process exited with exit code 2)       21 ms
+     namespace                    ... FAILED (test process exited with exit code 2)       16 ms
+     prepared_xacts               ... FAILED (test process exited with exit code 2)       20 ms
+parallel group (20 tests):  drop_operator init_privs security_label tablesample object_address groupingsets collate replica_identity password identity gist privileges lock brin join_hash spgist gin matview rowsecurity generated
+     brin                         ... FAILED (test process exited with exit code 2)     1550 ms
+     gin                          ... FAILED (test process exited with exit code 2)     1553 ms
+     gist                         ... FAILED (test process exited with exit code 2)     1547 ms
+     spgist                       ... FAILED (test process exited with exit code 2)     1551 ms
+     privileges                   ... FAILED (test process exited with exit code 2)     1547 ms
+     init_privs                   ... ok          128 ms
+     security_label               ... ok          135 ms
+     collate                      ... ok          765 ms
+     matview                      ... FAILED (test process exited with exit code 2)     1552 ms
+     lock                         ... FAILED (test process exited with exit code 2)     1547 ms
+     replica_identity             ... ok          858 ms
+     rowsecurity                  ... FAILED (test process exited with exit code 2)     1549 ms
+     object_address               ... ok          448 ms
+     tablesample                  ... ok          356 ms
+     groupingsets                 ... FAILED      506 ms
+     drop_operator                ... ok           98 ms
+     password                     ... ok          974 ms
+     identity                     ... ok         1021 ms
+     generated                    ... FAILED (test process exited with exit code 2)     1547 ms
+     join_hash                    ... FAILED (test process exited with exit code 2)     1543 ms
+parallel group (11 tests):  create_table_like alter_operator misc async misc_functions tsrf dbsize tid alter_generic sysviews tidscan
+     create_table_like            ... FAILED (test process exited with exit code 2)       21 ms
+     alter_generic                ... FAILED (test process exited with exit code 2)       23 ms
+     alter_operator               ... FAILED (test process exited with exit code 2)       19 ms
+     misc                         ... FAILED (test process exited with exit code 2)       18 ms
+     async                        ... FAILED (test process exited with exit code 2)       17 ms
+     dbsize                       ... FAILED (test process exited with exit code 2)       21 ms
+     misc_functions               ... FAILED (test process exited with exit code 2)       17 ms
+     sysviews                     ... FAILED (test process exited with exit code 2)       21 ms
+     tsrf                         ... FAILED (test process exited with exit code 2)       17 ms
+     tid                          ... FAILED (test process exited with exit code 2)       11 ms
+     tidscan                      ... FAILED (test process exited with exit code 2)       12 ms
+parallel group (5 tests):  rules psql psql_crosstab amutils stats_ext
+     rules                        ... FAILED (test process exited with exit code 2)       10 ms
+     psql                         ... FAILED (test process exited with exit code 2)       10 ms
+     psql_crosstab                ... FAILED (test process exited with exit code 2)       11 ms
+     amutils                      ... FAILED (test process exited with exit code 2)       12 ms
+     stats_ext                    ... FAILED (test process exited with exit code 2)       12 ms
+test select_parallel              ... FAILED (test process exited with exit code 2)        3 ms
+test write_parallel               ... FAILED (test process exited with exit code 2)        4 ms
+parallel group (2 tests):  subscription publication
+     publication                  ... FAILED (test process exited with exit code 2)        8 ms
+     subscription                 ... FAILED (test process exited with exit code 2)        7 ms
+parallel group (17 tests):  cluster guc select_views bitmapops foreign_key dependency combocid tsearch tsdicts foreign_data portals_p2 window xmlmap functional_deps advisory_lock indirect_toast equivclass
+     select_views                 ... FAILED (test process exited with exit code 2)       17 ms
+     portals_p2                   ... FAILED (test process exited with exit code 2)       28 ms
+     foreign_key                  ... FAILED (test process exited with exit code 2)       19 ms
+     cluster                      ... FAILED (test process exited with exit code 2)       16 ms
+     dependency                   ... FAILED (test process exited with exit code 2)       18 ms
+     guc                          ... FAILED (test process exited with exit code 2)       16 ms
+     bitmapops                    ... FAILED (test process exited with exit code 2)       16 ms
+     combocid                     ... FAILED (test process exited with exit code 2)       18 ms
+     tsearch                      ... FAILED (test process exited with exit code 2)       17 ms
+     tsdicts                      ... FAILED (test process exited with exit code 2)       18 ms
+     foreign_data                 ... FAILED (test process exited with exit code 2)       16 ms
+     window                       ... FAILED (test process exited with exit code 2)       20 ms
+     xmlmap                       ... FAILED (test process exited with exit code 2)       20 ms
+     functional_deps              ... FAILED (test process exited with exit code 2)       20 ms
+     advisory_lock                ... FAILED (test process exited with exit code 2)       20 ms
+     indirect_toast               ... FAILED (test process exited with exit code 2)       19 ms
+     equivclass                   ... FAILED (test process exited with exit code 2)       19 ms
+parallel group (6 tests):  json jsonb jsonb_jsonpath json_encoding jsonpath jsonpath_encoding
+     json                         ... FAILED (test process exited with exit code 2)        7 ms
+     jsonb                        ... FAILED (test process exited with exit code 2)        7 ms
+     json_encoding                ... FAILED (test process exited with exit code 2)        8 ms
+     jsonpath                     ... FAILED (test process exited with exit code 2)        8 ms
+     jsonpath_encoding            ... FAILED (test process exited with exit code 2)        8 ms
+     jsonb_jsonpath               ... FAILED (test process exited with exit code 2)        6 ms
+parallel group (18 tests):  plancache limit plpgsql copy2 rangefuncs domain prepare conversion truncate alter_table polymorphism temp sequence rowtypes returning largeobject with xml
+     plancache                    ... FAILED (test process exited with exit code 2)       14 ms
+     limit                        ... FAILED (test process exited with exit code 2)       14 ms
+     plpgsql                      ... FAILED (test process exited with exit code 2)       14 ms
+     copy2                        ... FAILED (test process exited with exit code 2)       13 ms
+     temp                         ... FAILED (test process exited with exit code 2)       20 ms
+     domain                       ... FAILED (test process exited with exit code 2)       18 ms
+     rangefuncs                   ... FAILED (test process exited with exit code 2)       13 ms
+     prepare                      ... FAILED (test process exited with exit code 2)       18 ms
+     conversion                   ... FAILED (test process exited with exit code 2)       18 ms
+     truncate                     ... FAILED (test process exited with exit code 2)       17 ms
+     alter_table                  ... FAILED (test process exited with exit code 2)       17 ms
+     sequence                     ... FAILED (test process exited with exit code 2)       18 ms
+     polymorphism                 ... FAILED (test process exited with exit code 2)       17 ms
+     rowtypes                     ... FAILED (test process exited with exit code 2)       10 ms
+     returning                    ... FAILED (test process exited with exit code 2)       10 ms
+     largeobject                  ... FAILED (test process exited with exit code 2)        8 ms
+     with                         ... FAILED (test process exited with exit code 2)        8 ms
+     xml                          ... FAILED (test process exited with exit code 2)        8 ms
+parallel group (7 tests):  partition_prune reloptions partition_join partition_aggregate indexing hash_part partition_info
+     partition_join               ... FAILED (test process exited with exit code 2)        9 ms
+     partition_prune              ... FAILED (test process exited with exit code 2)        8 ms
+     reloptions                   ... FAILED (test process exited with exit code 2)        8 ms
+     hash_part                    ... FAILED (test process exited with exit code 2)        9 ms
+     indexing                     ... FAILED (test process exited with exit code 2)        9 ms
+     partition_aggregate          ... FAILED (test process exited with exit code 2)        8 ms
+     partition_info               ... FAILED (test process exited with exit code 2)        9 ms
+test event_trigger                ... FAILED (test process exited with exit code 2)        3 ms
+test fast_default                 ... FAILED (test process exited with exit code 2)        3 ms
+test stats                        ... FAILED (test process exited with exit code 2)        3 ms
+test outline_hints                ... FAILED (test process exited with exit code 2)        3 ms
+============== shutting down postmaster               ==============
+
+=======================================================
+ 155 of 197 tests failed, 1 of these failures ignored. 
+=======================================================
+
+The differences that caused some tests to fail can be viewed in the
+file "/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/test/regress/regression.diffs".  A copy of the test summary that you see
+above is saved in the file "/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/test/regress/regression.out".
+
+make[1]: *** [GNUmakefile:132: check] Error 1
+make[1]: Leaving directory '/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/test/regress'
+make: *** [GNUmakefile:79: check] Error 2

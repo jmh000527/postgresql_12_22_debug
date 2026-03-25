@@ -4152,9 +4152,11 @@ PostgresMain(int argc, char *argv[],
 
 	/*
 	 * Register outline system hooks
+	 * TEMPORARILY DISABLED: These hooks are causing catalog cache access issues
+	 * during error recovery and transaction rollback.
 	 */
-	set_rel_pathlist_hook = outline_set_rel_pathlist;
-	set_join_pathlist_hook = outline_set_join_pathlist;
+	/* set_rel_pathlist_hook = outline_set_rel_pathlist; */
+	/* set_join_pathlist_hook = outline_set_join_pathlist; */
 	outline_hints_init();
 
 	/*

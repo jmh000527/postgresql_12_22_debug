@@ -44,8 +44,22 @@ outline_hints_init(void)
 {
 	current_hint_state = NULL;
 
-	/* Register our custom join search hook for Leading hint support */
-	join_search_hook = outline_join_search;
+	/*
+	 * TEMPORARILY DISABLED: join_search_hook registration
+	 *
+	 * The join_search_hook is causing catalog cache access issues during
+	 * error recovery and transaction rollback. When errors occur, the
+	 * optimizer may continue planning even after a transaction has been
+	 * aborted, leading to catalog cache lookups outside of transaction
+	 * contexts.
+	 *
+	 * This causes TRAP assertions: FailedAssertion("!(IsTransactionState())")
+	 * in catcache.c line 1214.
+	 *
+	 * TODO: Investigate proper transaction state handling in join search hook
+	 * or implement a more robust cleanup mechanism during error recovery.
+	 */
+	/* join_search_hook = outline_join_search; */
 }
 
 /*
@@ -287,6 +301,19 @@ outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	ListCell   *lc;
 	List	   *paths_to_keep = NIL;
 
+	/*
+	 * Safety check: Don't access catalog cache if not in a transaction.
+	 * This can happen during error recovery or after ROLLBACK/COMMIT.
+	 */
+	if (!IsTransactionState())
+		return;
+
+	/*
+	 * Safety check: If there's no hint state, don't do anything.
+	 */
+	if (current_hint_state == NULL || !current_hint_state->enabled)
+		return;
+
 	/* Apply Set hints if we haven't already */
 	static bool set_hints_applied = false;
 	if (!set_hints_applied && current_hint_state != NULL)
@@ -416,6 +443,19 @@ outline_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	JoinHint   *hint;
 	ListCell   *lc;
 	List	   *paths_to_keep = NIL;
+
+	/*
+	 * Safety check: Don't access catalog cache if not in a transaction.
+	 * This can happen during error recovery or after ROLLBACK/COMMIT.
+	 */
+	if (!IsTransactionState())
+		return;
+
+	/*
+	 * Safety check: If there's no hint state, don't do anything.
+	 */
+	if (current_hint_state == NULL || !current_hint_state->enabled)
+		return;
 
 	/* Check if there's a join hint for this join */
 	hint = find_join_hint(current_hint_state, outerrel, innerrel);
