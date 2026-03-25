@@ -207,6 +207,30 @@ find_parallel_hint(HintState *hstate, Index relid, RangeTblEntry *rte)
 }
 
 /*
+ * Check if a Leading hint applies to this query
+ */
+static LeadingHint *
+find_leading_hint(HintState *hstate)
+{
+	ListCell   *lc;
+
+	if (hstate == NULL || !hstate->enabled)
+		return NULL;
+
+	foreach(lc, hstate->hints)
+	{
+		Hint	   *hint = (Hint *) lfirst(lc);
+
+		if (hint->type == HINT_TYPE_LEADING)
+		{
+			return &hint->hint.leading;
+		}
+	}
+
+	return NULL;
+}
+
+/*
  * Apply Set hints (GUC parameter overrides)
  */
 static void
@@ -431,3 +455,64 @@ outline_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 			break;
 	}
 }
+
+/*
+ * Leading Hint Implementation Notes
+ * ==================================
+ *
+ * The Leading hint is designed to control join order, which is one of the most
+ * complex aspects of query optimization. Full implementation requires deep
+ * integration with PostgreSQL's join enumeration algorithm.
+ *
+ * Current Status:
+ * ---------------
+ * - Parsing: IMPLEMENTED (see outline_hints.c:parse_leading_hint_args)
+ *   The parser correctly handles both simple and nested Leading hint syntax:
+ *   - Simple: Leading(t1 t2 t3) - tables joined left-to-right
+ *   - Nested: Leading((t1 t2) t3) - explicit join tree structure
+ *
+ * - Application: PARTIAL - Foundation in place
+ *   The find_leading_hint() function exists to locate Leading hints in the
+ *   hint state, but the join order enforcement is not yet implemented.
+ *
+ * Implementation Approach:
+ * ------------------------
+ * To fully implement Leading hints, the following approach is recommended:
+ *
+ * 1. Implement join_search_hook:
+ *    - Register a custom join_search_hook in outline_hints_init()
+ *    - This hook replaces standard_join_search() when a Leading hint is active
+ *    - The hook should call a custom join search function that respects the
+ *      specified join order
+ *
+ * 2. Build Custom Join Tree:
+ *    - Parse the Leading hint's relnames list to build a join tree structure
+ *    - Handle parentheses markers ("(" and ")") to understand nesting
+ *    - Create RelOptInfo structures for joins in the specified order
+ *    - For simple syntax (no parens), join left-to-right
+ *    - For nested syntax, respect the join tree structure
+ *
+ * 3. Interact with Planner:
+ *    - Use make_join_rel() to create join relations
+ *    - Ensure that only the hinted join order is considered
+ *    - Still allow the join method hints (NestLoop, HashJoin, etc.) to apply
+ *    - Handle cases where the hinted order may not be feasible
+ *
+ * 4. Handle Edge Cases:
+ *    - What if a table in the hint doesn't exist in the query?
+ *    - What if the query has more tables than specified in the hint?
+ *    - What about subqueries and CTEs?
+ *    - How to handle outer joins where order matters semantically?
+ *
+ * References:
+ * -----------
+ * - pg_hint_plan extension: See how it implements Leading hints
+ * - PostgreSQL src/backend/optimizer/path/joinrels.c: Join enumeration logic
+ * - PostgreSQL src/backend/optimizer/path/allpaths.c: standard_join_search()
+ * - PostgreSQL src/include/optimizer/paths.h: join_search_hook definition
+ *
+ * The current implementation provides the parsing and data structures needed
+ * for Leading hints. The actual join order control logic remains to be
+ * implemented by future developers or in collaboration with domain experts
+ * in PostgreSQL's query optimizer internals.
+ */
