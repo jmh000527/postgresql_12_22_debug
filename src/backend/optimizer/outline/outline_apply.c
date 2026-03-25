@@ -24,6 +24,7 @@
 #include "nodes/pg_list.h"
 #include "nodes/parsenodes.h"
 #include "parser/parsetree.h"
+#include "access/xact.h"
 #include "utils/lsyscache.h"
 #include "utils/guc.h"
 #include "catalog/pg_class.h"
@@ -93,7 +94,8 @@ find_scan_hint(HintState *hstate, Index relid, RangeTblEntry *rte)
 	if (rte->rtekind != RTE_RELATION)
 		return NULL;
 
-	relname = get_rel_name(rte->relid);
+	/* Use eref->aliasname to avoid catalog lookup */
+	relname = rte->eref->aliasname;
 	if (relname == NULL)
 		return NULL;
 
@@ -168,7 +170,8 @@ find_rows_hint(HintState *hstate, RelOptInfo *rel, PlannerInfo *root)
 
 				if (rte && rte->rtekind == RTE_RELATION)
 				{
-					char *actual_relname = get_rel_name(rte->relid);
+					/* Use eref->aliasname to avoid catalog lookup */
+					char *actual_relname = rte->eref->aliasname;
 					if (actual_relname && pg_strcasecmp(relname, actual_relname) == 0)
 						return rows_hint;
 				}
@@ -196,7 +199,8 @@ find_parallel_hint(HintState *hstate, Index relid, RangeTblEntry *rte)
 	if (rte->rtekind != RTE_RELATION)
 		return NULL;
 
-	relname = get_rel_name(rte->relid);
+	/* Use eref->aliasname to avoid catalog lookup */
+	relname = rte->eref->aliasname;
 	if (relname == NULL)
 		return NULL;
 
@@ -488,7 +492,8 @@ find_rel_by_relname(List *initial_rels, const char *relname, PlannerInfo *root)
 		if (rte->rtekind != RTE_RELATION)
 			continue;
 
-		rel_relname = get_rel_name(rte->relid);
+		/* Use eref->aliasname to avoid catalog lookup */
+		rel_relname = rte->eref->aliasname;
 		if (rel_relname && pg_strcasecmp(rel_relname, relname) == 0)
 			return rel;
 	}
@@ -759,6 +764,20 @@ outline_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	RelOptInfo *result_rel;
 	bool		has_nested_structure = false;
 	ListCell   *lc;
+
+	/*
+	 * Safety check: Don't access catalog cache if not in a transaction.
+	 * This can happen during error recovery or after ROLLBACK/COMMIT.
+	 */
+	if (!IsTransactionState())
+		return standard_join_search(root, levels_needed, initial_rels);
+
+	/*
+	 * Safety check: If there's no hint state, don't do anything.
+	 * This prevents issues during cleanup or error recovery.
+	 */
+	if (current_hint_state == NULL || !current_hint_state->enabled)
+		return standard_join_search(root, levels_needed, initial_rels);
 
 	/* Check if we have a Leading hint */
 	leading_hint = find_leading_hint(current_hint_state);
