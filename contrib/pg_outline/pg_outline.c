@@ -785,6 +785,75 @@ typedef struct QueryHintCollector
 } QueryHintCollector;
 
 /*
+ * Context structure for SubLink collector walker
+ */
+typedef struct SubLinkCollectorContext
+{
+	QueryHintCollector *collector;
+} SubLinkCollectorContext;
+
+/*
+ * Walker function to collect hints from SubLink nodes in expressions
+ */
+static bool
+collect_hints_sublink_walker(Node *node, SubLinkCollectorContext *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink    *sublink = (SubLink *) node;
+
+		/* If the subselect is a Query, process it recursively */
+		if (IsA(sublink->subselect, Query))
+		{
+			Query	   *subquery = (Query *) sublink->subselect;
+
+			collect_query_hints_recursive(subquery, context->collector);
+		}
+
+		/* Continue walking the testexpr and other parts of the SubLink */
+		return false;
+	}
+
+	/* For Query nodes, don't recurse here - they're handled separately */
+	if (IsA(node, Query))
+		return false;
+
+	/* Continue walking the expression tree */
+	return expression_tree_walker(node, collect_hints_sublink_walker, (void *) context);
+}
+
+/*
+ * Process SubLinks in a Query's expression trees during hint collection
+ */
+static void
+process_query_sublinks_collection(Query *query, QueryHintCollector *collector)
+{
+	SubLinkCollectorContext context;
+
+	if (!query)
+		return;
+
+	context.collector = collector;
+
+	/* Walk targetList (SELECT clause) */
+	collect_hints_sublink_walker((Node *) query->targetList, &context);
+
+	/* Walk jointree quals (WHERE clause) */
+	if (query->jointree)
+		collect_hints_sublink_walker((Node *) query->jointree->quals, &context);
+
+	/* Walk havingQual (HAVING clause) */
+	collect_hints_sublink_walker(query->havingQual, &context);
+
+	/* Walk other expression fields that might contain SubLinks */
+	collect_hints_sublink_walker(query->limitOffset, &context);
+	collect_hints_sublink_walker(query->limitCount, &context);
+}
+
+/*
  * Recursively collect hints from Query tree
  * Assigns an index to each Query in depth-first order
  */
@@ -830,6 +899,9 @@ collect_query_hints_recursive(Query *query, QueryHintCollector *collector)
 			collect_query_hints_recursive(ctequery, collector);
 		}
 	}
+
+	/* Process SubLinks in expressions (WHERE, SELECT, HAVING, etc.) */
+	process_query_sublinks_collection(query, collector);
 }
 
 /*
@@ -1082,6 +1154,79 @@ find_hint_for_query_location(List *hint_positions, int stmt_location)
 }
 
 /*
+ * Context structure for SubLink walker
+ */
+typedef struct SubLinkWalkerContext
+{
+	List	   *hint_positions;
+	const char *source_text;
+} SubLinkWalkerContext;
+
+/*
+ * Walker function to process SubLink nodes in expressions
+ * This is called by expression_tree_walker for each node in the expression tree
+ */
+static bool
+assign_hints_sublink_walker(Node *node, SubLinkWalkerContext *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink    *sublink = (SubLink *) node;
+
+		/* If the subselect is a Query, process it recursively */
+		if (IsA(sublink->subselect, Query))
+		{
+			Query	   *subquery = (Query *) sublink->subselect;
+
+			assign_hints_to_queries(subquery, context->hint_positions, context->source_text);
+		}
+
+		/* Continue walking the testexpr and other parts of the SubLink */
+		return false;
+	}
+
+	/* For Query nodes, don't recurse here - they're handled separately */
+	if (IsA(node, Query))
+		return false;
+
+	/* Continue walking the expression tree */
+	return expression_tree_walker(node, assign_hints_sublink_walker, (void *) context);
+}
+
+/*
+ * Process SubLinks in a Query's expression trees
+ * This walks all expressions in the Query looking for SubLink nodes
+ */
+static void
+process_query_sublinks(Query *query, List *hint_positions, const char *source_text)
+{
+	SubLinkWalkerContext context;
+
+	if (!query)
+		return;
+
+	context.hint_positions = hint_positions;
+	context.source_text = source_text;
+
+	/* Walk targetList (SELECT clause) */
+	assign_hints_sublink_walker((Node *) query->targetList, &context);
+
+	/* Walk jointree quals (WHERE clause) */
+	if (query->jointree)
+		assign_hints_sublink_walker((Node *) query->jointree->quals, &context);
+
+	/* Walk havingQual (HAVING clause) */
+	assign_hints_sublink_walker(query->havingQual, &context);
+
+	/* Walk other expression fields that might contain SubLinks */
+	assign_hints_sublink_walker(query->limitOffset, &context);
+	assign_hints_sublink_walker(query->limitCount, &context);
+}
+
+/*
  * Recursively assign hints to Query structures based on their location
  * This walks the Query tree and associates each Query with its corresponding hint
  */
@@ -1125,6 +1270,9 @@ assign_hints_to_queries(Query *query, List *hint_positions, const char *source_t
 			assign_hints_to_queries(ctequery, hint_positions, source_text);
 		}
 	}
+
+	/* Process SubLinks in expressions (WHERE, SELECT, HAVING, etc.) */
+	process_query_sublinks(query, hint_positions, source_text);
 }
 
 /*
