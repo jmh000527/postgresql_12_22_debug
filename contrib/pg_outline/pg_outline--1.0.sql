@@ -20,6 +20,20 @@ CREATE INDEX IF NOT EXISTS pg_outline_name_idx ON pg_outline_data(outline_name);
 -- Create index on enabled status
 CREATE INDEX IF NOT EXISTS pg_outline_enabled_idx ON pg_outline_data(enabled) WHERE enabled = true;
 
+-- Create table to store per-Query hints
+-- Each outline can have multiple Query structures, each with its own hints
+CREATE TABLE IF NOT EXISTS pg_outline_query_hints (
+    hint_id SERIAL PRIMARY KEY,
+    outline_id INTEGER NOT NULL REFERENCES pg_outline_data(outline_id) ON DELETE CASCADE,
+    query_index INTEGER NOT NULL,  -- Index of Query in the parse tree (0=top-level)
+    hint_string TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(outline_id, query_index)
+);
+
+-- Create index for faster lookups
+CREATE INDEX IF NOT EXISTS pg_outline_query_hints_outline_idx ON pg_outline_query_hints(outline_id);
+
 -- Function to create an outline
 CREATE OR REPLACE FUNCTION pg_outline_create(
     outline_name TEXT,

@@ -143,6 +143,8 @@ static char *compute_query_fingerprint(const char *normalized_query);
 /* Hint storage and retrieval */
 static void store_outline_hints(const char *outline_name, const char *query_pattern,
 								const char *fingerprint, const char *hints);
+static void store_outline_with_query_hints(const char *outline_name, const char *query_pattern,
+										   const char *fingerprint, Query *query);
 static char *retrieve_outline_hints(const char *fingerprint);
 
 /* Inline hint extraction */
@@ -774,6 +776,184 @@ retrieve_outline_hints(const char *fingerprint)
 }
 
 /*
+ * Helper structure to collect hints from Query tree
+ */
+typedef struct QueryHintCollector
+{
+	List	   *hints;		/* List of strings: each Query's hints */
+	int			query_index; /* Current Query index */
+} QueryHintCollector;
+
+/*
+ * Recursively collect hints from Query tree
+ * Assigns an index to each Query in depth-first order
+ */
+static void
+collect_query_hints_recursive(Query *query, QueryHintCollector *collector)
+{
+	ListCell   *lc;
+
+	if (!query)
+		return;
+
+	/* Store this Query's hint with its index */
+	if (query->query_hints)
+	{
+		char	   *indexed_hint = psprintf("%d:%s", collector->query_index, query->query_hints);
+
+		collector->hints = lappend(collector->hints, indexed_hint);
+		elog(DEBUG1, "Collected hint for Query #%d: %s", collector->query_index, query->query_hints);
+	}
+
+	collector->query_index++;
+
+	/* Process subqueries in RTEs */
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery)
+		{
+			collect_query_hints_recursive(rte->subquery, collector);
+		}
+	}
+
+	/* Process CTEs */
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+		if (cte->ctequery)
+		{
+			Query	   *ctequery = castNode(Query, cte->ctequery);
+
+			collect_query_hints_recursive(ctequery, collector);
+		}
+	}
+}
+
+/*
+ * Store outline with per-Query hints
+ * This function stores hints separately for each Query in the Query tree
+ */
+static void
+store_outline_with_query_hints(const char *outline_name, const char *query_pattern,
+							   const char *fingerprint, Query *query)
+{
+	int			ret;
+	StringInfoData sql;
+	QueryHintCollector collector;
+	ListCell   *lc;
+	int			outline_id;
+
+	/* Initialize collector */
+	collector.hints = NIL;
+	collector.query_index = 0;
+
+	/* Collect all hints from the Query tree */
+	collect_query_hints_recursive(query, &collector);
+
+	if (list_length(collector.hints) == 0)
+	{
+		elog(WARNING, "pg_outline: no hints found in Query tree");
+		return;
+	}
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "pg_outline: SPI_connect failed");
+		return;
+	}
+
+	/* First, insert/update the outline record */
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "INSERT INTO pg_outline_data (outline_name, query_pattern, hint_string, enabled) "
+					 "VALUES (%s, %s, '', true) "
+					 "ON CONFLICT (outline_name) DO UPDATE SET "
+					 "query_pattern = EXCLUDED.query_pattern, "
+					 "updated_at = CURRENT_TIMESTAMP "
+					 "RETURNING outline_id",
+					 quote_literal_cstr(outline_name),
+					 quote_literal_cstr(query_pattern));
+
+	ret = SPI_execute(sql.data, false, 0);
+
+	if (ret != SPI_OK_INSERT_RETURNING && ret != SPI_OK_UPDATE_RETURNING)
+	{
+		elog(ERROR, "pg_outline: failed to store outline");
+		SPI_finish();
+		return;
+	}
+
+	/* Get the outline_id */
+	if (SPI_processed > 0)
+	{
+		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+		HeapTuple	tuple = SPI_tuptable->vals[0];
+		bool		isnull;
+		Datum		id_datum;
+
+		id_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+		if (isnull)
+		{
+			elog(ERROR, "pg_outline: outline_id is NULL");
+			SPI_finish();
+			return;
+		}
+		outline_id = DatumGetInt32(id_datum);
+	}
+	else
+	{
+		elog(ERROR, "pg_outline: no outline_id returned");
+		SPI_finish();
+		return;
+	}
+
+	/* Delete existing per-Query hints for this outline */
+	resetStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "DELETE FROM pg_outline_query_hints WHERE outline_id = %d",
+					 outline_id);
+	SPI_execute(sql.data, false, 0);
+
+	/* Insert per-Query hints */
+	foreach(lc, collector.hints)
+	{
+		char	   *indexed_hint = (char *) lfirst(lc);
+		int			qindex;
+		char	   *hint_text;
+		char	   *colon_pos;
+
+		/* Parse "index:hint" format */
+		colon_pos = strchr(indexed_hint, ':');
+		if (!colon_pos)
+			continue;
+
+		*colon_pos = '\0';
+		qindex = atoi(indexed_hint);
+		hint_text = colon_pos + 1;
+
+		resetStringInfo(&sql);
+		appendStringInfo(&sql,
+						 "INSERT INTO pg_outline_query_hints (outline_id, query_index, hint_string) "
+						 "VALUES (%d, %d, %s)",
+						 outline_id, qindex, quote_literal_cstr(hint_text));
+
+		ret = SPI_execute(sql.data, false, 0);
+		if (ret != SPI_OK_INSERT)
+			elog(WARNING, "pg_outline: failed to store hint for Query #%d", qindex);
+
+		*colon_pos = ':'; /* Restore the string */
+	}
+
+	SPI_finish();
+
+	elog(NOTICE, "pg_outline: stored %d hint(s) for outline '%s'",
+		 list_length(collector.hints), outline_name);
+}
+
+/*
  * Extract inline hints from query string with position information
  * Looks for /*+ ... */ comments and records both the hint content and its location
  * Returns a list of QueryHintPosition structures
@@ -1086,15 +1266,13 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 	fingerprint = compute_query_fingerprint(normalized);
 
 	/*
-	 * TODO: Instead of storing as a single hint string, we should store
-	 * hints separately per Query structure with their Query identifiers
-	 * For now, we still merge them but the infrastructure is in place
+	 * Store the outline with per-Query hints
+	 * This stores hints separately for each Query structure in the tree
 	 */
-	store_outline_hints(name_str, query_without_hints, fingerprint, hint_str.data);
+	store_outline_with_query_hints(name_str, query_without_hints, fingerprint, query);
 
 	elog(NOTICE, "pg_outline_create_from_sql: outline '%s' created with fingerprint %s",
 		 name_str, fingerprint ? fingerprint : "none");
-	elog(NOTICE, "Extracted hints: %s", hint_str.data);
 
 	if (normalized)
 		pfree(normalized);
