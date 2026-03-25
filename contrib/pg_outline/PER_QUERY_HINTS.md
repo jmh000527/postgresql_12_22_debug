@@ -115,8 +115,8 @@ WHERE t1.id IN (
 
 **Results in:**
 - Query #0 (top-level): hint = "HashJoin(t1 t2)"
-- Query #1 (first subquery): hint = "IndexScan(t3)"
-- Query #2 (second subquery): hint = "SeqScan(t4)"
+- Query #1 (first subquery in FROM): hint = "IndexScan(t3)"
+- Query #2 (SubLink in WHERE): hint = "SeqScan(t4)"
 
 **Stored as:**
 ```
@@ -128,6 +128,75 @@ pg_outline_query_hints:
   (outline_id=1, query_index=1, hint_string='IndexScan(t3)')
   (outline_id=1, query_index=2, hint_string='SeqScan(t4)')
 ```
+
+### 7. SubLink Support
+
+**SubLinks** are subqueries that appear in expressions rather than in FROM clauses. The implementation now fully supports hints in SubLinks:
+
+#### Types of SubLinks Supported:
+
+1. **WHERE Clause Subqueries**:
+   ```sql
+   SELECT * FROM t1
+   WHERE id IN (SELECT /*+ IndexScan(t2) */ id FROM t2);
+
+   SELECT * FROM t1
+   WHERE EXISTS (SELECT /*+ HashJoin(t3 t4) */ 1 FROM t3, t4 WHERE ...);
+
+   SELECT * FROM t1
+   WHERE value > ANY (SELECT /*+ SeqScan(t5) */ value FROM t5);
+   ```
+
+2. **SELECT List Scalar Subqueries**:
+   ```sql
+   SELECT id,
+          (SELECT /*+ IndexScan(t2) */ max(value) FROM t2 WHERE t2.id = t1.id) AS max_val
+   FROM t1;
+   ```
+
+3. **HAVING Clause Subqueries**:
+   ```sql
+   SELECT dept, COUNT(*)
+   FROM employees
+   GROUP BY dept
+   HAVING COUNT(*) > (SELECT /*+ SeqScan(departments) */ avg_size FROM departments);
+   ```
+
+4. **Expression Subqueries**:
+   ```sql
+   SELECT * FROM t1
+   ORDER BY (SELECT /*+ IndexOnlyScan(t2) */ rank FROM t2 WHERE t2.id = t1.id);
+   ```
+
+#### Implementation Details:
+
+The implementation uses expression tree walkers to traverse all expression nodes in a Query:
+
+```c
+// Walker function that processes SubLink nodes
+static bool assign_hints_sublink_walker(Node *node, SubLinkWalkerContext *context);
+
+// Process all expression fields that might contain SubLinks
+static void process_query_sublinks(Query *query, List *hint_positions, const char *source_text);
+```
+
+The walker examines:
+- `targetList` (SELECT clause)
+- `jointree->quals` (WHERE clause)
+- `havingQual` (HAVING clause)
+- `limitOffset` and `limitCount` (LIMIT/OFFSET clauses)
+
+When a SubLink is found, if its `subselect` field contains a Query node, that Query is processed recursively with `assign_hints_to_queries()`.
+
+#### Query Index Assignment:
+
+Query indices are assigned in depth-first order:
+1. Top-level Query gets index 0
+2. Process RTE subqueries (FROM clause)
+3. Process CTEs (WITH clause)
+4. Process SubLinks in expressions (WHERE, SELECT, HAVING, etc.)
+
+This ensures consistent indexing regardless of where subqueries appear in the SQL.
 
 ## Implementation Functions
 
@@ -143,18 +212,43 @@ pg_outline_query_hints:
 - `collect_query_hints_recursive()`: Walk Query tree and collect all hints with their indices
 - `store_outline_with_query_hints()`: Store outline and per-Query hints in separate tables
 
+### SubLink Processing
+- `assign_hints_sublink_walker()`: Walker function to process SubLink nodes in expressions
+- `process_query_sublinks()`: Walk expression trees looking for SubLinks
+- `collect_hints_sublink_walker()`: Walker for collecting hints from SubLinks
+- `process_query_sublinks_collection()`: Collect hints from SubLinks during collection phase
+
 ## Benefits
 
 1. **Correct Semantics**: Each Query structure maintains its own hints, matching how PostgreSQL's optimizer processes queries
 2. **Multiple Subqueries**: Can have different hints for each subquery, CTE, or nested SELECT
-3. **Future-Proof**: Can extend to store more metadata per Query (e.g., plan costs, row estimates)
-4. **Clear Separation**: The hint for the main query doesn't interfere with subquery hints
+3. **Complete Coverage**: Supports hints in all subquery locations (FROM clause, WHERE clause, SELECT list, HAVING, etc.)
+4. **SubLink Support**: Full support for SubLinks in expressions (IN, EXISTS, ANY, scalar subqueries)
+5. **Future-Proof**: Can extend to store more metadata per Query (e.g., plan costs, row estimates)
+6. **Clear Separation**: The hint for the main query doesn't interfere with subquery hints
+
+## PostgreSQL Query Rewriting
+
+Note that PostgreSQL's optimizer may rewrite certain SubLinks:
+
+- **IN/EXISTS subqueries** may be converted to semi-joins by `pull_up_sublinks()`
+- After conversion, these become RTE_SUBQUERY entries (already supported)
+- Unconverted SubLinks (e.g., correlated subqueries) are handled by the SubLink walker
+
+This means the implementation handles both:
+1. Subqueries that remain as SubLinks
+2. Subqueries that get converted to joins (and become RTEs)
 
 ## Next Steps
 
 1. **Hint Application**: Modify the planner hook to read `Query.query_hints` and apply them during planning
 2. **Hint Retrieval**: Update the retrieval logic to load per-Query hints from `pg_outline_query_hints` and restore them to the Query tree
-3. **Testing**: Comprehensive testing with complex queries containing multiple subqueries and CTEs
+3. **Testing**: Comprehensive testing with complex queries containing:
+   - Multiple SubLinks in WHERE clauses
+   - Scalar subqueries in SELECT lists
+   - Subqueries in HAVING clauses
+   - Nested subqueries (SubLinks within SubLinks)
+   - Mixed RTE_SUBQUERY and SubLink subqueries
 
 ## Compatibility Note
 
