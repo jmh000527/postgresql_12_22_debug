@@ -104,6 +104,14 @@ typedef struct OutlineInfo
 	StringInfo outline_data;
 } OutlineInfo;
 
+/* Structure to hold hint-to-Query position mapping */
+typedef struct QueryHintPosition
+{
+	int			hint_location;	/* Location in source where this hint begins */
+	int			hint_end;		/* Location where this hint ends */
+	char	   *hint_text;		/* Hint text extracted from comment */
+} QueryHintPosition;
+
 /* Current outline being processed */
 static OutlineInfo *current_outline = NULL;
 
@@ -138,8 +146,10 @@ static void store_outline_hints(const char *outline_name, const char *query_patt
 static char *retrieve_outline_hints(const char *fingerprint);
 
 /* Inline hint extraction */
-static char *extract_inline_hints(const char *query_string);
+static List *extract_inline_hints_with_positions(const char *query_string);
 static char *strip_hints_from_query(const char *query_string);
+static void assign_hints_to_queries(Query *query, List *hint_positions, const char *source_text);
+static char *find_hint_for_query_location(List *hint_positions, int stmt_location);
 
 /* SQL-callable functions */
 PG_FUNCTION_INFO_V1(pg_outline_create);
@@ -764,22 +774,21 @@ retrieve_outline_hints(const char *fingerprint)
 }
 
 /*
- * Extract inline hints from query string
- * Looks for /*+ ... */ comments and extracts the hint content
- * Supports multiple hint comments in one query
+ * Extract inline hints from query string with position information
+ * Looks for /*+ ... */ comments and records both the hint content and its location
+ * Returns a list of QueryHintPosition structures
  */
-static char *
-extract_inline_hints(const char *query_string)
+static List *
+extract_inline_hints_with_positions(const char *query_string)
 {
-	StringInfoData hints;
+	List	   *hint_positions = NIL;
 	const char *p;
 	const char *hint_start;
 	bool		in_hint = false;
+	int			hint_begin_loc = 0;
 
 	if (!query_string)
-		return NULL;
-
-	initStringInfo(&hints);
+		return NIL;
 
 	for (p = query_string; *p; p++)
 	{
@@ -787,6 +796,7 @@ extract_inline_hints(const char *query_string)
 		if (!in_hint && *p == '/' && *(p + 1) == '*' && *(p + 2) == '+')
 		{
 			in_hint = true;
+			hint_begin_loc = p - query_string;
 			hint_start = p + 3; /* Skip past "/*+" */
 			p += 2;			/* Move past "/*" (the loop will move past '+') */
 			continue;
@@ -798,16 +808,16 @@ extract_inline_hints(const char *query_string)
 			/* Extract hint content */
 			size_t		hint_len = p - hint_start;
 			char	   *hint_text = palloc(hint_len + 1);
+			QueryHintPosition *pos = palloc(sizeof(QueryHintPosition));
 
 			memcpy(hint_text, hint_start, hint_len);
 			hint_text[hint_len] = '\0';
 
-			/* Append to hints (with space if not first hint) */
-			if (hints.len > 0)
-				appendStringInfoChar(&hints, ' ');
-			appendStringInfoString(&hints, hint_text);
+			pos->hint_location = hint_begin_loc;
+			pos->hint_end = (p - query_string) + 2; /* Include "*/" */
+			pos->hint_text = hint_text;
 
-			pfree(hint_text);
+			hint_positions = lappend(hint_positions, pos);
 
 			in_hint = false;
 			p++;				/* Skip past the '/' in '*/' */
@@ -815,10 +825,7 @@ extract_inline_hints(const char *query_string)
 		}
 	}
 
-	if (hints.len == 0)
-		return NULL;
-
-	return hints.data;
+	return hint_positions;
 }
 
 /*
@@ -864,6 +871,83 @@ strip_hints_from_query(const char *query_string)
 }
 
 /*
+ * Find the hint that corresponds to a Query at a specific location
+ * Looks for a hint comment that appears just before the SELECT keyword
+ * at or near the Query's stmt_location
+ */
+static char *
+find_hint_for_query_location(List *hint_positions, int stmt_location)
+{
+	ListCell   *lc;
+
+	if (stmt_location < 0)
+		return NULL;
+
+	foreach(lc, hint_positions)
+	{
+		QueryHintPosition *pos = (QueryHintPosition *) lfirst(lc);
+
+		/*
+		 * A hint applies to a Query if it appears shortly before the Query's
+		 * location. We allow for some whitespace (up to 100 characters).
+		 */
+		if (pos->hint_end <= stmt_location &&
+			stmt_location - pos->hint_end < 100)
+		{
+			return pos->hint_text;
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * Recursively assign hints to Query structures based on their location
+ * This walks the Query tree and associates each Query with its corresponding hint
+ */
+static void
+assign_hints_to_queries(Query *query, List *hint_positions, const char *source_text)
+{
+	ListCell   *lc;
+	char	   *hint;
+
+	if (!query)
+		return;
+
+	/* Find and assign hint for this Query */
+	hint = find_hint_for_query_location(hint_positions, query->stmt_location);
+	if (hint)
+	{
+		query->query_hints = pstrdup(hint);
+		elog(DEBUG1, "Assigned hint '%s' to Query at location %d",
+			 hint, query->stmt_location);
+	}
+
+	/* Process subqueries in RTEs */
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery)
+		{
+			assign_hints_to_queries(rte->subquery, hint_positions, source_text);
+		}
+	}
+
+	/* Process CTEs */
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+		if (cte->ctequery)
+		{
+			Query *ctequery = castNode(Query, cte->ctequery);
+			assign_hints_to_queries(ctequery, hint_positions, source_text);
+		}
+	}
+}
+
+/*
  * SQL function: create an outline for a query
  */
 Datum
@@ -900,11 +984,12 @@ pg_outline_create(PG_FUNCTION_ARGS)
  * SQL function: create an outline from SQL with inline hints
  * This is the simplified interface that accepts SQL with /*+ ... */ hints
  * The function will:
- * 1. Extract inline hints from the SQL
- * 2. Execute the query with hints to get the actual plan
- * 3. Extract hints from the resulting execution plan
- * 4. Store the extracted hints as the outline
- * 5. Strip hints from query to create the pattern
+ * 1. Extract inline hints with their positions from the SQL
+ * 2. Parse the query (with hints still in source for location tracking)
+ * 3. Assign each hint to its corresponding Query structure
+ * 4. Plan the query with hints attached to Query structures
+ * 5. Extract hints from the resulting execution plan (per Query)
+ * 6. Store the extracted hints separately for each Query
  */
 Datum
 pg_outline_create_from_sql(PG_FUNCTION_ARGS)
@@ -916,41 +1001,51 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 	char	   *query_without_hints;
 	char	   *normalized;
 	char	   *fingerprint;
-	char	   *extracted_hints;
+	List	   *hint_positions;
 	PlannedStmt *plan;
 	List	   *parsetree_list;
 	Query	   *query;
+	RawStmt	   *raw_stmt;
+	List	   *raw_parsetree_list;
 	List	   *hints = NIL;
+	int			query_count = 0;
 
-	/* Extract and strip hints from the query */
-	extracted_hints = extract_inline_hints(query_str);
-	query_without_hints = strip_hints_from_query(query_str);
+	/* Extract hint positions from the query */
+	hint_positions = extract_inline_hints_with_positions(query_str);
 
-	if (!extracted_hints)
+	if (list_length(hint_positions) == 0)
 	{
 		elog(WARNING, "pg_outline_create_from_sql: no hints found in query");
 		PG_RETURN_BOOL(false);
 	}
 
-	/* Parse the query (without hints) */
-	parsetree_list = pg_parse_query(query_without_hints);
+	elog(NOTICE, "Found %d hint(s) in query", list_length(hint_positions));
 
-	if (list_length(parsetree_list) != 1)
+	/* Parse the raw query to get RawStmt with location info */
+	raw_parsetree_list = pg_parse_query(query_str);
+
+	if (list_length(raw_parsetree_list) != 1)
 	{
 		elog(WARNING, "pg_outline_create_from_sql: query must contain exactly one statement");
 		PG_RETURN_BOOL(false);
 	}
 
-	query = linitial_node(Query, parsetree_list);
+	raw_stmt = linitial_node(RawStmt, raw_parsetree_list);
+
+	/* Analyze the query to get Query tree */
+	query = parse_analyze(raw_stmt, query_str, NULL, 0, NULL);
+
+	/* Assign hints to Query structures based on their locations */
+	assign_hints_to_queries(query, hint_positions, query_str);
 
 	/*
-	 * Here we would ideally execute the query with hints to get the actual plan
-	 * For now, we'll use the standard planner
-	 * In a full implementation, we would:
-	 * 1. Temporarily set GUCs based on hints
-	 * 2. Call the planner
-	 * 3. Extract hints from the resulting plan
-	 * 4. Restore GUCs
+	 * Count how many Query structures have hints assigned
+	 */
+	/* TODO: Walk the Query tree and count queries with hints */
+
+	/*
+	 * Plan the query - the hints are now attached to Query structures
+	 * The planner can access query->query_hints for each Query
 	 */
 	plan = standard_planner(query, 0, NULL);
 
@@ -985,11 +1080,16 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 		}
 	}
 
-	/* Normalize query (without hints) and compute fingerprint */
+	/* Strip hints and normalize query for fingerprint */
+	query_without_hints = strip_hints_from_query(query_str);
 	normalized = normalize_query(query_without_hints);
 	fingerprint = compute_query_fingerprint(normalized);
 
-	/* Store the outline with extracted hints */
+	/*
+	 * TODO: Instead of storing as a single hint string, we should store
+	 * hints separately per Query structure with their Query identifiers
+	 * For now, we still merge them but the infrastructure is in place
+	 */
 	store_outline_hints(name_str, query_without_hints, fingerprint, hint_str.data);
 
 	elog(NOTICE, "pg_outline_create_from_sql: outline '%s' created with fingerprint %s",
