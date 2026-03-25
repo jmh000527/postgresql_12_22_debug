@@ -1,0 +1,404 @@
+--
+-- OUTLINE_HINTS
+-- Test the outline hint system for query plan control
+--
+
+-- Create test tables
+CREATE TABLE outline_test1 (
+    id int PRIMARY KEY,
+    name text,
+    value int
+);
+CREATE TABLE outline_test2 (
+    id int PRIMARY KEY,
+    ref_id int,
+    data text
+);
+CREATE TABLE outline_test3 (
+    id int PRIMARY KEY,
+    category text,
+    score int
+);
+-- Create indexes
+CREATE INDEX idx_test1_value ON outline_test1(value);
+CREATE INDEX idx_test2_ref ON outline_test2(ref_id);
+CREATE INDEX idx_test3_category ON outline_test3(category);
+-- Insert test data
+INSERT INTO outline_test1 SELECT i, 'name_' || i, i * 10 FROM generate_series(1, 1000) i;
+INSERT INTO outline_test2 SELECT i, (i % 100) + 1, 'data_' || i FROM generate_series(1, 5000) i;
+INSERT INTO outline_test3 SELECT i, 'cat_' || (i % 10), i * 5 FROM generate_series(1, 500) i;
+-- Analyze tables for proper statistics
+ANALYZE outline_test1;
+ANALYZE outline_test2;
+ANALYZE outline_test3;
+--
+-- Test 1: SeqScan hint
+--
+SELECT pg_create_outline(
+    'test_seqscan',
+    'SELECT * FROM outline_test1 WHERE value < $1',
+    'SeqScan(outline_test1)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+-- Verify the outline was created
+SELECT outlinename, outlineenabled FROM pg_outline WHERE outlinename = 'test_seqscan';
+ outlinename  | outlineenabled
+--------------+----------------
+ test_seqscan | t
+(1 row)
+
+--
+-- Test 2: IndexScan hint
+--
+SELECT pg_create_outline(
+    'test_indexscan',
+    'SELECT * FROM outline_test1 WHERE value < $1',
+    'IndexScan(outline_test1 idx_test1_value)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+SELECT outlinename, outlineenabled FROM pg_outline WHERE outlinename = 'test_indexscan';
+  outlinename  | outlineenabled
+---------------+----------------
+ test_indexscan | t
+(1 row)
+
+--
+-- Test 3: NoSeqScan hint
+--
+SELECT pg_create_outline(
+    'test_noseqscan',
+    'SELECT * FROM outline_test1 WHERE value = $1',
+    'NoSeqScan(outline_test1)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+SELECT outlinename, outlineenabled FROM pg_outline WHERE outlinename = 'test_noseqscan';
+  outlinename   | outlineenabled
+----------------+----------------
+ test_noseqscan | t
+(1 row)
+
+--
+-- Test 4: Join method hints
+--
+SELECT pg_create_outline(
+    'test_hashjoin',
+    'SELECT * FROM outline_test1 t1 JOIN outline_test2 t2 ON t1.id = t2.ref_id WHERE t1.value > $1',
+    'HashJoin(outline_test1 outline_test2)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+SELECT pg_create_outline(
+    'test_nestloop',
+    'SELECT * FROM outline_test1 t1 JOIN outline_test2 t2 ON t1.id = t2.ref_id WHERE t1.id < $1',
+    'NestLoop(outline_test1 outline_test2)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+SELECT pg_create_outline(
+    'test_mergejoin',
+    'SELECT * FROM outline_test1 t1 JOIN outline_test2 t2 ON t1.id = t2.id WHERE t1.value > $1',
+    'MergeJoin(outline_test1 outline_test2)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+--
+-- Test 5: Rows hint - Override row estimates
+--
+SELECT pg_create_outline(
+    'test_rows_single',
+    'SELECT * FROM outline_test1 WHERE value < $1',
+    'Rows(outline_test1 100)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+SELECT pg_create_outline(
+    'test_rows_join',
+    'SELECT * FROM outline_test1 t1 JOIN outline_test2 t2 ON t1.id = t2.ref_id',
+    'Rows(outline_test1 outline_test2 5000)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+--
+-- Test 6: Parallel hint
+--
+SELECT pg_create_outline(
+    'test_parallel',
+    'SELECT COUNT(*) FROM outline_test2 WHERE ref_id > $1',
+    'Parallel(outline_test2 4)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+--
+-- Test 7: NoParallel hint
+--
+SELECT pg_create_outline(
+    'test_noparallel',
+    'SELECT COUNT(*) FROM outline_test2 WHERE ref_id < $1',
+    'NoParallel(outline_test2)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+--
+-- Test 8: Set hint - GUC parameter override
+--
+SELECT pg_create_outline(
+    'test_set_workmen',
+    'SELECT * FROM outline_test1 ORDER BY value',
+    'Set(work_mem 128MB)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+SELECT pg_create_outline(
+    'test_set_random_page_cost',
+    'SELECT * FROM outline_test1 WHERE value < $1',
+    'Set(random_page_cost 1.5)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+--
+-- Test 9: Multiple hints combined
+--
+SELECT pg_create_outline(
+    'test_combined_hints',
+    'SELECT * FROM outline_test1 t1 JOIN outline_test2 t2 ON t1.id = t2.ref_id WHERE t1.value > $1',
+    'HashJoin(outline_test1 outline_test2)
+Rows(outline_test1 50)
+Rows(outline_test2 1000)
+Set(random_page_cost 2.0)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+--
+-- Test 10: Leading hint (simple syntax)
+--
+SELECT pg_create_outline(
+    'test_leading_simple',
+    'SELECT * FROM outline_test1 t1 JOIN outline_test2 t2 ON t1.id = t2.ref_id JOIN outline_test3 t3 ON t2.id = t3.id',
+    'Leading(outline_test1 outline_test2 outline_test3)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+--
+-- Test 11: Leading hint (nested syntax)
+--
+SELECT pg_create_outline(
+    'test_leading_nested',
+    'SELECT * FROM outline_test1 t1 JOIN outline_test2 t2 ON t1.id = t2.ref_id JOIN outline_test3 t3 ON t1.id = t3.id',
+    'Leading((outline_test1 outline_test2) outline_test3)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+--
+-- Test 12: Inline hints (query output will vary based on data)
+--
+SELECT /*+ SeqScan(outline_test1) */ * FROM outline_test1 WHERE value < 100 LIMIT 0;
+ id | name | value
+----+------+-------
+(0 rows)
+
+SELECT /*+ IndexScan(outline_test1 idx_test1_value) */ * FROM outline_test1 WHERE value < 50 LIMIT 0;
+ id | name | value
+----+------+-------
+(0 rows)
+
+SELECT /*+ HashJoin(outline_test1 outline_test2) Rows(outline_test1 100) */
+    t1.id, t2.id
+FROM outline_test1 t1
+JOIN outline_test2 t2 ON t1.id = t2.ref_id
+WHERE t1.value > 500 LIMIT 0;
+ id | id
+----+----
+(0 rows)
+
+--
+-- Test 13: OceanBase-style outline data format
+--
+SELECT /*+
+BEGIN_OUTLINE_DATA
+IndexScan(outline_test1 idx_test1_value)
+Rows(outline_test1 50)
+END_OUTLINE_DATA
+*/ * FROM outline_test1 WHERE value < 200 LIMIT 0;
+ id | name | value
+----+------+-------
+(0 rows)
+
+--
+-- Test 14: Outline management functions
+--
+-- List all outlines
+SELECT outlinename, outlineenabled FROM pg_outline ORDER BY outlinename;
+       outlinename       | outlineenabled
+-------------------------+----------------
+ test_combined_hints     | t
+ test_hashjoin           | t
+ test_indexscan          | t
+ test_leading_nested     | t
+ test_leading_simple     | t
+ test_mergejoin          | t
+ test_nestloop           | t
+ test_noparallel         | t
+ test_noseqscan          | t
+ test_parallel           | t
+ test_rows_join          | t
+ test_rows_single        | t
+ test_seqscan            | t
+ test_set_random_page_cost | t
+ test_set_workmen        | t
+(15 rows)
+
+-- Disable an outline
+SELECT pg_enable_outline('test_seqscan', false);
+ pg_enable_outline
+-------------------
+
+(1 row)
+
+SELECT outlinename, outlineenabled FROM pg_outline WHERE outlinename = 'test_seqscan';
+ outlinename  | outlineenabled
+--------------+----------------
+ test_seqscan | f
+(1 row)
+
+-- Re-enable an outline
+SELECT pg_enable_outline('test_seqscan', true);
+ pg_enable_outline
+-------------------
+
+(1 row)
+
+SELECT outlinename, outlineenabled FROM pg_outline WHERE outlinename = 'test_seqscan';
+ outlinename  | outlineenabled
+--------------+----------------
+ test_seqscan | t
+(1 row)
+
+-- Update an outline's hints
+SELECT pg_update_outline('test_seqscan', 'NoSeqScan(outline_test1)');
+ pg_update_outline
+-------------------
+
+(1 row)
+
+-- Drop an outline
+SELECT pg_drop_outline('test_seqscan');
+ pg_drop_outline
+-----------------
+
+(1 row)
+
+SELECT COUNT(*) FROM pg_outline WHERE outlinename = 'test_seqscan';
+ count
+-------
+     0
+(1 row)
+
+--
+-- Test 15: Error cases
+--
+-- Try to create outline with invalid hint syntax (should succeed, hint just won't match)
+SELECT pg_create_outline(
+    'test_invalid_hint',
+    'SELECT * FROM outline_test1',
+    'InvalidHint(outline_test1)'
+);
+ pg_create_outline
+-------------------
+
+(1 row)
+
+-- Drop the invalid outline
+SELECT pg_drop_outline('test_invalid_hint');
+ pg_drop_outline
+-----------------
+
+(1 row)
+
+--
+-- Test 16: Outline display setting
+--
+-- Enable hint display (output will show debug messages)
+SET outline.display_hints = on;
+-- Execute a query (no visible output change in basic mode)
+SELECT * FROM outline_test1 WHERE value < 100 LIMIT 0;
+ id | name | value
+----+------+-------
+(0 rows)
+
+-- Disable hint display
+SET outline.display_hints = off;
+--
+-- Cleanup
+--
+-- Drop all test outlines
+SELECT outlinename, pg_drop_outline(outlinename) FROM pg_outline WHERE outlinename LIKE 'test_%' ORDER BY outlinename;
+       outlinename       | pg_drop_outline
+-------------------------+-----------------
+ test_combined_hints     |
+ test_hashjoin           |
+ test_indexscan          |
+ test_leading_nested     |
+ test_leading_simple     |
+ test_mergejoin          |
+ test_nestloop           |
+ test_noparallel         |
+ test_noseqscan          |
+ test_parallel           |
+ test_rows_join          |
+ test_rows_single        |
+ test_set_random_page_cost |
+ test_set_workmen        |
+(14 rows)
+
+-- Drop test tables
+DROP TABLE outline_test3;
+DROP TABLE outline_test2;
+DROP TABLE outline_test1;
