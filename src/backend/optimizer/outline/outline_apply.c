@@ -22,11 +22,17 @@
 #include "optimizer/cost.h"
 #include "nodes/pathnodes.h"
 #include "nodes/pg_list.h"
+#include "nodes/parsenodes.h"
 #include "utils/lsyscache.h"
 #include "utils/guc.h"
+#include "catalog/pg_class.h"
 
 /* Module-level state */
 static HintState *current_hint_state = NULL;
+
+/* Forward declarations */
+static RelOptInfo *outline_join_search(PlannerInfo *root, int levels_needed,
+									   List *initial_rels);
 
 /*
  * Initialize outline hint system
@@ -35,6 +41,9 @@ void
 outline_hints_init(void)
 {
 	current_hint_state = NULL;
+
+	/* Register our custom join search hook for Leading hint support */
+	join_search_hook = outline_join_search;
 }
 
 /*
@@ -457,6 +466,175 @@ outline_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 }
 
 /*
+ * find_rel_by_relname - Find a RelOptInfo in the initial_rels list by relation name
+ */
+static RelOptInfo *
+find_rel_by_relname(List *initial_rels, const char *relname, PlannerInfo *root)
+{
+	ListCell   *lc;
+
+	foreach(lc, initial_rels)
+	{
+		RelOptInfo *rel = (RelOptInfo *) lfirst(lc);
+		RangeTblEntry *rte;
+		char	   *rel_relname;
+
+		/* Get the RTE for this relation */
+		if (rel->relid == 0 || rel->relid > list_length(root->parse->rtable))
+			continue;
+
+		rte = rt_fetch(rel->relid, root->parse->rtable);
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		rel_relname = get_rel_name(rte->relid);
+		if (rel_relname && pg_strcasecmp(rel_relname, relname) == 0)
+			return rel;
+	}
+
+	return NULL;
+}
+
+/*
+ * join_two_rels - Join two RelOptInfo structures
+ */
+static RelOptInfo *
+join_two_rels(PlannerInfo *root, RelOptInfo *outer_rel, RelOptInfo *inner_rel)
+{
+	RelOptInfo *joinrel;
+
+	/* Try to make the join relation */
+	joinrel = make_join_rel(root, outer_rel, inner_rel);
+
+	if (joinrel == NULL)
+	{
+		/* Join is not legal, this can happen with certain join orders */
+		return NULL;
+	}
+
+	return joinrel;
+}
+
+/*
+ * outline_join_search_simple - Implement simple Leading hint (left-to-right join order)
+ *
+ * For a simple Leading hint like Leading(t1 t2 t3), we join tables from left to right:
+ * First join t1 and t2, then join the result with t3, and so on.
+ */
+static RelOptInfo *
+outline_join_search_simple(PlannerInfo *root, LeadingHint *leading_hint,
+						   List *initial_rels)
+{
+	ListCell   *lc;
+	RelOptInfo *result_rel = NULL;
+	List	   *remaining_rels = list_copy(initial_rels);
+
+	/* Process each relation in the Leading hint order */
+	foreach(lc, leading_hint->relnames)
+	{
+		char	   *relname = (char *) lfirst(lc);
+		RelOptInfo *next_rel;
+
+		/* Skip parentheses markers - they're for nested syntax */
+		if (strcmp(relname, "(") == 0 || strcmp(relname, ")") == 0)
+			continue;
+
+		/* Find this relation in the remaining relations */
+		next_rel = find_rel_by_relname(remaining_rels, relname, root);
+		if (next_rel == NULL)
+		{
+			/* Relation not found, hint doesn't match query */
+			ereport(DEBUG1,
+					(errmsg("Leading hint relation \"%s\" not found in query", relname)));
+			return NULL;
+		}
+
+		/* Remove from remaining relations */
+		remaining_rels = list_delete_ptr(remaining_rels, next_rel);
+
+		if (result_rel == NULL)
+		{
+			/* First relation becomes the starting point */
+			result_rel = next_rel;
+		}
+		else
+		{
+			/* Join the accumulated result with the next relation */
+			result_rel = join_two_rels(root, result_rel, next_rel);
+			if (result_rel == NULL)
+			{
+				/* Join failed, can't continue with this order */
+				ereport(DEBUG1,
+						(errmsg("Leading hint join order failed for relation \"%s\"", relname)));
+				return NULL;
+			}
+		}
+	}
+
+	/* Join any remaining relations that weren't in the Leading hint */
+	foreach(lc, remaining_rels)
+	{
+		RelOptInfo *next_rel = (RelOptInfo *) lfirst(lc);
+
+		if (result_rel == NULL)
+			result_rel = next_rel;
+		else
+		{
+			result_rel = join_two_rels(root, result_rel, next_rel);
+			if (result_rel == NULL)
+			{
+				/* Join failed */
+				return NULL;
+			}
+		}
+	}
+
+	return result_rel;
+}
+
+/*
+ * outline_join_search - Custom join search function with Leading hint support
+ *
+ * This function is registered as the join_search_hook. It checks if a Leading hint
+ * is active, and if so, uses the hinted join order. Otherwise, it falls back to
+ * the standard join search algorithm.
+ */
+static RelOptInfo *
+outline_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
+{
+	LeadingHint *leading_hint;
+	RelOptInfo *result_rel;
+
+	/* Check if we have a Leading hint */
+	leading_hint = find_leading_hint(current_hint_state);
+
+	if (leading_hint != NULL && leading_hint->relnames != NIL)
+	{
+		ereport(DEBUG1,
+				(errmsg("Applying Leading hint with %d relations",
+						list_length(leading_hint->relnames))));
+
+		/* Try to use the Leading hint to control join order */
+		result_rel = outline_join_search_simple(root, leading_hint, initial_rels);
+
+		if (result_rel != NULL)
+		{
+			/* Successfully applied Leading hint */
+			ereport(DEBUG1,
+					(errmsg("Leading hint successfully applied")));
+			return result_rel;
+		}
+
+		/* Leading hint failed, fall through to standard search */
+		ereport(DEBUG1,
+				(errmsg("Leading hint failed, falling back to standard join search")));
+	}
+
+	/* No Leading hint or hint failed, use standard join search */
+	return standard_join_search(root, levels_needed, initial_rels);
+}
+
+/*
  * Leading Hint Implementation Notes
  * ==================================
  *
@@ -471,38 +649,33 @@ outline_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
  *   - Simple: Leading(t1 t2 t3) - tables joined left-to-right
  *   - Nested: Leading((t1 t2) t3) - explicit join tree structure
  *
- * - Application: PARTIAL - Foundation in place
- *   The find_leading_hint() function exists to locate Leading hints in the
- *   hint state, but the join order enforcement is not yet implemented.
+ * - Application: IMPLEMENTED - Simple join order control
+ *   The outline_join_search() function enforces Leading hints for simple cases.
+ *   For simple syntax (no nested parentheses), tables are joined left-to-right.
+ *   Nested syntax with parentheses is parsed but uses simplified join logic.
  *
- * Implementation Approach:
- * ------------------------
- * To fully implement Leading hints, the following approach is recommended:
+ * Implementation Details:
+ * -----------------------
+ * 1. join_search_hook registered in outline_hints_init()
+ *    - outline_join_search() replaces standard_join_search() when hints active
+ *    - Falls back to standard search if no Leading hint or if hint fails
  *
- * 1. Implement join_search_hook:
- *    - Register a custom join_search_hook in outline_hints_init()
- *    - This hook replaces standard_join_search() when a Leading hint is active
- *    - The hook should call a custom join search function that respects the
- *      specified join order
+ * 2. Simple Join Order Implementation:
+ *    - outline_join_search_simple() processes relations left-to-right
+ *    - Uses make_join_rel() to create joins in the specified order
+ *    - Handles cases where hinted join order is not feasible
  *
- * 2. Build Custom Join Tree:
- *    - Parse the Leading hint's relnames list to build a join tree structure
- *    - Handle parentheses markers ("(" and ")") to understand nesting
- *    - Create RelOptInfo structures for joins in the specified order
- *    - For simple syntax (no parens), join left-to-right
- *    - For nested syntax, respect the join tree structure
+ * 3. Limitations:
+ *    - Nested parentheses syntax is simplified (joins left-to-right)
+ *    - Full nested join tree building not yet implemented
+ *    - Outer join constraints may restrict applicable join orders
  *
- * 3. Interact with Planner:
- *    - Use make_join_rel() to create join relations
- *    - Ensure that only the hinted join order is considered
- *    - Still allow the join method hints (NestLoop, HashJoin, etc.) to apply
- *    - Handle cases where the hinted order may not be feasible
- *
- * 4. Handle Edge Cases:
- *    - What if a table in the hint doesn't exist in the query?
- *    - What if the query has more tables than specified in the hint?
- *    - What about subqueries and CTEs?
- *    - How to handle outer joins where order matters semantically?
+ * Future Enhancements:
+ * --------------------
+ * - Implement proper nested join tree building for complex syntax
+ * - Better handling of outer joins and join constraints
+ * - Validation of join order feasibility before attempting
+ * - Integration with bushy join tree algorithms
  *
  * References:
  * -----------
@@ -510,9 +683,4 @@ outline_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
  * - PostgreSQL src/backend/optimizer/path/joinrels.c: Join enumeration logic
  * - PostgreSQL src/backend/optimizer/path/allpaths.c: standard_join_search()
  * - PostgreSQL src/include/optimizer/paths.h: join_search_hook definition
- *
- * The current implementation provides the parsing and data structures needed
- * for Leading hints. The actual join order control logic remains to be
- * implemented by future developers or in collaboration with domain experts
- * in PostgreSQL's query optimizer internals.
  */
