@@ -133,6 +133,46 @@ extract_hints_from_plan(Plan *plan, StringInfo hints, List *rtable, int rtoffset
 			extract_hints_from_plan(plan->righttree, hints, rtable, rtoffset);
 			break;
 
+		case T_Gather:
+		case T_GatherMerge:
+			{
+				Gather *gather = (Gather *) plan;
+
+				/*
+				 * Extract parallel hint from Gather node
+				 * Gather nodes contain the number of workers used for parallel execution
+				 */
+				if (gather->num_workers > 0 && plan->lefttree)
+				{
+					/* Try to get the relation name from the subplan */
+					Plan *subplan = plan->lefttree;
+
+					/* If the subplan is a scan, we can generate a Parallel hint */
+					if (IsA(subplan, SeqScan) || IsA(subplan, IndexScan) ||
+						IsA(subplan, IndexOnlyScan) || IsA(subplan, BitmapHeapScan))
+					{
+						Scan *scan = (Scan *) subplan;
+						RangeTblEntry *rte = rt_fetch(scan->scanrelid, rtable);
+
+						if (rte && rte->rtekind == RTE_RELATION)
+						{
+							char *relname = get_outline_rel_name(rte->relid, rtable);
+							if (relname)
+							{
+								if (hints->len > 0)
+									appendStringInfoChar(hints, '\n');
+								appendStringInfo(hints, "Parallel(%s %d)",
+											   relname, gather->num_workers);
+							}
+						}
+					}
+				}
+
+				/* Recursively process subplan */
+				extract_hints_from_plan(plan->lefttree, hints, rtable, rtoffset);
+			}
+			break;
+
 		case T_Append:
 		case T_MergeAppend:
 		case T_BitmapAnd:
@@ -244,6 +284,42 @@ extract_scan_hints(Scan *scan, StringInfo hints, List *rtable)
 		default:
 			/* Other scan types not supported yet */
 			break;
+	}
+
+	/*
+	 * Optionally add row count hint if the estimated rows differ significantly
+	 * from what might be expected (e.g., very small or very large).
+	 * This is conservative - we only add Rows hints for notable cases.
+	 */
+	if (scan->plan.plan_rows > 0)
+	{
+		double rows = scan->plan.plan_rows;
+
+		/*
+		 * Add Rows hint for significant row counts (> 1000) or very small counts (< 10)
+		 * to help reproduce the plan when statistics might differ
+		 */
+		if (rows >= 1000 || rows < 10)
+		{
+			if (hints->len > 0)
+				appendStringInfoChar(hints, '\n');
+			appendStringInfo(hints, "Rows(%s %.0f)", relname, rows);
+		}
+	}
+
+	/*
+	 * Add parallel hint if the scan uses parallel workers
+	 * Note: parallel_aware flag indicates plan can be executed in parallel
+	 */
+	if (scan->plan.parallel_aware && scan->plan.plan_rows > 10000)
+	{
+		/*
+		 * We can't directly get worker count from the scan node,
+		 * but we can indicate that parallelism is expected.
+		 * In practice, the actual worker count comes from GatherNode.
+		 * For now, we add a comment that parallelism was used.
+		 */
+		/* Parallel hint will be added at Gather node level instead */
 	}
 }
 
