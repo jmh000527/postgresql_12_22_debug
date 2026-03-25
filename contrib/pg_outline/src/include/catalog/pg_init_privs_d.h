@@ -1,1 +1,0 @@
-/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/contrib/pg_outline/src/backend/catalog/pg_init_privs_d.h

@@ -1,1 +1,0 @@
-/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/test/locale/gr_GR.ISO8859-7/Makefile

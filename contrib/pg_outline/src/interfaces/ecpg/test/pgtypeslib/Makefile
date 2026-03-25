@@ -1,1 +1,0 @@
-/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/interfaces/ecpg/test/pgtypeslib/Makefile

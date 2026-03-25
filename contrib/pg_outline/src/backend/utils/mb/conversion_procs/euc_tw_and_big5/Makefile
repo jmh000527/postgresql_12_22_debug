@@ -1,1 +1,0 @@
-/home/runner/work/postgresql_12_22_debug/postgresql_12_22_debug/src/backend/utils/mb/conversion_procs/euc_tw_and_big5/Makefile
