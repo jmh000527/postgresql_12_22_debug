@@ -48,3 +48,5 @@ conftest.err
 confdefs.h
 conftest
 pgdata
+build/
+
