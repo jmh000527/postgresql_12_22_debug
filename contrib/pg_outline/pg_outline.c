@@ -103,6 +103,7 @@ typedef struct OutlineInfo
 	char *query_string;
 	List *hints;  /* List of OutlineHint */
 	StringInfo outline_data;
+	bool displayed;  /* Whether outline data has been displayed */
 } OutlineInfo;
 
 /* Structure to hold hint-to-Query position mapping */
@@ -278,6 +279,13 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		if (debug_query_string)
 		{
 			generate_outline_from_plan(result, debug_query_string);
+
+			/* Display outline data immediately for EXPLAIN statements
+			 * For normal queries, it will be displayed in ExecutorEnd hook */
+			if (pg_outline_display_hints && current_outline)
+			{
+				display_outline_data();
+			}
 		}
 	}
 
@@ -706,23 +714,28 @@ display_outline_data(void)
 {
 	if (current_outline && current_outline->hints && list_length(current_outline->hints) > 0)
 	{
-		StringInfoData outline;
-		ListCell   *lc;
-
-		initStringInfo(&outline);
-		appendStringInfo(&outline, "\n/*+\nBEGIN_OUTLINE_DATA\n");
-
-		foreach(lc, current_outline->hints)
+		/* Only display if not already displayed */
+		if (!current_outline->displayed)
 		{
-			char	   *hint = (char *) lfirst(lc);
+			StringInfoData outline;
+			ListCell   *lc;
 
-			if (hint)
-				appendStringInfo(&outline, "%s\n", hint);
+			initStringInfo(&outline);
+			appendStringInfo(&outline, "\n/*+\nBEGIN_OUTLINE_DATA\n");
+
+			foreach(lc, current_outline->hints)
+			{
+				char	   *hint = (char *) lfirst(lc);
+
+				if (hint)
+					appendStringInfo(&outline, "%s\n", hint);
+			}
+
+			appendStringInfo(&outline, "END_OUTLINE_DATA\n*/\n");
+
+			elog(NOTICE, "Generated Outline Data:%s", outline.data);
+			current_outline->displayed = true;
 		}
-
-		appendStringInfo(&outline, "END_OUTLINE_DATA\n*/\n");
-
-		elog(NOTICE, "Generated Outline Data:%s", outline.data);
 	}
 }
 
