@@ -280,8 +280,9 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		{
 			generate_outline_from_plan(result, debug_query_string);
 
-			/* Display outline data immediately for EXPLAIN statements
-			 * For normal queries, it will be displayed in ExecutorEnd hook */
+			/* Display outline data immediately after planning.
+			 * This will show for EXPLAIN statements (which only plan, not execute).
+			 * For normal queries, the outline is cleaned up in ExecutorEnd without display. */
 			if (pg_outline_display_hints && current_outline)
 			{
 				display_outline_data();
@@ -319,11 +320,9 @@ outline_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 outline_ExecutorEnd(QueryDesc *queryDesc)
 {
-	/* Display outline data before cleaning up */
-	if (pg_outline_enabled && pg_outline_display_hints && current_outline)
-	{
-		display_outline_data();
-	}
+	/* Note: We do NOT display outline data here for normal queries.
+	 * Outline data is only displayed for EXPLAIN statements in the planner hook.
+	 * Normal queries should not show outline data to avoid cluttering output. */
 
 	/* Clean up current outline */
 	if (current_outline)
