@@ -609,21 +609,52 @@ static char *
 get_join_method_hint(Plan *plan)
 {
 	StringInfoData hint;
+	char	   *relation_names;
 
 	initStringInfo(&hint);
 
 	switch (nodeTag(plan))
 	{
 		case T_NestLoop:
-			appendStringInfo(&hint, "NestLoop(...)");
+			/* Extract relation names from the join */
+			relation_names = extract_relation_names_from_plan(plan);
+			if (relation_names)
+			{
+				appendStringInfo(&hint, "NestLoop%s", relation_names);
+				pfree(relation_names);
+			}
+			else
+			{
+				appendStringInfo(&hint, "NestLoop(...)");
+			}
 			return hint.data;
 
 		case T_HashJoin:
-			appendStringInfo(&hint, "HashJoin(...)");
+			/* Extract relation names from the join */
+			relation_names = extract_relation_names_from_plan(plan);
+			if (relation_names)
+			{
+				appendStringInfo(&hint, "HashJoin%s", relation_names);
+				pfree(relation_names);
+			}
+			else
+			{
+				appendStringInfo(&hint, "HashJoin(...)");
+			}
 			return hint.data;
 
 		case T_MergeJoin:
-			appendStringInfo(&hint, "MergeJoin(...)");
+			/* Extract relation names from the join */
+			relation_names = extract_relation_names_from_plan(plan);
+			if (relation_names)
+			{
+				appendStringInfo(&hint, "MergeJoin%s", relation_names);
+				pfree(relation_names);
+			}
+			else
+			{
+				appendStringInfo(&hint, "MergeJoin(...)");
+			}
 			return hint.data;
 
 		default:
@@ -749,7 +780,8 @@ get_leading_hint_from_join(Plan *plan)
 			if (relation_names)
 			{
 				initStringInfo(&hint);
-				appendStringInfo(&hint, "Leading%s", relation_names);
+				/* Always use nested format - wrap in outer parentheses */
+				appendStringInfo(&hint, "Leading(%s)", relation_names);
 				pfree(relation_names);
 				return hint.data;
 			}
