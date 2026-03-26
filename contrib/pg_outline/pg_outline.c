@@ -863,6 +863,7 @@ display_outline_data(void)
 			appendStringInfo(&outline, "END_OUTLINE_DATA\n*/\n");
 
 			elog(NOTICE, "Generated Outline Data:%s", outline.data);
+			/* Note: outline.data will be freed when memory context is reset */
 			current_outline->displayed = true;
 		}
 	}
