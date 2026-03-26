@@ -117,6 +117,9 @@ typedef struct QueryHintPosition
 	char	   *hint_text;		/* Hint text extracted from comment */
 } QueryHintPosition;
 
+/* Memory context for pg_outline data that persists across queries */
+static MemoryContext OutlineContext = NULL;
+
 /* Current outline being processed */
 static OutlineInfo *current_outline = NULL;
 
@@ -224,6 +227,11 @@ _PG_init(void)
 
 	prev_ExplainOneQuery_hook = ExplainOneQuery_hook;
 	ExplainOneQuery_hook = outline_ExplainOneQuery;
+
+	/* Create memory context for outline data */
+	OutlineContext = AllocSetContextCreate(TopMemoryContext,
+										   "OutlineContext",
+										   ALLOCSET_DEFAULT_SIZES);
 
 	elog(LOG, "pg_outline extension loaded");
 }
@@ -375,15 +383,15 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 			/* Initialize current outline if needed */
 			if (current_outline == NULL)
 			{
-				oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+				oldcontext = MemoryContextSwitchTo(OutlineContext);
 				current_outline = (OutlineInfo *) palloc0(sizeof(OutlineInfo));
 				current_outline->hints = NIL;
 				MemoryContextSwitchTo(oldcontext);
 			}
 
-			/* Generate outline from the plan - must be in TopMemoryContext
+			/* Generate outline from the plan - must be in OutlineContext
 			 * so hint strings survive across memory context resets */
-			oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+			oldcontext = MemoryContextSwitchTo(OutlineContext);
 			generate_outline_from_plan(plan, queryString);
 			MemoryContextSwitchTo(oldcontext);
 
@@ -450,30 +458,13 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 		display_outline_data();
 	}
 
-	/* Clean up current outline after displaying/storing */
-	if (current_outline)
+	/* Reset outline context for next query - this frees all memory at once */
+	if (OutlineContext)
 	{
-		/* Free the hints list - elements are palloc'd strings */
-		if (current_outline->hints)
-			list_free_deep(current_outline->hints);
-
-		/* Free the outline_data StringInfo structure */
-		if (current_outline->outline_data)
-		{
-			if (current_outline->outline_data->data)
-				pfree(current_outline->outline_data->data);
-			pfree(current_outline->outline_data);
-		}
-
-		/* Free query_string if it was allocated */
-		if (current_outline->query_string)
-			pfree(current_outline->query_string);
-
-		pfree(current_outline);
-		current_outline = NULL;
+		MemoryContextReset(OutlineContext);
+		current_outline = NULL;  /* Pointer is now invalid after reset */
 	}
 }
-
 /*
  * Generate outline hints from a planned statement
  */
