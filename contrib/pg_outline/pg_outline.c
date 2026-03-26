@@ -160,6 +160,7 @@ static void store_outline_hints(const char *outline_name, const char *query_patt
 static void store_outline_with_query_hints(const char *outline_name, const char *query_pattern,
 										   const char *fingerprint, Query *query);
 static char *retrieve_outline_hints(const char *fingerprint);
+static bool outline_exists(const char *outline_name);
 
 /* Inline hint extraction */
 static List *extract_inline_hints_with_positions(const char *query_string);
@@ -433,12 +434,24 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 							}
 						}
 
-						/* Display the command to store this outline */
-						elog(NOTICE, "To store this outline, execute:\n"
-							 "SELECT pg_outline_create('%s', %s, %s);",
-							 outline_name.data,
-							 quote_literal_cstr(queryString),
-							 quote_literal_cstr(hints_buf.data));
+						/* Check if outline already exists */
+						if (outline_exists(outline_name.data))
+						{
+							/* Outline already exists - notify user */
+							elog(NOTICE, "An outline named '%s' already exists for this query.\n"
+								 "The existing outline will be used when the query is executed.",
+								 outline_name.data);
+						}
+						else
+						{
+							/* Display the command to store this outline */
+							elog(NOTICE, "To store this outline, execute:\n"
+								 "SELECT pg_outline_create('%s', %s, %s);",
+								 outline_name.data,
+								 quote_literal_cstr(queryString),
+								 quote_literal_cstr(hints_buf.data));
+						}
+
 					/* Free the StringInfoData buffers */
 					pfree(outline_name.data);
 					pfree(hints_buf.data);
@@ -1039,6 +1052,43 @@ retrieve_outline_hints(const char *fingerprint)
 	SPI_finish();
 
 	return hints;
+}
+
+/*
+ * Check if an outline with the given name exists in the database
+ */
+static bool
+outline_exists(const char *outline_name)
+{
+	int			ret;
+	bool		exists = false;
+	StringInfoData query;
+
+	if (!outline_name)
+		return false;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(WARNING, "pg_outline: SPI_connect failed");
+		return false;
+	}
+
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "SELECT 1 FROM pg_outline_data "
+					 "WHERE outline_name = %s "
+					 "LIMIT 1",
+					 quote_literal_cstr(outline_name));
+
+	ret = SPI_execute(query.data, true, 1);
+
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+		exists = true;
+
+	pfree(query.data);
+	SPI_finish();
+
+	return exists;
 }
 
 /*
