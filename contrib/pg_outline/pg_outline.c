@@ -361,14 +361,9 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 					   &planduration);
 	}
 
-	/* In auto mode, generate and store outline for EXPLAIN statements */
+	/* In auto mode, generate and display outline for EXPLAIN statements */
 	if (pg_outline_enabled && strcmp(pg_outline_mode, "auto") == 0 && queryString)
 	{
-		char *normalized;
-		char *fingerprint;
-		char *hints_str;
-		StringInfoData outline_name;
-
 		/* Get the plan if we don't have it yet */
 		if (plan == NULL)
 			plan = current_plannedstmt;
@@ -393,58 +388,52 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 				/* Display outline data if enabled */
 				if (pg_outline_display_hints)
 				{
-					display_outline_data();
-				}
-
-				/* Store the outline automatically */
-				normalized = normalize_query(queryString);
-				fingerprint = compute_query_fingerprint(normalized);
-
-				if (fingerprint)
-				{
-					ListCell *lc;
+					char *normalized;
+					char *fingerprint;
+					StringInfoData outline_name;
 					StringInfoData hints_buf;
+					ListCell *lc;
 					bool first = true;
 
-					/* Generate outline name using fingerprint */
-					initStringInfo(&outline_name);
-					appendStringInfo(&outline_name, "auto_outline_%s", fingerprint);
+					display_outline_data();
 
-					/* Format hints as a single string */
-					initStringInfo(&hints_buf);
-					foreach(lc, current_outline->hints)
+					/* Generate outline creation command for user to execute */
+					normalized = normalize_query(queryString);
+					fingerprint = compute_query_fingerprint(normalized);
+
+					if (fingerprint)
 					{
-						char *hint = (char *) lfirst(lc);
-						if (hint)
+						/* Generate outline name using fingerprint */
+						initStringInfo(&outline_name);
+						appendStringInfo(&outline_name, "auto_outline_%s", fingerprint);
+
+						/* Format hints as a single string */
+						initStringInfo(&hints_buf);
+						foreach(lc, current_outline->hints)
 						{
-							if (!first)
-								appendStringInfoChar(&hints_buf, '\n');
-							appendStringInfoString(&hints_buf, hint);
-							first = false;
+							char *hint = (char *) lfirst(lc);
+							if (hint)
+							{
+								if (!first)
+									appendStringInfoChar(&hints_buf, '\n');
+								appendStringInfoString(&hints_buf, hint);
+								first = false;
+							}
 						}
+
+						/* Display the command to store this outline */
+						elog(NOTICE, "To store this outline, execute:\n"
+							 "SELECT pg_outline_create('%s', %s, %s);",
+							 outline_name.data,
+							 quote_literal_cstr(queryString),
+							 quote_literal_cstr(hints_buf.data));
 					}
 
-					hints_str = hints_buf.data;
-
-					/* Store the outline - wrapped in PG_TRY to handle errors */
-					PG_TRY();
-					{
-						store_outline_hints(outline_name.data, queryString, fingerprint, hints_str);
-						elog(NOTICE, "pg_outline: auto-created outline '%s'", outline_name.data);
-					}
-					PG_CATCH();
-					{
-						/* If storage fails, just log a warning and continue */
-						elog(WARNING, "pg_outline: failed to auto-store outline");
-						FlushErrorState();
-					}
-					PG_END_TRY();
+					if (normalized)
+						pfree(normalized);
+					if (fingerprint)
+						pfree(fingerprint);
 				}
-
-				if (normalized)
-					pfree(normalized);
-				if (fingerprint)
-					pfree(fingerprint);
 			}
 		}
 	}
@@ -457,10 +446,22 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	/* Clean up current outline after displaying/storing */
 	if (current_outline)
 	{
+		/* Free the hints list - elements are palloc'd strings */
 		if (current_outline->hints)
 			list_free_deep(current_outline->hints);
+
+		/* Free the outline_data StringInfo structure */
 		if (current_outline->outline_data)
-			pfree(current_outline->outline_data->data);
+		{
+			if (current_outline->outline_data->data)
+				pfree(current_outline->outline_data->data);
+			pfree(current_outline->outline_data);
+		}
+
+		/* Free query_string if it was allocated */
+		if (current_outline->query_string)
+			pfree(current_outline->query_string);
+
 		pfree(current_outline);
 		current_outline = NULL;
 	}
@@ -804,6 +805,7 @@ static StringInfo
 format_outline_data(List *hints)
 {
 	StringInfoData result;
+	StringInfo ret;
 	ListCell   *lc;
 	bool		first = true;
 
@@ -826,7 +828,11 @@ format_outline_data(List *hints)
 
 	appendStringInfo(&result, "\nEND_OUTLINE_DATA\n*/");
 
-	return makeStringInfo();  /* Return initialized StringInfo */
+	/* Allocate a StringInfo structure and copy the result */
+	ret = makeStringInfo();
+	appendStringInfoString(ret, result.data);
+	pfree(result.data);  /* Free the local StringInfoData's buffer */
+	return ret;
 }
 
 /*
