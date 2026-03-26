@@ -421,7 +421,7 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 
 						/* Generate outline name using short fingerprint */
 						initStringInfo(&outline_name);
-						appendStringInfo(&outline_name, "auto_outline_%s", short_fp);
+						appendStringInfo(&outline_name, "outline_%s", short_fp);
 						pfree(short_fp);
 
 						/* Format hints as a single string */
