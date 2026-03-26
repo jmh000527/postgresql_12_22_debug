@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS pg_outline_data (
     outline_id SERIAL PRIMARY KEY,
     outline_name TEXT NOT NULL UNIQUE,
     query_pattern TEXT NOT NULL,
+    fingerprint TEXT,
     hint_string TEXT NOT NULL,
     enabled BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -83,13 +84,14 @@ RETURNS TABLE (
     outline_id INTEGER,
     outline_name TEXT,
     query_pattern TEXT,
+    fingerprint TEXT,
     hint_string TEXT,
     enabled BOOLEAN,
     created_at TIMESTAMP,
     updated_at TIMESTAMP
 )
 AS $$
-    SELECT outline_id, outline_name, query_pattern, hint_string,
+    SELECT outline_id, outline_name, query_pattern, fingerprint, hint_string,
            enabled, created_at, updated_at
     FROM pg_outline_data
     ORDER BY outline_id;
@@ -97,7 +99,7 @@ $$ LANGUAGE SQL;
 
 -- Create a view for easy access to enabled outlines
 CREATE OR REPLACE VIEW pg_outline_enabled AS
-    SELECT outline_id, outline_name, query_pattern, hint_string, created_at, updated_at
+    SELECT outline_id, outline_name, query_pattern, fingerprint, hint_string, created_at, updated_at
     FROM pg_outline_data
     WHERE enabled = true;
 

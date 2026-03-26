@@ -153,6 +153,7 @@ static StringInfo format_outline_data(List *hints);
 /* Query fingerprinting */
 static char *normalize_query(const char *query_string);
 static char *compute_query_fingerprint(const char *normalized_query);
+static char *get_short_fingerprint(const char *fingerprint);
 
 /* Hint storage and retrieval */
 static void store_outline_hints(const char *outline_name, const char *query_pattern,
@@ -416,9 +417,12 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 
 					if (fingerprint)
 					{
-						/* Generate outline name using fingerprint */
+						char	   *short_fp = get_short_fingerprint(fingerprint);
+
+						/* Generate outline name using short fingerprint */
 						initStringInfo(&outline_name);
-						appendStringInfo(&outline_name, "auto_outline_%s", fingerprint);
+						appendStringInfo(&outline_name, "auto_outline_%s", short_fp);
+						pfree(short_fp);
 
 						/* Format hints as a single string */
 						initStringInfo(&hints_buf);
@@ -958,7 +962,7 @@ normalize_query(const char *query_string)
 
 /*
  * Compute MD5 fingerprint of normalized query
- * Returns first 12 characters of MD5 hash for shorter outline names
+ * Returns the full 32-character MD5 hash
  */
 static char *
 compute_query_fingerprint(const char *normalized_query)
@@ -973,9 +977,26 @@ compute_query_fingerprint(const char *normalized_query)
 	if (!pg_md5_hash(normalized_query, strlen(normalized_query), hexsum))
 		return NULL;
 
-	/* Use only first 12 characters for shorter outline names */
-	hexsum[12] = '\0';
+	/* Return the full 32-character hash */
 	result = pstrdup(hexsum);
+
+	return result;
+}
+
+/*
+ * Generate short outline name from fingerprint
+ * Uses first 12 characters of the fingerprint
+ */
+static char *
+get_short_fingerprint(const char *fingerprint)
+{
+	char	   *result;
+
+	if (!fingerprint)
+		return NULL;
+
+	/* Use only first 12 characters for shorter outline names */
+	result = pnstrdup(fingerprint, 12);
 
 	return result;
 }
@@ -998,14 +1019,16 @@ store_outline_hints(const char *outline_name, const char *query_pattern,
 
 	initStringInfo(&query);
 	appendStringInfo(&query,
-					 "INSERT INTO pg_outline_data (outline_name, query_pattern, hint_string, enabled) "
-					 "VALUES (%s, %s, %s, true) "
+					 "INSERT INTO pg_outline_data (outline_name, query_pattern, fingerprint, hint_string, enabled) "
+					 "VALUES (%s, %s, %s, %s, true) "
 					 "ON CONFLICT (outline_name) DO UPDATE SET "
 					 "query_pattern = EXCLUDED.query_pattern, "
+					 "fingerprint = EXCLUDED.fingerprint, "
 					 "hint_string = EXCLUDED.hint_string, "
 					 "updated_at = CURRENT_TIMESTAMP",
 					 quote_literal_cstr(outline_name),
 					 quote_literal_cstr(query_pattern),
+					 fingerprint ? quote_literal_cstr(fingerprint) : "NULL",
 					 quote_literal_cstr(hints));
 
 	ret = SPI_execute(query.data, false, 0);
@@ -1265,14 +1288,16 @@ store_outline_with_query_hints(const char *outline_name, const char *query_patte
 	/* First, insert/update the outline record */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "INSERT INTO pg_outline_data (outline_name, query_pattern, hint_string, enabled) "
-					 "VALUES (%s, %s, '', true) "
+					 "INSERT INTO pg_outline_data (outline_name, query_pattern, fingerprint, hint_string, enabled) "
+					 "VALUES (%s, %s, %s, '', true) "
 					 "ON CONFLICT (outline_name) DO UPDATE SET "
 					 "query_pattern = EXCLUDED.query_pattern, "
+					 "fingerprint = EXCLUDED.fingerprint, "
 					 "updated_at = CURRENT_TIMESTAMP "
 					 "RETURNING outline_id",
 					 quote_literal_cstr(outline_name),
-					 quote_literal_cstr(query_pattern));
+					 quote_literal_cstr(query_pattern),
+					 fingerprint ? quote_literal_cstr(fingerprint) : "NULL");
 
 	ret = SPI_execute(sql.data, false, 0);
 
