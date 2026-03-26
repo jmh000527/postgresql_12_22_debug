@@ -146,6 +146,7 @@ static char *get_join_method_hint(Plan *plan);
 static char *get_leading_hint(Plan *plan);
 static char *get_leading_hint_from_join(Plan *plan);
 static char *extract_relation_names_from_plan(Plan *plan);
+static char *extract_relation_names_flat(Plan *plan);
 static char *get_relation_name(Index relid, PlannedStmt *plan);
 static void display_outline_data(void);
 static StringInfo format_outline_data(List *hints);
@@ -616,11 +617,11 @@ get_join_method_hint(Plan *plan)
 	switch (nodeTag(plan))
 	{
 		case T_NestLoop:
-			/* Extract relation names from the join */
-			relation_names = extract_relation_names_from_plan(plan);
+			/* Extract relation names from the join in flat format */
+			relation_names = extract_relation_names_flat(plan);
 			if (relation_names)
 			{
-				appendStringInfo(&hint, "NestLoop%s", relation_names);
+				appendStringInfo(&hint, "NestLoop(%s)", relation_names);
 				pfree(relation_names);
 			}
 			else
@@ -630,11 +631,11 @@ get_join_method_hint(Plan *plan)
 			return hint.data;
 
 		case T_HashJoin:
-			/* Extract relation names from the join */
-			relation_names = extract_relation_names_from_plan(plan);
+			/* Extract relation names from the join in flat format */
+			relation_names = extract_relation_names_flat(plan);
 			if (relation_names)
 			{
-				appendStringInfo(&hint, "HashJoin%s", relation_names);
+				appendStringInfo(&hint, "HashJoin(%s)", relation_names);
 				pfree(relation_names);
 			}
 			else
@@ -644,11 +645,11 @@ get_join_method_hint(Plan *plan)
 			return hint.data;
 
 		case T_MergeJoin:
-			/* Extract relation names from the join */
-			relation_names = extract_relation_names_from_plan(plan);
+			/* Extract relation names from the join in flat format */
+			relation_names = extract_relation_names_flat(plan);
 			if (relation_names)
 			{
-				appendStringInfo(&hint, "MergeJoin%s", relation_names);
+				appendStringInfo(&hint, "MergeJoin(%s)", relation_names);
 				pfree(relation_names);
 			}
 			else
@@ -749,6 +750,98 @@ extract_relation_names_from_plan(Plan *plan)
 			if (plan->righttree)
 			{
 				right_str = extract_relation_names_from_plan(plan->righttree);
+				if (right_str)
+					return right_str;
+			}
+			return NULL;
+	}
+}
+
+/*
+ * Extract relation names from a plan tree in flat format (space-separated list)
+ * Used for Join hints which should not have nested parentheses
+ * For example: "t1 t2 t3" instead of "(t1 (t2 t3))"
+ */
+static char *
+extract_relation_names_flat(Plan *plan)
+{
+	StringInfoData result;
+	char	   *left_str;
+	char	   *right_str;
+	char	   *relname;
+
+	if (plan == NULL)
+		return NULL;
+
+	initStringInfo(&result);
+
+	/* Check if this is a join node */
+	switch (nodeTag(plan))
+	{
+		case T_NestLoop:
+		case T_HashJoin:
+		case T_MergeJoin:
+			/* Recursively get relation names from left and right subtrees */
+			left_str = extract_relation_names_flat(plan->lefttree);
+			right_str = extract_relation_names_flat(plan->righttree);
+
+			if (left_str && right_str)
+			{
+				/* Build flat format: left right (space-separated) */
+				appendStringInfo(&result, "%s %s", left_str, right_str);
+				pfree(left_str);
+				pfree(right_str);
+				return result.data;
+			}
+			else if (left_str)
+			{
+				pfree(left_str);
+				return NULL;
+			}
+			else if (right_str)
+			{
+				pfree(right_str);
+				return NULL;
+			}
+			return NULL;
+
+		case T_SeqScan:
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+		case T_BitmapHeapScan:
+			/* Extract relation name from scan node */
+			relname = get_relation_name(((Scan *) plan)->scanrelid, current_plannedstmt);
+			if (relname)
+			{
+				/* Use just the base relation name (without AS alias part) */
+				char	   *space_pos = strchr(relname, ' ');
+
+				if (space_pos)
+				{
+					/* Extract just the base name before " AS " */
+					size_t		len = space_pos - relname;
+					char	   *base_name = palloc(len + 1);
+
+					memcpy(base_name, relname, len);
+					base_name[len] = '\0';
+					pfree(relname);
+					return base_name;
+				}
+				return relname;
+			}
+			return NULL;
+
+		default:
+			/* For other node types, try to recurse into child plans */
+			if (plan->lefttree)
+			{
+				left_str = extract_relation_names_flat(plan->lefttree);
+				if (left_str)
+					return left_str;
+			}
+			if (plan->righttree)
+			{
+				right_str = extract_relation_names_flat(plan->righttree);
 				if (right_str)
 					return right_str;
 			}
