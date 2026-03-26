@@ -283,28 +283,8 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	/* Save PlannedStmt for relation name resolution */
 	current_plannedstmt = result;
 
-	/* Generate outline if enabled and in auto mode */
-	if (pg_outline_enabled && strcmp(pg_outline_mode, "auto") == 0)
-	{
-		/* Initialize current outline if needed */
-		if (current_outline == NULL)
-		{
-			MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-			current_outline = (OutlineInfo *) palloc0(sizeof(OutlineInfo));
-			current_outline->hints = NIL;
-			current_outline->outline_data = makeStringInfo();
-			MemoryContextSwitchTo(oldcontext);
-		}
-
-		/* Store query string for later use */
-		if (debug_query_string)
-		{
-			generate_outline_from_plan(result, debug_query_string);
-			/* Note: Outline data is NOT displayed here.
-			 * It will be displayed in the ExplainOneQuery hook for EXPLAIN statements only.
-			 * For normal queries, the outline is generated but cleaned up without display. */
-		}
-	}
+	/* Note: In auto mode, outline generation is only done for EXPLAIN statements
+	 * in the ExplainOneQuery hook. Normal queries don't generate outlines. */
 
 	return result;
 }
@@ -349,13 +329,15 @@ outline_ExecutorEnd(QueryDesc *queryDesc)
 }
 
 /*
- * ExplainOneQuery hook: display outline data for EXPLAIN statements
+ * ExplainOneQuery hook: display and store outline data for EXPLAIN statements
  */
 static void
 outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 						ExplainState *es, const char *queryString,
 						ParamListInfo params, QueryEnvironment *queryEnv)
 {
+	PlannedStmt *plan = NULL;
+
 	/* Call the previous hook or default behavior first */
 	if (prev_ExplainOneQuery_hook)
 		(*prev_ExplainOneQuery_hook)(query, cursorOptions, into, es,
@@ -363,7 +345,6 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	else
 	{
 		/* Default EXPLAIN behavior */
-		PlannedStmt *plan;
 		instr_time	planstart,
 					planduration;
 
@@ -380,13 +361,100 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 					   &planduration);
 	}
 
-	/* Display outline data if enabled and available */
-	if (pg_outline_display_hints && current_outline)
+	/* In auto mode, generate and store outline for EXPLAIN statements */
+	if (pg_outline_enabled && strcmp(pg_outline_mode, "auto") == 0 && queryString)
 	{
+		char *normalized;
+		char *fingerprint;
+		char *hints_str;
+		StringInfoData outline_name;
+
+		/* Get the plan if we don't have it yet */
+		if (plan == NULL)
+			plan = current_plannedstmt;
+
+		if (plan)
+		{
+			/* Initialize current outline if needed */
+			if (current_outline == NULL)
+			{
+				MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+				current_outline = (OutlineInfo *) palloc0(sizeof(OutlineInfo));
+				current_outline->hints = NIL;
+				current_outline->outline_data = makeStringInfo();
+				MemoryContextSwitchTo(oldcontext);
+			}
+
+			/* Generate outline from the plan */
+			generate_outline_from_plan(plan, queryString);
+
+			if (current_outline && current_outline->hints && list_length(current_outline->hints) > 0)
+			{
+				/* Display outline data if enabled */
+				if (pg_outline_display_hints)
+				{
+					display_outline_data();
+				}
+
+				/* Store the outline automatically */
+				normalized = normalize_query(queryString);
+				fingerprint = compute_query_fingerprint(normalized);
+
+				if (fingerprint)
+				{
+					ListCell *lc;
+					StringInfoData hints_buf;
+					bool first = true;
+
+					/* Generate outline name using fingerprint */
+					initStringInfo(&outline_name);
+					appendStringInfo(&outline_name, "auto_outline_%s", fingerprint);
+
+					/* Format hints as a single string */
+					initStringInfo(&hints_buf);
+					foreach(lc, current_outline->hints)
+					{
+						char *hint = (char *) lfirst(lc);
+						if (hint)
+						{
+							if (!first)
+								appendStringInfoChar(&hints_buf, '\n');
+							appendStringInfoString(&hints_buf, hint);
+							first = false;
+						}
+					}
+
+					hints_str = hints_buf.data;
+
+					/* Store the outline - wrapped in PG_TRY to handle errors */
+					PG_TRY();
+					{
+						store_outline_hints(outline_name.data, queryString, fingerprint, hints_str);
+						elog(NOTICE, "pg_outline: auto-created outline '%s'", outline_name.data);
+					}
+					PG_CATCH();
+					{
+						/* If storage fails, just log a warning and continue */
+						elog(WARNING, "pg_outline: failed to auto-store outline");
+						FlushErrorState();
+					}
+					PG_END_TRY();
+				}
+
+				if (normalized)
+					pfree(normalized);
+				if (fingerprint)
+					pfree(fingerprint);
+			}
+		}
+	}
+	else if (pg_outline_display_hints && current_outline)
+	{
+		/* Not in auto mode but display is enabled - just display without storing */
 		display_outline_data();
 	}
 
-	/* Clean up current outline after displaying */
+	/* Clean up current outline after displaying/storing */
 	if (current_outline)
 	{
 		if (current_outline->hints)
