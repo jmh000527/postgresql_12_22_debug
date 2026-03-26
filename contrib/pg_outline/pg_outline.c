@@ -370,18 +370,23 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 
 		if (plan)
 		{
+			MemoryContext oldcontext;
+
 			/* Initialize current outline if needed */
 			if (current_outline == NULL)
 			{
-				MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+				oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 				current_outline = (OutlineInfo *) palloc0(sizeof(OutlineInfo));
 				current_outline->hints = NIL;
 				current_outline->outline_data = makeStringInfo();
 				MemoryContextSwitchTo(oldcontext);
 			}
 
-			/* Generate outline from the plan */
+			/* Generate outline from the plan - must be in TopMemoryContext
+			 * so hint strings survive across memory context resets */
+			oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 			generate_outline_from_plan(plan, queryString);
+			MemoryContextSwitchTo(oldcontext);
 
 			if (current_outline && current_outline->hints && list_length(current_outline->hints) > 0)
 			{
