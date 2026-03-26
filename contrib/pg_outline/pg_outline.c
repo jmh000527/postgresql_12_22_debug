@@ -958,11 +958,13 @@ normalize_query(const char *query_string)
 
 /*
  * Compute MD5 fingerprint of normalized query
+ * Returns first 12 characters of MD5 hash for shorter outline names
  */
 static char *
 compute_query_fingerprint(const char *normalized_query)
 {
 	char		hexsum[33];  /* MD5 hex string: 32 chars + null terminator */
+	char		*result;
 
 	if (!normalized_query)
 		return NULL;
@@ -971,7 +973,11 @@ compute_query_fingerprint(const char *normalized_query)
 	if (!pg_md5_hash(normalized_query, strlen(normalized_query), hexsum))
 		return NULL;
 
-	return pstrdup(hexsum);
+	/* Use only first 12 characters for shorter outline names */
+	hexsum[12] = '\0';
+	result = pstrdup(hexsum);
+
+	return result;
 }
 
 /*
