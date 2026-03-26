@@ -42,7 +42,7 @@ CREATE OR REPLACE FUNCTION pg_outline_create(
 )
 RETURNS BOOLEAN
 AS 'MODULE_PATHNAME', 'pg_outline_create'
-LANGUAGE C STRICT;
+LANGUAGE C;
 
 -- Simplified function to create an outline from SQL with inline hints
 CREATE OR REPLACE FUNCTION pg_outline_create_from_sql(

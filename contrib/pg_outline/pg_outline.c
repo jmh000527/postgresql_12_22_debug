@@ -1411,12 +1411,24 @@ pg_outline_create(PG_FUNCTION_ARGS)
 {
 	text	   *outline_name = PG_GETARG_TEXT_PP(0);
 	text	   *query_text = PG_GETARG_TEXT_PP(1);
-	text	   *hints_text = PG_GETARG_TEXT_PP(2);
-	char	   *name_str = text_to_cstring(outline_name);
-	char	   *query_str = text_to_cstring(query_text);
-	char	   *hints_str = text_to_cstring(hints_text);
+	char	   *name_str;
+	char	   *query_str;
+	char	   *hints_str;
 	char	   *normalized;
 	char	   *fingerprint;
+
+	/* Check for NULL arguments */
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+
+	name_str = text_to_cstring(outline_name);
+	query_str = text_to_cstring(query_text);
+
+	/* Handle optional hints parameter */
+	if (PG_ARGISNULL(2))
+		hints_str = pstrdup("");  /* Use empty string for NULL hints */
+	else
+		hints_str = text_to_cstring(PG_GETARG_TEXT_PP(2));
 
 	/* Normalize query and compute fingerprint */
 	normalized = normalize_query(query_str);
@@ -1432,6 +1444,7 @@ pg_outline_create(PG_FUNCTION_ARGS)
 		pfree(normalized);
 	if (fingerprint)
 		pfree(fingerprint);
+	pfree(hints_str);
 
 	PG_RETURN_BOOL(true);
 }
