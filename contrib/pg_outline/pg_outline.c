@@ -50,9 +50,11 @@
 #include "parser/analyze.h"
 #include "parser/parser.h"
 #include "parser/parsetree.h"
+#include "portability/instr_time.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -78,6 +80,7 @@ static char *pg_outline_mode = "auto";  /* auto, manual, off */
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+static ExplainOneQuery_hook_type prev_ExplainOneQuery_hook = NULL;
 
 /* Data structures for outline hints */
 typedef enum OutlineHintType
@@ -128,6 +131,10 @@ static PlannedStmt *outline_planner(Query *parse, int cursorOptions,
 									ParamListInfo boundParams);
 static void outline_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void outline_ExecutorEnd(QueryDesc *queryDesc);
+static void outline_ExplainOneQuery(Query *query, int cursorOptions,
+									IntoClause *into, ExplainState *es,
+									const char *queryString, ParamListInfo params,
+									QueryEnvironment *queryEnv);
 
 static void generate_outline_from_plan(PlannedStmt *plan, const char *query_string);
 static void extract_hints_from_plan_tree(Plan *plan, List **hints, int level);
@@ -215,6 +222,9 @@ _PG_init(void)
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = outline_ExecutorEnd;
 
+	prev_ExplainOneQuery_hook = ExplainOneQuery_hook;
+	ExplainOneQuery_hook = outline_ExplainOneQuery;
+
 	elog(LOG, "pg_outline extension loaded");
 }
 
@@ -228,6 +238,7 @@ _PG_fini(void)
 	planner_hook = prev_planner_hook;
 	ExecutorStart_hook = prev_ExecutorStart;
 	ExecutorEnd_hook = prev_ExecutorEnd;
+	ExplainOneQuery_hook = prev_ExplainOneQuery_hook;
 
 	elog(LOG, "pg_outline extension unloaded");
 }
@@ -275,18 +286,23 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	/* Generate outline if enabled and in auto mode */
 	if (pg_outline_enabled && strcmp(pg_outline_mode, "auto") == 0)
 	{
+		/* Initialize current outline if needed */
+		if (current_outline == NULL)
+		{
+			MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+			current_outline = (OutlineInfo *) palloc0(sizeof(OutlineInfo));
+			current_outline->hints = NIL;
+			current_outline->outline_data = makeStringInfo();
+			MemoryContextSwitchTo(oldcontext);
+		}
+
 		/* Store query string for later use */
 		if (debug_query_string)
 		{
 			generate_outline_from_plan(result, debug_query_string);
-
-			/* Display outline data immediately after planning.
-			 * This will show for EXPLAIN statements (which only plan, not execute).
-			 * For normal queries, the outline is cleaned up in ExecutorEnd without display. */
-			if (pg_outline_display_hints && current_outline)
-			{
-				display_outline_data();
-			}
+			/* Note: Outline data is NOT displayed here.
+			 * It will be displayed in the ExplainOneQuery hook for EXPLAIN statements only.
+			 * For normal queries, the outline is generated but cleaned up without display. */
 		}
 	}
 
@@ -315,16 +331,62 @@ outline_ExecutorStart(QueryDesc *queryDesc, int eflags)
 }
 
 /*
- * ExecutorEnd hook: display outline data if enabled
+ * ExecutorEnd hook: no cleanup needed
  */
 static void
 outline_ExecutorEnd(QueryDesc *queryDesc)
 {
-	/* Note: We do NOT display outline data here for normal queries.
-	 * Outline data is only displayed for EXPLAIN statements in the planner hook.
-	 * Normal queries should not show outline data to avoid cluttering output. */
+	/* Note: We do NOT clean up current_outline here.
+	 * For EXPLAIN statements, the ExplainOneQuery hook will clean up after displaying.
+	 * For normal queries, memory will be freed at transaction end since it's in TopMemoryContext.
+	 * This avoids the issue where ExecutorEnd is called before ExplainOneQuery can display. */
 
-	/* Clean up current outline */
+	/* Call previous hook or standard ExecutorEnd */
+	if (prev_ExecutorEnd)
+		prev_ExecutorEnd(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+}
+
+/*
+ * ExplainOneQuery hook: display outline data for EXPLAIN statements
+ */
+static void
+outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
+						ExplainState *es, const char *queryString,
+						ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	/* Call the previous hook or default behavior first */
+	if (prev_ExplainOneQuery_hook)
+		(*prev_ExplainOneQuery_hook)(query, cursorOptions, into, es,
+									 queryString, params, queryEnv);
+	else
+	{
+		/* Default EXPLAIN behavior */
+		PlannedStmt *plan;
+		instr_time	planstart,
+					planduration;
+
+		INSTR_TIME_SET_CURRENT(planstart);
+
+		/* plan the query */
+		plan = pg_plan_query(query, cursorOptions, params);
+
+		INSTR_TIME_SET_CURRENT(planduration);
+		INSTR_TIME_SUBTRACT(planduration, planstart);
+
+		/* run it (if needed) and produce output */
+		ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
+					   &planduration);
+	}
+
+	/* Display outline data if enabled and available */
+	if (pg_outline_display_hints && current_outline)
+	{
+		display_outline_data();
+	}
+
+	/* Clean up current outline after displaying */
 	if (current_outline)
 	{
 		if (current_outline->hints)
@@ -334,12 +396,6 @@ outline_ExecutorEnd(QueryDesc *queryDesc)
 		pfree(current_outline);
 		current_outline = NULL;
 	}
-
-	/* Call previous hook or standard ExecutorEnd */
-	if (prev_ExecutorEnd)
-		prev_ExecutorEnd(queryDesc);
-	else
-		standard_ExecutorEnd(queryDesc);
 }
 
 /*
