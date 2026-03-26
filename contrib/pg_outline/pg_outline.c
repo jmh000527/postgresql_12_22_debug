@@ -1060,9 +1060,18 @@ normalize_query(const char *query_string)
 			continue;
 		}
 
-		/* Replace numbers with placeholder */
+		/* Replace standalone numbers with placeholder, but preserve identifiers */
 		if (isdigit(*p))
 		{
+			/* Check if this is part of an identifier (preceded by letter or underscore) */
+			if (p > query_string && (isalnum(*(p - 1)) || *(p - 1) == '_'))
+			{
+				/* Part of an identifier like t1, c2 - keep it */
+				appendStringInfoChar(&normalized, *p);
+				continue;
+			}
+
+			/* This is a standalone number - replace with placeholder */
 			while (isdigit(*p) || *p == '.')
 				p++;
 			p--;
