@@ -448,7 +448,7 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 							elog(NOTICE, "To store this outline, execute:\n"
 								 "SELECT pg_outline_create('%s', %s, %s);",
 								 outline_name.data,
-								 quote_literal_cstr(queryString),
+								 quote_literal_cstr(normalized),
 								 quote_literal_cstr(hints_buf.data));
 						}
 
@@ -1625,8 +1625,8 @@ pg_outline_create(PG_FUNCTION_ARGS)
 	normalized = normalize_query(query_str);
 	fingerprint = compute_query_fingerprint(normalized);
 
-	/* Store the outline */
-	store_outline_hints(name_str, query_str, fingerprint, hints_str);
+	/* Store the outline with normalized query as pattern */
+	store_outline_hints(name_str, normalized, fingerprint, hints_str);
 
 	elog(NOTICE, "pg_outline_create: outline '%s' created with fingerprint %s",
 		 name_str, fingerprint ? fingerprint : "none");
@@ -1744,9 +1744,9 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 
 	/*
 	 * Store the outline with per-Query hints
-	 * This stores hints separately for each Query structure in the tree
+	 * Use normalized query as the pattern for consistent matching
 	 */
-	store_outline_with_query_hints(name_str, query_without_hints, fingerprint, query);
+	store_outline_with_query_hints(name_str, normalized, fingerprint, query);
 
 	elog(NOTICE, "pg_outline_create_from_sql: outline '%s' created with fingerprint %s",
 		 name_str, fingerprint ? fingerprint : "none");
