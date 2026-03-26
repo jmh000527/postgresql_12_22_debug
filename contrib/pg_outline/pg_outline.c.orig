@@ -378,6 +378,7 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 				oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 				current_outline = (OutlineInfo *) palloc0(sizeof(OutlineInfo));
 				current_outline->hints = NIL;
+				current_outline->outline_data = makeStringInfo();
 				MemoryContextSwitchTo(oldcontext);
 			}
 
@@ -431,9 +432,6 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 							 outline_name.data,
 							 quote_literal_cstr(queryString),
 							 quote_literal_cstr(hints_buf.data));
-					/* Free the StringInfoData buffers */
-					pfree(outline_name.data);
-					pfree(hints_buf.data);
 					}
 
 					if (normalized)

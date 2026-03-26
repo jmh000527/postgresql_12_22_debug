@@ -1,0 +1,13 @@
+--- contrib/pg_outline/pg_outline.c
++++ contrib/pg_outline/pg_outline.c
+@@ -432,6 +432,10 @@
+ 						 outline_name.data,
+ 						 quote_literal_cstr(queryString),
+ 						 quote_literal_cstr(hints_buf.data));
++
++					/* Free the StringInfoData buffers */
++					pfree(outline_name.data);
++					pfree(hints_buf.data);
+ 				}
+ 
+ 				if (normalized)
