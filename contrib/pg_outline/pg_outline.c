@@ -248,6 +248,7 @@ typedef struct QueryHintCollector
 
 static void collect_query_hints_recursive(Query *query, QueryHintCollector *collector);
 static void extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query, List **hints);
+static void log_query_names_and_hints(Query *query);
 
 
 
@@ -508,6 +509,11 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 			if (list_length(hint_positions) > 0)
 			{
 				assign_hints_to_queries(query, hint_positions, queryString);
+
+				/* Log Query names and their hints for debugging */
+				elog(NOTICE, "=== Query Structure Analysis ===");
+				log_query_names_and_hints(query);
+				elog(NOTICE, "=== End of Query Structure Analysis ===");
 			}
 
 			/* Store the Query tree in current_outline for later use */
@@ -2892,6 +2898,110 @@ assign_hints_to_queries(Query *query, List *hint_positions, const char *source_t
 }
 
 /*
+ * Log Query names and their associated hints
+ * This walks the Query tree and logs each Query's name and hint for debugging
+ */
+static void
+log_query_names_and_hints(Query *query)
+{
+	ListCell   *lc;
+	char	   *query_name;
+	char	   *query_hints;
+
+	if (!query || !current_query_metadata)
+		return;
+
+	/* Get Query metadata from hash table */
+	query_name = get_query_name(query);
+	query_hints = get_query_hints(query);
+
+	/* Log this Query's name and hints */
+	if (query_name)
+	{
+		if (query_hints)
+		{
+			elog(NOTICE, "Query '%s' has hints: %s", query_name, query_hints);
+		}
+		else
+		{
+			elog(NOTICE, "Query '%s' has no hints", query_name);
+		}
+	}
+
+	/* Process subqueries in RTEs */
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery)
+		{
+			log_query_names_and_hints(rte->subquery);
+		}
+	}
+
+	/* Process CTEs */
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+		if (cte->ctequery)
+		{
+			Query *ctequery = castNode(Query, cte->ctequery);
+			log_query_names_and_hints(ctequery);
+		}
+	}
+
+	/* Process SubLinks in expressions */
+	/* We need a walker to traverse SubLinks */
+	typedef struct SubLinkLogContext
+	{
+		/* Currently no extra context needed */
+		int dummy;
+	} SubLinkLogContext;
+
+	bool log_sublink_walker(Node *node, SubLinkLogContext *context)
+	{
+		if (node == NULL)
+			return false;
+
+		if (IsA(node, SubLink))
+		{
+			SubLink *sublink = (SubLink *) node;
+
+			if (IsA(sublink->subselect, Query))
+			{
+				Query *subquery = (Query *) sublink->subselect;
+				log_query_names_and_hints(subquery);
+			}
+
+			return false;
+		}
+
+		if (IsA(node, Query))
+			return false;
+
+		return expression_tree_walker(node, log_sublink_walker, (void *) context);
+	}
+
+	SubLinkLogContext walker_context;
+	walker_context.dummy = 0;
+
+	/* Walk targetList (SELECT clause) */
+	log_sublink_walker((Node *) query->targetList, &walker_context);
+
+	/* Walk jointree quals (WHERE clause) */
+	if (query->jointree)
+		log_sublink_walker((Node *) query->jointree->quals, &walker_context);
+
+	/* Walk havingQual (HAVING clause) */
+	log_sublink_walker(query->havingQual, &walker_context);
+
+	/* Walk other expression fields that might contain SubLinks */
+	log_sublink_walker(query->limitOffset, &walker_context);
+	log_sublink_walker(query->limitCount, &walker_context);
+}
+
+/*
  * SQL function: create an outline for a query
  */
 Datum
@@ -3024,6 +3134,11 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 
 		/* Then assign hints to Query structures based on their locations */
 		assign_hints_to_queries(query, hint_positions, query_str);
+
+		/* Log Query names and their hints for debugging */
+		elog(NOTICE, "=== Query Structure Analysis ===");
+		log_query_names_and_hints(query);
+		elog(NOTICE, "=== End of Query Structure Analysis ===");
 
 		/*
 		 * Count how many Query structures have hints assigned
