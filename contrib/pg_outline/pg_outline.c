@@ -1560,28 +1560,34 @@ static void
 collect_query_hints_recursive(Query *query, QueryHintCollector *collector)
 {
 	ListCell   *lc;
+	char	   *query_name;
+	char	   *query_hints;
 
 	if (!query)
 		return;
 
+	/* Get Query metadata from hash table */
+	query_name = get_query_name(query);
+	query_hints = get_query_hints(query);
+
 	/* Store this Query's hint with its name and index */
-	if (query->query_hints && query->query_name)
+	if (query_hints && query_name)
 	{
 		/* Format: "[query_name] hint_content" */
-		char	   *named_hint = psprintf("[%s] %s", query->query_name, query->query_hints);
+		char	   *named_hint = psprintf("[%s] %s", query_name, query_hints);
 
 		collector->hints = lappend(collector->hints, named_hint);
 		elog(DEBUG1, "Collected hint for Query #%d '%s': %s",
-			 collector->query_index, query->query_name, query->query_hints);
+			 collector->query_index, query_name, query_hints);
 	}
-	else if (query->query_hints)
+	else if (query_hints)
 	{
 		/* Fallback if query_name is not set - use index only */
-		char	   *indexed_hint = psprintf("[query_%d] %s", collector->query_index, query->query_hints);
+		char	   *indexed_hint = psprintf("[query_%d] %s", collector->query_index, query_hints);
 
 		collector->hints = lappend(collector->hints, indexed_hint);
 		elog(DEBUG1, "Collected hint for Query #%d (no name): %s",
-			 collector->query_index, query->query_hints);
+			 collector->query_index, query_hints);
 	}
 
 	collector->query_index++;
@@ -2602,6 +2608,7 @@ assign_query_names(Query *query, QueryNamingContext *context, const char *parent
 {
 	ListCell *lc;
 	char *query_name;
+	static int query_index = 0;  /* Sequential index for all queries */
 
 	if (!query)
 		return;
@@ -2611,6 +2618,7 @@ assign_query_names(Query *query, QueryNamingContext *context, const char *parent
 	{
 		/* Top-level query */
 		query_name = generate_query_name(context, "main", NULL);
+		query_index = 0;  /* Reset index for new query tree */
 	}
 	else if (cte_name != NULL)
 	{
@@ -2623,11 +2631,13 @@ assign_query_names(Query *query, QueryNamingContext *context, const char *parent
 		query_name = generate_query_name(context, "subquery", NULL);
 	}
 
-	/* Assign the name to the Query structure */
-	query->query_name = pstrdup(query_name);
-
-	elog(DEBUG1, "Assigned name '%s' to Query at location %d (parent: %s)",
-		 query_name, query->stmt_location, parent_name ? parent_name : "none");
+	/* Store the name in the hash table instead of modifying Query structure */
+	if (current_query_metadata != NULL)
+	{
+		store_query_metadata(current_query_metadata, query, query_name, NULL, query_index++);
+		elog(DEBUG1, "Assigned name '%s' to Query at location %d (parent: %s)",
+			 query_name, query->stmt_location, parent_name ? parent_name : "none");
+	}
 
 	/* Process CTEs first - they're defined before use */
 	foreach(lc, query->cteList)
@@ -2675,11 +2685,26 @@ assign_hints_to_queries(Query *query, List *hint_positions, const char *source_t
 
 	/* Find and assign hint for this Query */
 	hint = find_hint_for_query_location(hint_positions, query->stmt_location);
-	if (hint)
+	if (hint && current_query_metadata != NULL)
 	{
-		query->query_hints = pstrdup(hint);
-		elog(DEBUG1, "Assigned hint '%s' to Query at location %d",
-			 hint, query->stmt_location);
+		/* Look up existing metadata entry and update the hints field */
+		QueryMetadataEntry *entry = lookup_query_metadata(current_query_metadata, query);
+		if (entry)
+		{
+			/* Update hints in existing entry */
+			if (entry->query_hints)
+				pfree(entry->query_hints);
+			entry->query_hints = pstrdup(hint);
+			elog(DEBUG1, "Assigned hint '%s' to Query at location %d",
+				 hint, query->stmt_location);
+		}
+		else
+		{
+			/* Entry doesn't exist yet, create one with just hints */
+			store_query_metadata(current_query_metadata, query, NULL, hint, -1);
+			elog(DEBUG1, "Created metadata with hint '%s' for Query at location %d",
+				 hint, query->stmt_location);
+		}
 	}
 
 	/* Process subqueries in RTEs */
@@ -2828,81 +2853,105 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 	/* Analyze the query to get Query tree */
 	query = parse_analyze(raw_stmt, query_str, NULL, 0, NULL);
 
-	/* First, assign names to all Query structures in the tree */
+	/* Create a hash table for Query metadata (names and hints) */
+	current_query_metadata = create_query_metadata_table(CurrentMemoryContext);
+
+	PG_TRY();
 	{
-		QueryNamingContext naming_context;
-		memset(&naming_context, 0, sizeof(QueryNamingContext));
-		assign_query_names(query, &naming_context, NULL, NULL);
-	}
-
-	/* Then assign hints to Query structures based on their locations */
-	assign_hints_to_queries(query, hint_positions, query_str);
-
-	/*
-	 * Count how many Query structures have hints assigned
-	 */
-	/* TODO: Walk the Query tree and count queries with hints */
-
-	/*
-	 * Plan the query - the hints are now attached to Query structures
-	 * The planner can access query->query_hints for each Query
-	 */
-	plan = standard_planner(query, 0, NULL);
-
-	/* Extract hints from the generated plan */
-	if (plan && plan->planTree)
-	{
-		extract_hints_from_plan_tree(plan->planTree, &hints, 0);
-	}
-
-	if (list_length(hints) == 0)
-	{
-		elog(WARNING, "pg_outline_create_from_sql: no hints could be extracted from plan");
-		PG_RETURN_BOOL(false);
-	}
-
-	/* Format hints for storage */
-	initStringInfo(&hint_str);
-	foreach(lc, hints)
-	{
-		char	   *hint = (char *) lfirst(lc);
-
-		if (hint)
+		/* First, assign names to all Query structures in the tree */
 		{
-			if (!first)
-				appendStringInfoChar(&hint_str, ' ');
-			appendStringInfoString(&hint_str, hint);
-			first = false;
+			QueryNamingContext naming_context;
+			memset(&naming_context, 0, sizeof(QueryNamingContext));
+			assign_query_names(query, &naming_context, NULL, NULL);
 		}
+
+		/* Then assign hints to Query structures based on their locations */
+		assign_hints_to_queries(query, hint_positions, query_str);
+
+		/*
+		 * Count how many Query structures have hints assigned
+		 */
+		/* TODO: Walk the Query tree and count queries with hints */
+
+		/*
+		 * Plan the query - the hints are now stored in the hash table
+		 * The planner can access hints via get_query_hints() for each Query
+		 */
+		plan = standard_planner(query, 0, NULL);
+
+		/* Extract hints from the generated plan */
+		if (plan && plan->planTree)
+		{
+			extract_hints_from_plan_tree(plan->planTree, &hints, 0);
+		}
+
+		if (list_length(hints) == 0)
+		{
+			elog(WARNING, "pg_outline_create_from_sql: no hints could be extracted from plan");
+			/* Cleanup before returning */
+			destroy_query_metadata_table(current_query_metadata);
+			current_query_metadata = NULL;
+			PG_RETURN_BOOL(false);
+		}
+
+		/* Format hints for storage */
+		initStringInfo(&hint_str);
+		foreach(lc, hints)
+		{
+			char	   *hint = (char *) lfirst(lc);
+
+			if (hint)
+			{
+				if (!first)
+					appendStringInfoChar(&hint_str, ' ');
+				appendStringInfoString(&hint_str, hint);
+				first = false;
+			}
+		}
+
+		/* Strip hints and normalize query for fingerprint */
+		query_without_hints = strip_hints_from_query(query_str);
+		normalized = normalize_query(query_without_hints);
+		fingerprint = compute_query_fingerprint(normalized);
+
+		/*
+		 * Store the outline with per-Query hints
+		 * Use normalized query as the pattern for consistent matching
+		 * If name_str is NULL, store_outline_with_query_hints will auto-generate from fingerprint
+		 */
+		store_outline_with_query_hints(name_str, normalized, fingerprint, query);
+
+		/* Get the effective name for the notice message */
+		if (!name_str || name_str[0] == '\0')
+		{
+			char *short_fp = get_short_fingerprint(fingerprint);
+			name_str = psprintf("outline_%s", short_fp);
+			pfree(short_fp);
+		}
+
+		elog(NOTICE, "pg_outline_create_from_sql: outline '%s' created with fingerprint %s",
+			 name_str, fingerprint ? fingerprint : "none");
+
+		if (normalized)
+			pfree(normalized);
+		if (fingerprint)
+			pfree(fingerprint);
+
+		/* Cleanup hash table */
+		destroy_query_metadata_table(current_query_metadata);
+		current_query_metadata = NULL;
 	}
-
-	/* Strip hints and normalize query for fingerprint */
-	query_without_hints = strip_hints_from_query(query_str);
-	normalized = normalize_query(query_without_hints);
-	fingerprint = compute_query_fingerprint(normalized);
-
-	/*
-	 * Store the outline with per-Query hints
-	 * Use normalized query as the pattern for consistent matching
-	 * If name_str is NULL, store_outline_with_query_hints will auto-generate from fingerprint
-	 */
-	store_outline_with_query_hints(name_str, normalized, fingerprint, query);
-
-	/* Get the effective name for the notice message */
-	if (!name_str || name_str[0] == '\0')
+	PG_CATCH();
 	{
-		char *short_fp = get_short_fingerprint(fingerprint);
-		name_str = psprintf("outline_%s", short_fp);
-		pfree(short_fp);
+		/* Cleanup hash table on error */
+		if (current_query_metadata)
+		{
+			destroy_query_metadata_table(current_query_metadata);
+			current_query_metadata = NULL;
+		}
+		PG_RE_THROW();
 	}
-
-	elog(NOTICE, "pg_outline_create_from_sql: outline '%s' created with fingerprint %s",
-		 name_str, fingerprint ? fingerprint : "none");
-
-	if (normalized)
-		pfree(normalized);
-	if (fingerprint)
-		pfree(fingerprint);
+	PG_END_TRY();
 
 	PG_RETURN_BOOL(true);
 }
