@@ -182,6 +182,7 @@ typedef struct Query
 
 	/* Outline hint support: hints extracted from inline comments for this Query */
 	char	   *query_hints;	/* hint string for this specific Query, or NULL */
+	char	   *query_name;		/* unique name for this Query in the tree, or NULL */
 } Query;
 
 

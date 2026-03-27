@@ -170,6 +170,19 @@ static char *strip_hints_from_query(const char *query_string);
 static void assign_hints_to_queries(Query *query, List *hint_positions, const char *source_text);
 static char *find_hint_for_query_location(List *hint_positions, int stmt_location);
 
+/* Query naming support */
+typedef struct QueryNamingContext
+{
+	int main_query_count;    /* Counter for main queries */
+	int cte_count;           /* Counter for CTEs */
+	int subquery_count;      /* Counter for subqueries */
+	int sublink_count;       /* Counter for sublinks */
+} QueryNamingContext;
+
+static void assign_query_names(Query *query, QueryNamingContext *context, const char *parent_name, const char *cte_name);
+static char *generate_query_name(QueryNamingContext *context, const char *type, const char *cte_name);
+
+
 /* SQL-callable functions */
 PG_FUNCTION_INFO_V1(pg_outline_create);
 PG_FUNCTION_INFO_V1(pg_outline_create_from_sql);
@@ -1486,7 +1499,7 @@ process_query_sublinks_collection(Query *query, QueryHintCollector *collector)
 
 /*
  * Recursively collect hints from Query tree
- * Assigns an index to each Query in depth-first order
+ * Collects hints with their query names and indices
  */
 static void
 collect_query_hints_recursive(Query *query, QueryHintCollector *collector)
@@ -1496,13 +1509,24 @@ collect_query_hints_recursive(Query *query, QueryHintCollector *collector)
 	if (!query)
 		return;
 
-	/* Store this Query's hint with its index */
-	if (query->query_hints)
+	/* Store this Query's hint with its name and index */
+	if (query->query_hints && query->query_name)
 	{
-		char	   *indexed_hint = psprintf("%d:%s", collector->query_index, query->query_hints);
+		/* Format: "[query_name] hint_content" */
+		char	   *named_hint = psprintf("[%s] %s", query->query_name, query->query_hints);
+
+		collector->hints = lappend(collector->hints, named_hint);
+		elog(DEBUG1, "Collected hint for Query #%d '%s': %s",
+			 collector->query_index, query->query_name, query->query_hints);
+	}
+	else if (query->query_hints)
+	{
+		/* Fallback if query_name is not set - use index only */
+		char	   *indexed_hint = psprintf("[query_%d] %s", collector->query_index, query->query_hints);
 
 		collector->hints = lappend(collector->hints, indexed_hint);
-		elog(DEBUG1, "Collected hint for Query #%d: %s", collector->query_index, query->query_hints);
+		elog(DEBUG1, "Collected hint for Query #%d (no name): %s",
+			 collector->query_index, query->query_hints);
 	}
 
 	collector->query_index++;
@@ -1642,31 +1666,48 @@ store_outline_with_query_hints(const char *outline_name, const char *query_patte
 	/* Insert per-Query hints */
 	foreach(lc, collector.hints)
 	{
-		char	   *indexed_hint = (char *) lfirst(lc);
-		int			qindex;
+		char	   *named_hint = (char *) lfirst(lc);
+		char	   *query_name_buf;
 		char	   *hint_text;
-		char	   *colon_pos;
+		char	   *bracket_start;
+		char	   *bracket_end;
+		int			qindex = collector.query_index - list_length(collector.hints) + foreach_current_index(lc);
 
-		/* Parse "index:hint" format */
-		colon_pos = strchr(indexed_hint, ':');
-		if (!colon_pos)
+		/* Parse "[query_name] hint" format */
+		bracket_start = strchr(named_hint, '[');
+		bracket_end = strchr(named_hint, ']');
+
+		if (!bracket_start || !bracket_end || bracket_end < bracket_start)
+		{
+			elog(WARNING, "pg_outline: malformed hint format (expected [query_name] hint): %s", named_hint);
 			continue;
+		}
 
-		*colon_pos = '\0';
-		qindex = atoi(indexed_hint);
-		hint_text = colon_pos + 1;
+		/* Extract query name */
+		query_name_buf = palloc(bracket_end - bracket_start);
+		memcpy(query_name_buf, bracket_start + 1, bracket_end - bracket_start - 1);
+		query_name_buf[bracket_end - bracket_start - 1] = '\0';
 
+		/* Extract hint text (skip the space after ]) */
+		hint_text = bracket_end + 1;
+		while (*hint_text == ' ' || *hint_text == '\t')
+			hint_text++;
+
+		/* Insert into database */
 		resetStringInfo(&sql);
 		appendStringInfo(&sql,
-						 "INSERT INTO pg_outline_query_hints (outline_id, query_index, hint_string) "
-						 "VALUES (%d, %d, %s)",
-						 outline_id, qindex, quote_literal_cstr(hint_text));
+						 "INSERT INTO pg_outline_query_hints (outline_id, query_name, query_index, hint_string) "
+						 "VALUES (%d, %s, %d, %s)",
+						 outline_id,
+						 quote_literal_cstr(query_name_buf),
+						 qindex,
+						 quote_literal_cstr(hint_text));
 
 		ret = SPI_execute(sql.data, false, 0);
 		if (ret != SPI_OK_INSERT)
-			elog(WARNING, "pg_outline: failed to store hint for Query #%d", qindex);
+			elog(WARNING, "pg_outline: failed to store hint for Query '%s'", query_name_buf);
 
-		*colon_pos = ':'; /* Restore the string */
+		pfree(query_name_buf);
 	}
 
 	SPI_finish();
@@ -1878,6 +1919,189 @@ process_query_sublinks(Query *query, List *hint_positions, const char *source_te
 }
 
 /*
+ * Generate a unique name for a Query structure
+ * Types: "main", "cte", "subquery", "sublink"
+ */
+static char *
+generate_query_name(QueryNamingContext *context, const char *type, const char *cte_name)
+{
+	StringInfoData name;
+
+	initStringInfo(&name);
+
+	if (strcmp(type, "main") == 0)
+	{
+		if (context->main_query_count == 0)
+			appendStringInfoString(&name, "main");
+		else
+			appendStringInfo(&name, "main_%d", context->main_query_count);
+		context->main_query_count++;
+	}
+	else if (strcmp(type, "cte") == 0)
+	{
+		if (cte_name && cte_name[0] != '\0')
+			appendStringInfo(&name, "cte_%s", cte_name);
+		else
+			appendStringInfo(&name, "cte_%d", context->cte_count);
+		context->cte_count++;
+	}
+	else if (strcmp(type, "subquery") == 0)
+	{
+		appendStringInfo(&name, "subquery_%d", context->subquery_count);
+		context->subquery_count++;
+	}
+	else if (strcmp(type, "sublink") == 0)
+	{
+		appendStringInfo(&name, "sublink_%d", context->sublink_count);
+		context->sublink_count++;
+	}
+
+	return name.data;
+}
+
+/*
+ * Walker context for assigning query names to SubLinks
+ */
+typedef struct QueryNamingSubLinkContext
+{
+	QueryNamingContext *naming_context;
+	const char *parent_name;
+} QueryNamingSubLinkContext;
+
+/*
+ * Walker function to assign names to SubLink subqueries
+ */
+static bool
+assign_names_sublink_walker(Node *node, QueryNamingSubLinkContext *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink *sublink = (SubLink *) node;
+
+		if (sublink->subselect && IsA(sublink->subselect, Query))
+		{
+			Query *subquery = (Query *) sublink->subselect;
+			assign_query_names(subquery, context->naming_context, context->parent_name, NULL);
+		}
+
+		/* Continue walking other parts of the SubLink */
+		return false;
+	}
+
+	/* For Query nodes, don't recurse here - they're handled separately */
+	if (IsA(node, Query))
+		return false;
+
+	/* Continue walking the expression tree */
+	return expression_tree_walker(node, assign_names_sublink_walker, (void *) context);
+}
+
+/*
+ * Process SubLinks in a Query's expression trees for naming
+ */
+static void
+process_query_sublinks_naming(Query *query, QueryNamingContext *context, const char *parent_name)
+{
+	QueryNamingSubLinkContext walker_context;
+
+	if (!query)
+		return;
+
+	walker_context.naming_context = context;
+	walker_context.parent_name = parent_name;
+
+	/* Walk targetList (SELECT clause) */
+	assign_names_sublink_walker((Node *) query->targetList, &walker_context);
+
+	/* Walk jointree quals (WHERE clause) */
+	if (query->jointree)
+		assign_names_sublink_walker((Node *) query->jointree->quals, &walker_context);
+
+	/* Walk havingQual (HAVING clause) */
+	assign_names_sublink_walker(query->havingQual, &walker_context);
+
+	/* Walk other expression fields that might contain SubLinks */
+	assign_names_sublink_walker(query->limitOffset, &walker_context);
+	assign_names_sublink_walker(query->limitCount, &walker_context);
+}
+
+/*
+ * Recursively assign names to all Query structures in a Query tree
+ * This supports CTEs, subqueries in FROM clause, and SubLinks in expressions
+ *
+ * Parameters:
+ *   query - The Query structure to name
+ *   context - Naming context with counters
+ *   parent_name - Name of the parent query (NULL for top-level)
+ *   cte_name - Name of the CTE if this is a CTE query (NULL otherwise)
+ */
+static void
+assign_query_names(Query *query, QueryNamingContext *context, const char *parent_name, const char *cte_name)
+{
+	ListCell *lc;
+	char *query_name;
+
+	if (!query)
+		return;
+
+	/* Determine the type and generate a name for this Query */
+	if (parent_name == NULL)
+	{
+		/* Top-level query */
+		query_name = generate_query_name(context, "main", NULL);
+	}
+	else if (cte_name != NULL)
+	{
+		/* This is a CTE query */
+		query_name = generate_query_name(context, "cte", cte_name);
+	}
+	else
+	{
+		/* This is a regular subquery in FROM clause */
+		query_name = generate_query_name(context, "subquery", NULL);
+	}
+
+	/* Assign the name to the Query structure */
+	query->query_name = pstrdup(query_name);
+
+	elog(DEBUG1, "Assigned name '%s' to Query at location %d (parent: %s)",
+		 query_name, query->stmt_location, parent_name ? parent_name : "none");
+
+	/* Process CTEs first - they're defined before use */
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+		if (cte->ctequery)
+		{
+			Query *ctequery = castNode(Query, cte->ctequery);
+			/* Pass the CTE name so we can include it in the query name */
+			assign_query_names(ctequery, context, query_name, cte->ctename);
+		}
+	}
+
+	/* Process subqueries in FROM clause (RTEs) */
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && rte->subquery)
+		{
+			assign_query_names(rte->subquery, context, query_name, NULL);
+		}
+	}
+
+	/* Process SubLinks in expressions (WHERE, SELECT, HAVING, etc.) */
+	/* SubLinks get "sublink" type names */
+	process_query_sublinks_naming(query, context, query_name);
+
+	pfree(query_name);
+}
+
+/*
  * Recursively assign hints to Query structures based on their location
  * This walks the Query tree and associates each Query with its corresponding hint
  */
@@ -2045,7 +2269,14 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 	/* Analyze the query to get Query tree */
 	query = parse_analyze(raw_stmt, query_str, NULL, 0, NULL);
 
-	/* Assign hints to Query structures based on their locations */
+	/* First, assign names to all Query structures in the tree */
+	{
+		QueryNamingContext naming_context;
+		memset(&naming_context, 0, sizeof(QueryNamingContext));
+		assign_query_names(query, &naming_context, NULL, NULL);
+	}
+
+	/* Then assign hints to Query structures based on their locations */
 	assign_hints_to_queries(query, hint_positions, query_str);
 
 	/*

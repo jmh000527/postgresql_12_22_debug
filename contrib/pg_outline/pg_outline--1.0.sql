@@ -29,10 +29,11 @@ CREATE INDEX IF NOT EXISTS pg_outline_enabled_idx ON pg_outline_data(enabled) WH
 CREATE TABLE IF NOT EXISTS pg_outline_query_hints (
     hint_id SERIAL PRIMARY KEY,
     outline_id INTEGER NOT NULL REFERENCES pg_outline_data(outline_id) ON DELETE CASCADE,
-    query_index INTEGER NOT NULL,  -- Index of Query in the parse tree (0=top-level)
+    query_name TEXT NOT NULL,  -- Name of Query in the parse tree (e.g., "main", "cte_orders", "subquery_1")
+    query_index INTEGER NOT NULL,  -- Index of Query in the parse tree (0=top-level, for backward compatibility)
     hint_string TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(outline_id, query_index)
+    UNIQUE(outline_id, query_name)
 );
 
 -- Create index for faster lookups
