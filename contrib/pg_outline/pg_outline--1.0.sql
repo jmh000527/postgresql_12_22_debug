@@ -6,7 +6,7 @@
 -- Create outline catalog table
 CREATE TABLE IF NOT EXISTS pg_outline_data (
     outline_id SERIAL PRIMARY KEY,
-    outline_name TEXT,
+    outline_name TEXT NOT NULL,
     query_pattern TEXT NOT NULL,
     fingerprint TEXT NOT NULL UNIQUE,
     hint_string TEXT NOT NULL,
@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS pg_outline_data (
 -- Create index on fingerprint for faster lookups
 CREATE INDEX IF NOT EXISTS pg_outline_fingerprint_idx ON pg_outline_data(fingerprint);
 
--- Create index on outline name for optional lookups
-CREATE INDEX IF NOT EXISTS pg_outline_name_idx ON pg_outline_data(outline_name) WHERE outline_name IS NOT NULL;
+-- Create index on outline name for lookups
+CREATE INDEX IF NOT EXISTS pg_outline_name_idx ON pg_outline_data(outline_name);
 
 -- Create index on enabled status
 CREATE INDEX IF NOT EXISTS pg_outline_enabled_idx ON pg_outline_data(enabled) WHERE enabled = true;
