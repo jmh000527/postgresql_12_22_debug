@@ -1664,50 +1664,54 @@ store_outline_with_query_hints(const char *outline_name, const char *query_patte
 	SPI_execute(sql.data, false, 0);
 
 	/* Insert per-Query hints */
-	foreach(lc, collector.hints)
 	{
-		char	   *named_hint = (char *) lfirst(lc);
-		char	   *query_name_buf;
-		char	   *hint_text;
-		char	   *bracket_start;
-		char	   *bracket_end;
-		int			qindex = collector.query_index - list_length(collector.hints) + foreach_current_index(lc);
-
-		/* Parse "[query_name] hint" format */
-		bracket_start = strchr(named_hint, '[');
-		bracket_end = strchr(named_hint, ']');
-
-		if (!bracket_start || !bracket_end || bracket_end < bracket_start)
+		int hint_index = 0;
+		foreach(lc, collector.hints)
 		{
-			elog(WARNING, "pg_outline: malformed hint format (expected [query_name] hint): %s", named_hint);
-			continue;
+			char	   *named_hint = (char *) lfirst(lc);
+			char	   *query_name_buf;
+			char	   *hint_text;
+			char	   *bracket_start;
+			char	   *bracket_end;
+
+			/* Parse "[query_name] hint" format */
+			bracket_start = strchr(named_hint, '[');
+			bracket_end = strchr(named_hint, ']');
+
+			if (!bracket_start || !bracket_end || bracket_end < bracket_start)
+			{
+				elog(WARNING, "pg_outline: malformed hint format (expected [query_name] hint): %s", named_hint);
+				hint_index++;
+				continue;
+			}
+
+			/* Extract query name */
+			query_name_buf = palloc(bracket_end - bracket_start);
+			memcpy(query_name_buf, bracket_start + 1, bracket_end - bracket_start - 1);
+			query_name_buf[bracket_end - bracket_start - 1] = '\0';
+
+			/* Extract hint text (skip the space after ]) */
+			hint_text = bracket_end + 1;
+			while (*hint_text == ' ' || *hint_text == '\t')
+				hint_text++;
+
+			/* Insert into database */
+			resetStringInfo(&sql);
+			appendStringInfo(&sql,
+							 "INSERT INTO pg_outline_query_hints (outline_id, query_name, query_index, hint_string) "
+							 "VALUES (%d, %s, %d, %s)",
+							 outline_id,
+							 quote_literal_cstr(query_name_buf),
+							 hint_index,
+							 quote_literal_cstr(hint_text));
+
+			ret = SPI_execute(sql.data, false, 0);
+			if (ret != SPI_OK_INSERT)
+				elog(WARNING, "pg_outline: failed to store hint for Query '%s'", query_name_buf);
+
+			pfree(query_name_buf);
+			hint_index++;
 		}
-
-		/* Extract query name */
-		query_name_buf = palloc(bracket_end - bracket_start);
-		memcpy(query_name_buf, bracket_start + 1, bracket_end - bracket_start - 1);
-		query_name_buf[bracket_end - bracket_start - 1] = '\0';
-
-		/* Extract hint text (skip the space after ]) */
-		hint_text = bracket_end + 1;
-		while (*hint_text == ' ' || *hint_text == '\t')
-			hint_text++;
-
-		/* Insert into database */
-		resetStringInfo(&sql);
-		appendStringInfo(&sql,
-						 "INSERT INTO pg_outline_query_hints (outline_id, query_name, query_index, hint_string) "
-						 "VALUES (%d, %s, %d, %s)",
-						 outline_id,
-						 quote_literal_cstr(query_name_buf),
-						 qindex,
-						 quote_literal_cstr(hint_text));
-
-		ret = SPI_execute(sql.data, false, 0);
-		if (ret != SPI_OK_INSERT)
-			elog(WARNING, "pg_outline: failed to store hint for Query '%s'", query_name_buf);
-
-		pfree(query_name_buf);
 	}
 
 	SPI_finish();
