@@ -604,10 +604,26 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 						/* Check if outline already exists */
 						if (outline_exists(outline_name.data))
 						{
-							/* Outline already exists - notify user */
+							/* Outline already exists - notify user and show SQL with hints */
+							char *sql_with_hints;
+							StringInfo formatted_hints = format_outline_data(current_outline->hints);
+
 							elog(NOTICE, "An outline named '%s' already exists for this query.\n"
 								 "The existing outline will be used when the query is executed.",
 								 outline_name.data);
+
+							/* Show SQL with hints injected */
+							if (formatted_hints && formatted_hints->data)
+							{
+								sql_with_hints = construct_sql_with_hints(queryString, formatted_hints->data);
+								if (sql_with_hints)
+								{
+									elog(NOTICE, "SQL with outline hints injected:\n%s", sql_with_hints);
+									pfree(sql_with_hints);
+								}
+								pfree(formatted_hints->data);
+								pfree(formatted_hints);
+							}
 						}
 						else
 						{
