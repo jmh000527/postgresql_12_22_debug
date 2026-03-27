@@ -179,10 +179,6 @@ typedef struct Query
 	 */
 	int			stmt_location;	/* start location, or -1 if unknown */
 	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
-
-	/* Outline hint support: hints extracted from inline comments for this Query */
-	char	   *query_hints;	/* hint string for this specific Query, or NULL */
-	char	   *query_name;		/* unique name for this Query in the tree, or NULL */
 } Query;
 
 
