@@ -251,6 +251,18 @@ static void collect_query_hints_recursive(Query *query, QueryHintCollector *coll
 static void extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query, List **hints);
 static void log_query_names_and_hints(Query *query);
 
+/* SubLink-to-relation mapping for handling pulled-up subqueries */
+typedef struct RelationSubLinkMap RelationSubLinkMap;
+typedef struct RelationSubLinkEntry RelationSubLinkEntry;
+typedef struct RelSubLinkMapContext RelSubLinkMapContext;
+
+static RelationSubLinkMap *build_relation_sublink_map(Query *query);
+static int get_relation_sublink_index(RelationSubLinkMap *map, Oid relid);
+static char *extract_relation_from_hint(const char *hint);
+static Oid get_relation_oid_from_name(const char *relname, PlannedStmt *plannedstmt);
+static int get_hint_sublink_index(const char *hint, RelationSubLinkMap *relmap, PlannedStmt *plannedstmt);
+static bool build_relation_sublink_map_walker(Node *node, RelSubLinkMapContext *context);
+
 
 
 /* SQL-callable functions */
@@ -635,8 +647,6 @@ static void
 generate_outline_from_plan(PlannedStmt *plan, const char *query_string)
 {
 	List	   *hints = NIL;
-	ListCell   *lc;
-	char	   *query_name = "main"; /* Default query name for simple queries */
 
 	if (!plan || !plan->planTree)
 		return;
@@ -1069,10 +1079,254 @@ get_leading_hint(Plan *plan)
 	return get_leading_hint_from_join(plan);
 }
 
+/* Structure to map relation OIDs to their originating SubLink index */
+typedef struct RelationSubLinkMap
+{
+	HTAB *relid_to_sublink;  /* Hash table: Oid -> sublink_index */
+	int   sublink_count;     /* Total number of SubLinks found */
+} RelationSubLinkMap;
+
+typedef struct RelationSubLinkEntry
+{
+	Oid relid;            /* Key: relation OID */
+	int sublink_index;     /* Value: SubLink index (-1 for main query) */
+} RelationSubLinkEntry;
+
+/* Context for building the relation to SubLink mapping */
+typedef struct RelSubLinkMapContext
+{
+	RelationSubLinkMap *map;
+	int current_sublink_index;
+	HASHCTL hash_ctl;
+} RelSubLinkMapContext;
+
+/* Walker to find SubLinks and build relation mapping */
+static bool
+build_relation_sublink_map_walker(Node *node, RelSubLinkMapContext *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink *sublink = (SubLink *) node;
+
+		if (IsA(sublink->subselect, Query))
+		{
+			Query *subquery = (Query *) sublink->subselect;
+			ListCell *lc;
+			int sublink_idx = context->current_sublink_index++;
+			bool found;
+
+			/* Mark all relations in this subquery as belonging to this SubLink */
+			foreach(lc, subquery->rtable)
+			{
+				RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+				if (rte->rtekind == RTE_RELATION)
+				{
+					RelationSubLinkEntry *entry;
+					entry = (RelationSubLinkEntry *) hash_search(context->map->relid_to_sublink,
+																  &rte->relid,
+																  HASH_ENTER,
+																  &found);
+					if (!found)
+					{
+						entry->relid = rte->relid;
+						entry->sublink_index = sublink_idx;
+					}
+				}
+			}
+
+			/* Recursively process nested subqueries */
+			return query_tree_walker(subquery, build_relation_sublink_map_walker, context, 0);
+		}
+		return false;
+	}
+
+	/* For Query nodes, don't recurse - they're handled by explicit check above */
+	if (IsA(node, Query))
+		return false;
+
+	return expression_tree_walker(node, build_relation_sublink_map_walker, context);
+}
+
+/* Build a mapping of relations to SubLinks */
+static RelationSubLinkMap *
+build_relation_sublink_map(Query *query)
+{
+	RelationSubLinkMap *map;
+	RelSubLinkMapContext context;
+	HASHCTL hash_ctl;
+
+	map = (RelationSubLinkMap *) palloc0(sizeof(RelationSubLinkMap));
+
+	/* Initialize hash table */
+	memset(&hash_ctl, 0, sizeof(hash_ctl));
+	hash_ctl.keysize = sizeof(Oid);
+	hash_ctl.entrysize = sizeof(RelationSubLinkEntry);
+	hash_ctl.hcxt = CurrentMemoryContext;
+
+	map->relid_to_sublink = hash_create("Relation to SubLink Map",
+										 32,  /* initial size */
+										 &hash_ctl,
+										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	map->sublink_count = 0;
+
+	/* Walk the query tree to find SubLinks */
+	context.map = map;
+	context.current_sublink_index = 0;
+
+	/* Walk WHERE clause */
+	if (query->jointree && query->jointree->quals)
+		build_relation_sublink_map_walker(query->jointree->quals, &context);
+
+	/* Walk targetlist */
+	build_relation_sublink_map_walker((Node *) query->targetList, &context);
+
+	/* Walk HAVING clause */
+	if (query->havingQual)
+		build_relation_sublink_map_walker(query->havingQual, &context);
+
+	map->sublink_count = context.current_sublink_index;
+
+	return map;
+}
+
+/* Get the SubLink index for a relation OID, or -1 if it's in the main query */
+static int
+get_relation_sublink_index(RelationSubLinkMap *map, Oid relid)
+{
+	RelationSubLinkEntry *entry;
+	bool found;
+
+	if (!map || !map->relid_to_sublink)
+		return -1;
+
+	entry = (RelationSubLinkEntry *) hash_search(map->relid_to_sublink,
+												  &relid,
+												  HASH_FIND,
+												  &found);
+
+	if (found)
+		return entry->sublink_index;
+
+	return -1;  /* Not in any SubLink, belongs to main query */
+}
+
+/* Extract relation name from a hint string (e.g., "SeqScan(t2)" -> "t2") */
+static char *
+extract_relation_from_hint(const char *hint)
+{
+	char *paren_start;
+	char *paren_end;
+	char *space;
+	int len;
+	char *relname;
+
+	if (!hint)
+		return NULL;
+
+	paren_start = strchr(hint, '(');
+	if (!paren_start)
+		return NULL;
+
+	paren_end = strchr(paren_start, ')');
+	if (!paren_end)
+		return NULL;
+
+	/* Skip past the '(' */
+	paren_start++;
+	len = paren_end - paren_start;
+
+	if (len <= 0)
+		return NULL;
+
+	/* For join hints like "HashJoin(t1 t2)", just get the first relation for now */
+	/* TODO: Handle multiple relations in join hints properly */
+	space = strchr(paren_start, ' ');
+	if (space && space < paren_end)
+		len = space - paren_start;
+
+	relname = palloc(len + 1);
+	strncpy(relname, paren_start, len);
+	relname[len] = '\0';
+
+	return relname;
+}
+
+/* Get relation OID from relation name using PlannedStmt's rtable */
+static Oid
+get_relation_oid_from_name(const char *relname, PlannedStmt *plannedstmt)
+{
+	ListCell *lc;
+	RangeTblEntry *rte;
+
+	if (!relname || !plannedstmt || !plannedstmt->rtable)
+		return InvalidOid;
+
+	foreach(lc, plannedstmt->rtable)
+	{
+		rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			char *rte_relname = get_rel_name(rte->relid);
+			if (rte_relname && strcmp(rte_relname, relname) == 0)
+			{
+				Oid relid = rte->relid;
+				pfree(rte_relname);
+				return relid;
+			}
+			if (rte_relname)
+				pfree(rte_relname);
+
+			/* Also check alias */
+			if (rte->alias && rte->alias->aliasname &&
+				strcmp(rte->alias->aliasname, relname) == 0)
+				return rte->relid;
+		}
+	}
+
+	return InvalidOid;
+}
+
+/* Determine which SubLink (if any) a hint belongs to based on the relations it references */
+static int
+get_hint_sublink_index(const char *hint, RelationSubLinkMap *relmap, PlannedStmt *plannedstmt)
+{
+	char *relname;
+	Oid relid;
+	int sublink_idx;
+
+	if (!hint || !relmap)
+		return -1;
+
+	/* Extract the first relation name from the hint */
+	relname = extract_relation_from_hint(hint);
+	if (!relname)
+		return -1;
+
+	/* Get the OID for this relation */
+	relid = get_relation_oid_from_name(relname, plannedstmt);
+	pfree(relname);
+
+	if (relid == InvalidOid)
+		return -1;
+
+	/* Check if this relation belongs to a SubLink */
+	sublink_idx = get_relation_sublink_index(relmap, relid);
+
+	return sublink_idx;
+}
+
 /*
  * Extract hints from plan tree with proper query names
  * This function maps plan nodes to their corresponding Query structures
  * and prefixes hints with the appropriate query name ([main], [sublink_N], etc.)
+ *
+ * For pulled-up subqueries (converted to joins), we need to track which relations
+ * originally came from SubLinks and label their hints accordingly.
  */
 static void
 extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query, List **hints)
@@ -1081,9 +1335,15 @@ extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query,
 	ListCell   *lc;
 	char	   *query_name;
 	int			sublink_index = 0;
+	RelationSubLinkMap *relmap;
+	List	   **sublink_hints_array;  /* Array of hint lists, one per SubLink */
+	int			i;
 
 	if (!plannedstmt || !plannedstmt->planTree || !query)
 		return;
+
+	/* Build a mapping of relations to their originating SubLinks */
+	relmap = build_relation_sublink_map(query);
 
 	/* Extract hints from main plan tree */
 	extract_hints_from_plan_tree(plannedstmt->planTree, &main_hints, 0);
@@ -1093,22 +1353,59 @@ extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query,
 	if (!query_name)
 		query_name = "main";
 
-	/* Prefix main plan hints with main query name */
+	/* Initialize an array to hold hints for each SubLink */
+	if (relmap->sublink_count > 0)
+	{
+		sublink_hints_array = (List **) palloc0(sizeof(List *) * relmap->sublink_count);
+		for (i = 0; i < relmap->sublink_count; i++)
+			sublink_hints_array[i] = NIL;
+	}
+	else
+	{
+		sublink_hints_array = NULL;
+	}
+
+	/*
+	 * Categorize hints based on which SubLink (if any) they belong to.
+	 * Check each hint to see if its relations belong to a SubLink.
+	 */
 	foreach(lc, main_hints)
 	{
 		char *hint = (char *) lfirst(lc);
 		if (hint)
 		{
-			char *prefixed_hint = psprintf("[%s] %s", query_name, hint);
-			*hints = lappend(*hints, prefixed_hint);
+			int hint_sublink_idx = get_hint_sublink_index(hint, relmap, plannedstmt);
+
+			if (hint_sublink_idx >= 0 && hint_sublink_idx < relmap->sublink_count)
+			{
+				/* This hint belongs to a SubLink */
+				char *sublink_name = psprintf("sublink_%d", hint_sublink_idx);
+				char *prefixed_hint = psprintf("[%s] %s", sublink_name, hint);
+				sublink_hints_array[hint_sublink_idx] = lappend(sublink_hints_array[hint_sublink_idx], prefixed_hint);
+			}
+			else
+			{
+				/* This hint belongs to the main query */
+				char *prefixed_hint = psprintf("[%s] %s", query_name, hint);
+				*hints = lappend(*hints, prefixed_hint);
+			}
 		}
 	}
 
-	/* Process subplans (for SubLinks - scalar subqueries, IN, EXISTS, etc.) */
+	/* Add SubLink hints to the main hints list */
+	for (i = 0; i < relmap->sublink_count; i++)
+	{
+		ListCell *slc;
+		foreach(slc, sublink_hints_array[i])
+		{
+			*hints = lappend(*hints, lfirst(slc));
+		}
+	}
+
+	/* Process subplans (for SubLinks that weren't pulled up) */
 	if (plannedstmt->subplans)
 	{
 		ListCell *subplan_lc;
-		int subplan_idx = 0;
 
 		foreach(subplan_lc, plannedstmt->subplans)
 		{
@@ -1122,9 +1419,7 @@ extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query,
 			/* Extract hints from this subplan */
 			extract_hints_from_plan_tree(subplan, &subplan_hints, 0);
 
-			/* Try to find the corresponding Query for this subplan
-			 * For now, we'll use sequential naming: sublink_0, sublink_1, etc.
-			 * This matches the order subplans are created during planning */
+			/* Use sequential naming: sublink_0, sublink_1, etc. */
 			sublink_name = psprintf("sublink_%d", sublink_index);
 			sublink_index++;
 
@@ -1140,6 +1435,12 @@ extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query,
 			}
 		}
 	}
+
+	/* Clean up */
+	if (sublink_hints_array)
+		pfree(sublink_hints_array);
+	if (relmap && relmap->relid_to_sublink)
+		hash_destroy(relmap->relid_to_sublink);
 }
 
 /*
