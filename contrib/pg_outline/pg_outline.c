@@ -2915,11 +2915,11 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 		fingerprint = compute_query_fingerprint(normalized);
 
 		/*
-		 * Store the outline with per-Query hints
+		 * Store the outline with the collected hints
 		 * Use normalized query as the pattern for consistent matching
-		 * If name_str is NULL, store_outline_with_query_hints will auto-generate from fingerprint
+		 * If name_str is NULL, store_outline_hints will auto-generate from fingerprint
 		 */
-		store_outline_with_query_hints(name_str, normalized, fingerprint, query);
+		store_outline_hints(name_str, normalized, fingerprint, hint_str.data);
 
 		/* Get the effective name for the notice message */
 		if (!name_str || name_str[0] == '\0')
