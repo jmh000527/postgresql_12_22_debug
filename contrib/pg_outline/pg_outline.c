@@ -192,6 +192,7 @@ static char *extract_relation_names_flat(Plan *plan);
 static char *get_relation_name(Index relid, PlannedStmt *plan);
 static void display_outline_data(void);
 static StringInfo format_outline_data(List *hints);
+static char *construct_sql_with_hints(const char *query_string, const char *hints_string);
 
 /* Query fingerprinting */
 static char *normalize_query(const char *query_string);
@@ -389,7 +390,18 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 				stored_hints = retrieve_outline_hints(query_fingerprint);
 				if (stored_hints)
 				{
+					char *sql_with_hints;
+
 					elog(DEBUG1, "pg_outline: found stored hints for query");
+
+					/* Construct SQL with hints injected and log it */
+					sql_with_hints = construct_sql_with_hints(debug_query_string, stored_hints);
+					if (sql_with_hints)
+					{
+						elog(NOTICE, "Outline matched! SQL with hints injected:\n%s", sql_with_hints);
+						pfree(sql_with_hints);
+					}
+
 					/* TODO: Parse and apply hints before planning */
 				}
 			}
@@ -1519,6 +1531,31 @@ format_outline_data(List *hints)
 	ret = makeStringInfo();
 	appendStringInfoString(ret, result.data);
 	pfree(result.data);  /* Free the local StringInfoData's buffer */
+	return ret;
+}
+
+/*
+ * Construct SQL with hints injected
+ * This function injects the outline hints comment at the beginning of the SQL query
+ */
+static char *
+construct_sql_with_hints(const char *query_string, const char *hints_string)
+{
+	StringInfoData result;
+	char	   *ret;
+
+	if (!query_string || !hints_string)
+		return NULL;
+
+	initStringInfo(&result);
+
+	/* Add hints comment at the beginning */
+	appendStringInfo(&result, "%s\n", hints_string);
+
+	/* Add the original query */
+	appendStringInfo(&result, "%s", query_string);
+
+	ret = result.data;
 	return ret;
 }
 
