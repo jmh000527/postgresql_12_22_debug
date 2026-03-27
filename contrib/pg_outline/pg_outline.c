@@ -173,6 +173,7 @@ static char *find_hint_for_query_location(List *hint_positions, int stmt_locatio
 /* SQL-callable functions */
 PG_FUNCTION_INFO_V1(pg_outline_create);
 PG_FUNCTION_INFO_V1(pg_outline_create_from_sql);
+PG_FUNCTION_INFO_V1(pg_outline_update);
 PG_FUNCTION_INFO_V1(pg_outline_drop);
 PG_FUNCTION_INFO_V1(pg_outline_enable);
 PG_FUNCTION_INFO_V1(pg_outline_disable);
@@ -1242,15 +1243,11 @@ store_outline_hints(const char *outline_name, const char *query_pattern,
 		effective_name = pstrdup(outline_name);
 	}
 
+	/* INSERT only - no ON CONFLICT to prevent accidental updates */
 	initStringInfo(&query);
 	appendStringInfo(&query,
 					 "INSERT INTO pg_outline_data (outline_name, query_pattern, fingerprint, hint_string, enabled) "
-					 "VALUES (%s, %s, %s, %s, true) "
-					 "ON CONFLICT (fingerprint) DO UPDATE SET "
-					 "outline_name = EXCLUDED.outline_name, "
-					 "query_pattern = EXCLUDED.query_pattern, "
-					 "hint_string = EXCLUDED.hint_string, "
-					 "updated_at = CURRENT_TIMESTAMP",
+					 "VALUES (%s, %s, %s, %s, true)",
 					 quote_literal_cstr(effective_name),
 					 quote_literal_cstr(query_pattern),
 					 quote_literal_cstr(fingerprint),
@@ -1260,6 +1257,65 @@ store_outline_hints(const char *outline_name, const char *query_pattern,
 
 	if (ret != SPI_OK_INSERT && ret != SPI_OK_INSERT_RETURNING)
 		elog(WARNING, "pg_outline: failed to store outline");
+
+	pfree(effective_name);
+	SPI_finish();
+}
+
+/*
+ * Update existing outline hints in database using SPI
+ */
+static void
+update_outline_hints(const char *outline_name, const char *query_pattern,
+					const char *fingerprint, const char *hints)
+{
+	int			ret;
+	StringInfoData query;
+	char	   *effective_name;
+	char	   *short_fp;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		elog(ERROR, "pg_outline: SPI_connect failed");
+		return;
+	}
+
+	/* If outline_name is NULL or empty, generate it from fingerprint */
+	if (!outline_name || outline_name[0] == '\0')
+	{
+		short_fp = get_short_fingerprint(fingerprint);
+		effective_name = psprintf("outline_%s", short_fp);
+		pfree(short_fp);
+	}
+	else
+	{
+		effective_name = pstrdup(outline_name);
+	}
+
+	/* UPDATE based on fingerprint */
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "UPDATE pg_outline_data SET "
+					 "outline_name = %s, "
+					 "query_pattern = %s, "
+					 "hint_string = %s, "
+					 "updated_at = CURRENT_TIMESTAMP "
+					 "WHERE fingerprint = %s",
+					 quote_literal_cstr(effective_name),
+					 quote_literal_cstr(query_pattern),
+					 quote_literal_cstr(hints),
+					 quote_literal_cstr(fingerprint));
+
+	ret = SPI_execute(query.data, false, 0);
+
+	if (ret < 0)
+	{
+		elog(WARNING, "pg_outline: failed to update outline");
+	}
+	else if (SPI_processed == 0)
+	{
+		elog(WARNING, "pg_outline: outline with fingerprint '%s' not found", fingerprint);
+	}
 
 	pfree(effective_name);
 	SPI_finish();
@@ -2057,6 +2113,62 @@ pg_outline_create_from_sql(PG_FUNCTION_ARGS)
 		pfree(normalized);
 	if (fingerprint)
 		pfree(fingerprint);
+
+	PG_RETURN_BOOL(true);
+}
+
+/*
+ * SQL function: update an existing outline
+ * This function only updates, it will fail if the outline doesn't exist
+ */
+Datum
+pg_outline_update(PG_FUNCTION_ARGS)
+{
+	text	   *outline_name = PG_ARGISNULL(0) ? NULL : PG_GETARG_TEXT_PP(0);
+	text	   *query_text = PG_GETARG_TEXT_PP(1);
+	char	   *name_str;
+	char	   *query_str;
+	char	   *hints_str;
+	char	   *normalized;
+	char	   *fingerprint;
+
+	/* Check for NULL query_text (required) */
+	if (PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+
+	/* Get outline_name string if provided, else pass NULL for auto-generation */
+	name_str = outline_name ? text_to_cstring(outline_name) : NULL;
+	query_str = text_to_cstring(query_text);
+
+	/* Handle optional hints parameter */
+	if (PG_ARGISNULL(2))
+		hints_str = pstrdup("");  /* Use empty string for NULL hints */
+	else
+		hints_str = text_to_cstring(PG_GETARG_TEXT_PP(2));
+
+	/* Normalize query and compute fingerprint */
+	normalized = normalize_query(query_str);
+	fingerprint = compute_query_fingerprint(normalized);
+
+	/* Update the outline - will fail if it doesn't exist */
+	update_outline_hints(name_str, normalized, fingerprint, hints_str);
+
+	/* Get the effective name for the notice message */
+	if (!name_str || name_str[0] == '\0')
+	{
+		char *short_fp = get_short_fingerprint(fingerprint);
+		name_str = psprintf("outline_%s", short_fp);
+		pfree(short_fp);
+	}
+
+	elog(NOTICE, "pg_outline_update: outline '%s' updated with fingerprint %s",
+		 name_str, fingerprint ? fingerprint : "none");
+
+	if (normalized)
+		pfree(normalized);
+	if (fingerprint)
+		pfree(fingerprint);
+	pfree(hints_str);
 
 	PG_RETURN_BOOL(true);
 }

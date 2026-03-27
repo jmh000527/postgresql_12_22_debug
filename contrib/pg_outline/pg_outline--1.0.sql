@@ -57,6 +57,16 @@ RETURNS BOOLEAN
 AS 'MODULE_PATHNAME', 'pg_outline_create_from_sql'
 LANGUAGE C STRICT;
 
+-- Function to update an existing outline
+CREATE OR REPLACE FUNCTION pg_outline_update(
+    outline_name TEXT,
+    query_text TEXT,
+    hints TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+AS 'MODULE_PATHNAME', 'pg_outline_update'
+LANGUAGE C;
+
 -- Function to drop an outline
 CREATE OR REPLACE FUNCTION pg_outline_drop(
     outline_name TEXT
