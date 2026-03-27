@@ -218,6 +218,7 @@ typedef struct QueryNamingContext
 	int cte_count;           /* Counter for CTEs */
 	int subquery_count;      /* Counter for subqueries */
 	int sublink_count;       /* Counter for sublinks */
+	int query_index;         /* Sequential index for all queries in this tree */
 } QueryNamingContext;
 
 static void assign_query_names(Query *query, QueryNamingContext *context, const char *parent_name, const char *cte_name);
@@ -343,6 +344,22 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	PlannedStmt *result;
 	char	   *query_fingerprint = NULL;
 	char	   *stored_hints = NULL;
+
+	/* Always assign query names before planning if pg_outline is enabled */
+	if (pg_outline_enabled && parse)
+	{
+		/* Create or reuse the hash table for Query metadata */
+		if (current_query_metadata == NULL)
+			current_query_metadata = create_query_metadata_table(TopMemoryContext);
+
+		/* Assign names to all Query structures in the tree BEFORE optimization */
+		{
+			QueryNamingContext naming_context;
+			memset(&naming_context, 0, sizeof(QueryNamingContext));
+			assign_query_names(parse, &naming_context, NULL, NULL);
+			elog(DEBUG1, "pg_outline: assigned query names before optimization");
+		}
+	}
 
 	/* Try to retrieve stored hints if in manual mode */
 	if (pg_outline_enabled && strcmp(pg_outline_mode, "manual") == 0 && debug_query_string)
@@ -473,11 +490,13 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 		/* Always assign query names if we have a query tree, so hints can be prefixed */
 		if (query)
 		{
-			/* Create a hash table for Query metadata (names and hints) */
+			/* Create a hash table for Query metadata (names and hints) if needed */
 			if (current_query_metadata == NULL)
 				current_query_metadata = create_query_metadata_table(OutlineContext);
 
-			/* Assign names to all Query structures in the tree */
+			/* Assign names to all Query structures in the tree if not already named */
+			/* Check if the top-level query already has a name (from planner hook) */
+			if (lookup_query_metadata(current_query_metadata, query) == NULL)
 			{
 				QueryNamingContext naming_context;
 				memset(&naming_context, 0, sizeof(QueryNamingContext));
@@ -592,6 +611,13 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	{
 		MemoryContextReset(OutlineContext);
 		current_outline = NULL;  /* Pointer is now invalid after reset */
+	}
+
+	/* Cleanup query metadata hash table if it was created */
+	if (current_query_metadata)
+	{
+		destroy_query_metadata_table(current_query_metadata);
+		current_query_metadata = NULL;
 	}
 }
 /*
@@ -2684,7 +2710,6 @@ assign_query_names(Query *query, QueryNamingContext *context, const char *parent
 {
 	ListCell *lc;
 	char *query_name;
-	static int query_index = 0;  /* Sequential index for all queries */
 
 	if (!query)
 		return;
@@ -2694,7 +2719,7 @@ assign_query_names(Query *query, QueryNamingContext *context, const char *parent
 	{
 		/* Top-level query */
 		query_name = generate_query_name(context, "main", NULL);
-		query_index = 0;  /* Reset index for new query tree */
+		context->query_index = 0;  /* Reset index for new query tree */
 	}
 	else if (cte_name != NULL)
 	{
@@ -2710,7 +2735,7 @@ assign_query_names(Query *query, QueryNamingContext *context, const char *parent
 	/* Store the name in the hash table instead of modifying Query structure */
 	if (current_query_metadata != NULL)
 	{
-		store_query_metadata(current_query_metadata, query, query_name, NULL, query_index++);
+		store_query_metadata(current_query_metadata, query, query_name, NULL, context->query_index++);
 		elog(DEBUG1, "Assigned name '%s' to Query at location %d (parent: %s)",
 			 query_name, query->stmt_location, parent_name ? parent_name : "none");
 	}
