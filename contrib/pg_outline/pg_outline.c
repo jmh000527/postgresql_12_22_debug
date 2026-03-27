@@ -104,6 +104,7 @@ typedef struct OutlineHint
 typedef struct OutlineInfo
 {
 	char *query_string;
+	Query *query;  /* Query tree for collecting hints with query names */
 	List *hints;  /* List of OutlineHint */
 	StringInfo outline_data;
 	bool displayed;  /* Whether outline data has been displayed */
@@ -236,6 +237,16 @@ static void store_query_metadata(QueryMetadataHashTable *table, Query *query,
 static QueryMetadataEntry *lookup_query_metadata(QueryMetadataHashTable *table, Query *query);
 static char *get_query_name(Query *query);
 static char *get_query_hints(Query *query);
+
+/* Query hint collection support */
+typedef struct QueryHintCollector
+{
+	List	   *hints;		/* List of strings: each Query's hints */
+	int			query_index; /* Current Query index */
+} QueryHintCollector;
+
+static void collect_query_hints_recursive(Query *query, QueryHintCollector *collector);
+
 
 
 /* SQL-callable functions */
@@ -444,22 +455,53 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	/* In auto mode, generate and display outline for EXPLAIN statements */
 	if (pg_outline_enabled && strcmp(pg_outline_mode, "auto") == 0 && queryString)
 	{
+		MemoryContext oldcontext;
+		List *hint_positions = NIL;
+
+		/* Initialize current outline if needed */
+		if (current_outline == NULL)
+		{
+			oldcontext = MemoryContextSwitchTo(OutlineContext);
+			current_outline = (OutlineInfo *) palloc0(sizeof(OutlineInfo));
+			current_outline->hints = NIL;
+			MemoryContextSwitchTo(oldcontext);
+		}
+
+		/* Extract inline hints from the query string */
+		hint_positions = extract_inline_hints_with_positions(queryString);
+
+		/* Always assign query names if we have a query tree, so hints can be prefixed */
+		if (query)
+		{
+			/* Create a hash table for Query metadata (names and hints) */
+			if (current_query_metadata == NULL)
+				current_query_metadata = create_query_metadata_table(OutlineContext);
+
+			/* Assign names to all Query structures in the tree */
+			{
+				QueryNamingContext naming_context;
+				memset(&naming_context, 0, sizeof(QueryNamingContext));
+				assign_query_names(query, &naming_context, NULL, NULL);
+			}
+
+			/* If we have inline hints, assign them to Query structures based on their locations */
+			if (list_length(hint_positions) > 0)
+			{
+				assign_hints_to_queries(query, hint_positions, queryString);
+			}
+
+			/* Store the Query tree in current_outline for later use */
+			oldcontext = MemoryContextSwitchTo(OutlineContext);
+			current_outline->query = query;
+			MemoryContextSwitchTo(oldcontext);
+		}
+
 		/* Get the plan if we don't have it yet */
 		if (plan == NULL)
 			plan = current_plannedstmt;
 
 		if (plan)
 		{
-			MemoryContext oldcontext;
-
-			/* Initialize current outline if needed */
-			if (current_outline == NULL)
-			{
-				oldcontext = MemoryContextSwitchTo(OutlineContext);
-				current_outline = (OutlineInfo *) palloc0(sizeof(OutlineInfo));
-				current_outline->hints = NIL;
-				MemoryContextSwitchTo(oldcontext);
-			}
 
 			/* Generate outline from the plan - must be in OutlineContext
 			 * so hint strings survive across memory context resets */
@@ -559,12 +601,58 @@ static void
 generate_outline_from_plan(PlannedStmt *plan, const char *query_string)
 {
 	List	   *hints = NIL;
+	ListCell   *lc;
+	char	   *query_name = "main"; /* Default query name for simple queries */
 
 	if (!plan || !plan->planTree)
 		return;
 
-	/* Extract hints from the plan tree */
-	extract_hints_from_plan_tree(plan->planTree, &hints, 0);
+	/* Check if we have a Query tree with query names assigned */
+	if (current_outline && current_outline->query && current_query_metadata)
+	{
+		/* Collect hints with query names from the Query tree if hints were assigned */
+		QueryHintCollector collector;
+
+		collector.hints = NIL;
+		collector.query_index = 0;
+
+		/* Collect all hints from the Query tree with [query_name] prefixes */
+		collect_query_hints_recursive(current_outline->query, &collector);
+
+		/* If we got hints from the Query tree, use them */
+		if (list_length(collector.hints) > 0)
+		{
+			hints = collector.hints;
+		}
+		else
+		{
+			/* No hints in Query tree, extract from plan tree and prefix with query name */
+			extract_hints_from_plan_tree(plan->planTree, &hints, 0);
+
+			/* Get the main query name from the hash table */
+			query_name = get_query_name(current_outline->query);
+			if (!query_name)
+				query_name = "main";
+
+			/* Prefix each hint with [query_name] */
+			List *prefixed_hints = NIL;
+			foreach(lc, hints)
+			{
+				char *hint = (char *) lfirst(lc);
+				if (hint)
+				{
+					char *prefixed_hint = psprintf("[%s] %s", query_name, hint);
+					prefixed_hints = lappend(prefixed_hints, prefixed_hint);
+				}
+			}
+			hints = prefixed_hints;
+		}
+	}
+	else
+	{
+		/* Fallback: Extract hints from the plan tree (without query names) */
+		extract_hints_from_plan_tree(plan->planTree, &hints, 0);
+	}
 
 	/* Store hints in current outline */
 	if (current_outline)
@@ -1470,18 +1558,6 @@ outline_exists(const char *outline_name)
 
 	return exists;
 }
-
-/*
- * Helper structure to collect hints from Query tree
- */
-typedef struct QueryHintCollector
-{
-	List	   *hints;		/* List of strings: each Query's hints */
-	int			query_index; /* Current Query index */
-} QueryHintCollector;
-
-/* Forward declaration */
-static void collect_query_hints_recursive(Query *query, QueryHintCollector *collector);
 
 /*
  * Context structure for SubLink collector walker
