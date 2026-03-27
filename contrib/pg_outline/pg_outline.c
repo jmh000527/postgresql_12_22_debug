@@ -1011,8 +1011,8 @@ display_outline_data(void)
 
 /*
  * Normalize query by replacing literals with placeholders
- * This is a simplified implementation - a production version would use
- * more sophisticated normalization
+ * This version uses improved string parsing to preserve all identifiers
+ * while replacing only literal values
  */
 static char *
 normalize_query(const char *query_string)
@@ -1020,7 +1020,9 @@ normalize_query(const char *query_string)
 	StringInfoData normalized;
 	const char *p;
 	bool		in_string = false;
+	bool		in_identifier = false;
 	bool		in_comment = false;
+	char		quote_char = '\0';
 
 	if (!query_string)
 		return NULL;
@@ -1029,6 +1031,7 @@ normalize_query(const char *query_string)
 
 	for (p = query_string; *p; p++)
 	{
+		/* Handle line comments */
 		if (in_comment)
 		{
 			if (*p == '\n')
@@ -1036,12 +1039,37 @@ normalize_query(const char *query_string)
 			continue;
 		}
 
+		/* Handle string literals */
 		if (in_string)
 		{
-			if (*p == '\'')
+			if (*p == quote_char)
 			{
+				/* Check for escaped quote */
+				if (*(p + 1) == quote_char)
+				{
+					p++; /* Skip escaped quote */
+					continue;
+				}
 				in_string = false;
 				appendStringInfoString(&normalized, " ? ");
+			}
+			continue;
+		}
+
+		/* Handle quoted identifiers - preserve them */
+		if (in_identifier)
+		{
+			appendStringInfoChar(&normalized, tolower(*p));
+			if (*p == '"')
+			{
+				/* Check for escaped quote */
+				if (*(p + 1) == '"')
+				{
+					p++;
+					appendStringInfoChar(&normalized, '"');
+					continue;
+				}
+				in_identifier = false;
 			}
 			continue;
 		}
@@ -1050,31 +1078,79 @@ normalize_query(const char *query_string)
 		if (*p == '\'')
 		{
 			in_string = true;
+			quote_char = '\'';
 			continue;
 		}
 
-		/* Start of comment */
+		/* Start of quoted identifier */
+		if (*p == '"')
+		{
+			in_identifier = true;
+			appendStringInfoChar(&normalized, '"');
+			continue;
+		}
+
+		/* Start of line comment */
 		if (*p == '-' && *(p + 1) == '-')
 		{
 			in_comment = true;
 			continue;
 		}
 
-		/* Replace standalone numbers with placeholder, but preserve identifiers */
+		/* Start of block comment */
+		if (*p == '/' && *(p + 1) == '*')
+		{
+			/* Skip until end of block comment */
+			p += 2;
+			while (*p)
+			{
+				if (*p == '*' && *(p + 1) == '/')
+				{
+					p++;
+					break;
+				}
+				p++;
+			}
+			continue;
+		}
+
+		/*
+		 * Handle numeric literals - replace with placeholder
+		 * A number is a standalone literal if it's NOT part of an identifier.
+		 * An identifier can contain letters, digits, underscores, and dollar signs.
+		 */
 		if (isdigit(*p))
 		{
-			/* Check if this is part of an identifier (preceded by letter or underscore) */
-			if (p > query_string && (isalnum(*(p - 1)) || *(p - 1) == '_'))
+			/* Check if this digit is part of an identifier */
+			if (p > query_string && (isalnum(*(p - 1)) || *(p - 1) == '_' || *(p - 1) == '$'))
 			{
-				/* Part of an identifier like t1, c2 - keep it */
+				/* Part of an identifier - keep it */
 				appendStringInfoChar(&normalized, *p);
 				continue;
 			}
 
 			/* This is a standalone number - replace with placeholder */
-			while (isdigit(*p) || *p == '.')
+			/* Also check ahead to ensure we're not breaking an identifier */
+			const char *num_start = p;
+
+			/* Skip the number (including decimal point and scientific notation) */
+			while (*p && (isdigit(*p) || *p == '.' || *p == 'e' || *p == 'E' ||
+						  (*p == '+' && p > num_start && (*(p - 1) == 'e' || *(p - 1) == 'E')) ||
+						  (*p == '-' && p > num_start && (*(p - 1) == 'e' || *(p - 1) == 'E'))))
 				p++;
-			p--;
+
+			/* Check if the number is followed by identifier characters */
+			if (*p && (isalpha(*p) || *p == '_' || *p == '$'))
+			{
+				/* This is actually part of an identifier like "123table" - keep it all */
+				p = num_start;
+				appendStringInfoChar(&normalized, *p);
+				continue;
+			}
+
+			/* Move back one character since the loop will increment p */
+			if (*p)
+				p--;
 			appendStringInfoString(&normalized, " ? ");
 			continue;
 		}
@@ -1088,6 +1164,7 @@ normalize_query(const char *query_string)
 			continue;
 		}
 
+		/* Keep everything else (keywords, identifiers, operators) as lowercase */
 		appendStringInfoChar(&normalized, tolower(*p));
 	}
 
