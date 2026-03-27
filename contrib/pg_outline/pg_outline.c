@@ -1232,14 +1232,14 @@ store_outline_hints(const char *outline_name, const char *query_pattern,
 	appendStringInfo(&query,
 					 "INSERT INTO pg_outline_data (outline_name, query_pattern, fingerprint, hint_string, enabled) "
 					 "VALUES (%s, %s, %s, %s, true) "
-					 "ON CONFLICT (outline_name) DO UPDATE SET "
+					 "ON CONFLICT (fingerprint) DO UPDATE SET "
+					 "outline_name = EXCLUDED.outline_name, "
 					 "query_pattern = EXCLUDED.query_pattern, "
-					 "fingerprint = EXCLUDED.fingerprint, "
 					 "hint_string = EXCLUDED.hint_string, "
 					 "updated_at = CURRENT_TIMESTAMP",
-					 quote_literal_cstr(outline_name),
+					 outline_name ? quote_literal_cstr(outline_name) : "NULL",
 					 quote_literal_cstr(query_pattern),
-					 fingerprint ? quote_literal_cstr(fingerprint) : "NULL",
+					 quote_literal_cstr(fingerprint),
 					 quote_literal_cstr(hints));
 
 	ret = SPI_execute(query.data, false, 0);
@@ -1272,8 +1272,9 @@ retrieve_outline_hints(const char *fingerprint)
 	initStringInfo(&query);
 	appendStringInfo(&query,
 					 "SELECT hint_string FROM pg_outline_data "
-					 "WHERE enabled = true "
-					 "LIMIT 1");
+					 "WHERE fingerprint = %s AND enabled = true "
+					 "LIMIT 1",
+					 quote_literal_cstr(fingerprint));
 
 	ret = SPI_execute(query.data, true, 1);
 
@@ -2017,7 +2018,8 @@ pg_outline_drop(PG_FUNCTION_ARGS)
 
 	initStringInfo(&query);
 	appendStringInfo(&query,
-					 "DELETE FROM pg_outline_data WHERE outline_name = %s",
+					 "DELETE FROM pg_outline_data WHERE fingerprint = %s OR outline_name = %s",
+					 quote_literal_cstr(name_str),
 					 quote_literal_cstr(name_str));
 
 	ret = SPI_execute(query.data, false, 0);
@@ -2053,7 +2055,8 @@ pg_outline_enable(PG_FUNCTION_ARGS)
 	initStringInfo(&query);
 	appendStringInfo(&query,
 					 "UPDATE pg_outline_data SET enabled = true, updated_at = CURRENT_TIMESTAMP "
-					 "WHERE outline_name = %s",
+					 "WHERE fingerprint = %s OR outline_name = %s",
+					 quote_literal_cstr(name_str),
 					 quote_literal_cstr(name_str));
 
 	ret = SPI_execute(query.data, false, 0);
@@ -2089,7 +2092,8 @@ pg_outline_disable(PG_FUNCTION_ARGS)
 	initStringInfo(&query);
 	appendStringInfo(&query,
 					 "UPDATE pg_outline_data SET enabled = false, updated_at = CURRENT_TIMESTAMP "
-					 "WHERE outline_name = %s",
+					 "WHERE fingerprint = %s OR outline_name = %s",
+					 quote_literal_cstr(name_str),
 					 quote_literal_cstr(name_str));
 
 	ret = SPI_execute(query.data, false, 0);

@@ -16,6 +16,7 @@ include $(PGXS)
 else
 subdir = contrib/pg_outline
 top_builddir = ../..
+top_srcdir = ../..
 include $(top_builddir)/src/Makefile.global
-include $(top_srcdir)/contrib/contrib-global.mk
+include $(top_builddir)/contrib/contrib-global.mk
 endif
