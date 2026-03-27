@@ -126,6 +126,46 @@ static OutlineInfo *current_outline = NULL;
 /* Current PlannedStmt for relation name resolution */
 static PlannedStmt *current_plannedstmt = NULL;
 
+/*
+ * Query jumbling infrastructure (adapted from pg_stat_statements)
+ * Used to compute unique hashes for Query structures without modifying them.
+ */
+#define JUMBLE_SIZE				1024	/* query serialization buffer size */
+
+/* Working state for computing a query jumble */
+typedef struct OutlineJumbleState
+{
+	unsigned char *jumble;		/* Jumble of current query tree */
+	Size		jumble_len;			/* Number of bytes used in jumble[] */
+} OutlineJumbleState;
+
+/*
+ * Query metadata entry - stores the mapping from query hash to metadata
+ * This replaces the invasive approach of adding fields to Query structure.
+ */
+typedef struct QueryMetadataEntry
+{
+	uint64		query_hash;			/* Hash computed by jumbleQuery (KEY) */
+	int			stmt_location;		/* Query stmt_location for disambiguation */
+	char	   *query_name;			/* Unique name (main, cte_orders, etc.) */
+	char	   *query_hints;		/* Hint string for this Query */
+	int			query_index;		/* Sequential index for ordering */
+	struct QueryMetadataEntry *next;  /* For handling collisions */
+} QueryMetadataEntry;
+
+/* Simple hash table for Query metadata */
+#define QUERY_METADATA_HASH_SIZE 128
+
+typedef struct QueryMetadataHashTable
+{
+	QueryMetadataEntry *buckets[QUERY_METADATA_HASH_SIZE];
+	MemoryContext	memory_context;	/* Context for allocations */
+	int			entry_count;		/* Number of entries */
+} QueryMetadataHashTable;
+
+/* Current query metadata hash table - created per query execution */
+static QueryMetadataHashTable *current_query_metadata = NULL;
+
 /* Function declarations */
 void		_PG_init(void);
 void		_PG_fini(void);
@@ -181,6 +221,21 @@ typedef struct QueryNamingContext
 
 static void assign_query_names(Query *query, QueryNamingContext *context, const char *parent_name, const char *cte_name);
 static char *generate_query_name(QueryNamingContext *context, const char *type, const char *cte_name);
+
+/* Query jumbling and hash table functions */
+static void AppendJumble(OutlineJumbleState *jstate, const unsigned char *item, Size size);
+static void JumbleQuery(OutlineJumbleState *jstate, Query *query);
+static void JumbleRangeTable(OutlineJumbleState *jstate, List *rtable);
+static void JumbleExpr(OutlineJumbleState *jstate, Node *node);
+static uint64 compute_query_hash(Query *query);
+
+static QueryMetadataHashTable *create_query_metadata_table(MemoryContext context);
+static void destroy_query_metadata_table(QueryMetadataHashTable *table);
+static void store_query_metadata(QueryMetadataHashTable *table, Query *query,
+								 const char *query_name, const char *query_hints, int query_index);
+static QueryMetadataEntry *lookup_query_metadata(QueryMetadataHashTable *table, Query *query);
+static char *get_query_name(Query *query);
+static char *get_query_hints(Query *query);
 
 
 /* SQL-callable functions */
@@ -1921,6 +1976,506 @@ process_query_sublinks(Query *query, List *hint_positions, const char *source_te
 	assign_hints_sublink_walker(query->limitOffset, &context);
 	assign_hints_sublink_walker(query->limitCount, &context);
 }
+
+/*
+ * ============================================================================
+ * Query Jumbling and Hash Table Implementation
+ * ============================================================================
+ *
+ * This section provides a non-invasive way to associate metadata (names and hints)
+ * with Query structures without modifying the Query structure definition.
+ *
+ * It uses a jumble-based hashing approach (adapted from pg_stat_statements)
+ * to compute unique identifiers for each Query, then maintains a hash table
+ * mapping these identifiers to their associated metadata.
+ */
+
+/*
+ * AppendJumble: Append data to the query jumble
+ */
+static void
+AppendJumble(OutlineJumbleState *jstate, const unsigned char *item, Size size)
+{
+	unsigned char *jumble = jstate->jumble;
+	Size		jumble_len = jstate->jumble_len;
+
+	/*
+	 * Whenever the jumble buffer is full, we hash the current contents and
+	 * reset the buffer to contain just that hash value, thus relying on the
+	 * hash to summarize everything so far.
+	 */
+	while (size > 0)
+	{
+		Size		part_size;
+
+		if (jumble_len >= JUMBLE_SIZE)
+		{
+			uint64		start_hash;
+
+			start_hash = DatumGetUInt64(hash_any_extended(jumble,
+														  JUMBLE_SIZE, 0));
+			memcpy(jumble, &start_hash, sizeof(start_hash));
+			jumble_len = sizeof(start_hash);
+		}
+		part_size = Min(size, JUMBLE_SIZE - jumble_len);
+		memcpy(jumble + jumble_len, item, part_size);
+		jumble_len += part_size;
+		item += part_size;
+		size -= part_size;
+	}
+	jstate->jumble_len = jumble_len;
+}
+
+/* Macros for jumbling various data types */
+#define APP_JUMB(item) \
+	AppendJumble(jstate, (const unsigned char *) &(item), sizeof(item))
+#define APP_JUMB_STRING(str) \
+	AppendJumble(jstate, (const unsigned char *) (str), strlen(str) + 1)
+
+/*
+ * JumbleQuery: Selectively serialize the query tree
+ */
+static void
+JumbleQuery(OutlineJumbleState *jstate, Query *query)
+{
+	Assert(IsA(query, Query));
+	Assert(query->utilityStmt == NULL);
+
+	APP_JUMB(query->commandType);
+	/* Include stmt_location to distinguish between different Query nodes */
+	APP_JUMB(query->stmt_location);
+
+	JumbleExpr(jstate, (Node *) query->cteList);
+	JumbleRangeTable(jstate, query->rtable);
+	JumbleExpr(jstate, (Node *) query->jointree);
+	JumbleExpr(jstate, (Node *) query->targetList);
+	JumbleExpr(jstate, (Node *) query->onConflict);
+	JumbleExpr(jstate, (Node *) query->returningList);
+	JumbleExpr(jstate, (Node *) query->groupClause);
+	JumbleExpr(jstate, (Node *) query->groupingSets);
+	JumbleExpr(jstate, query->havingQual);
+	JumbleExpr(jstate, (Node *) query->windowClause);
+	JumbleExpr(jstate, (Node *) query->distinctClause);
+	JumbleExpr(jstate, (Node *) query->sortClause);
+	JumbleExpr(jstate, query->limitOffset);
+	JumbleExpr(jstate, query->limitCount);
+	JumbleExpr(jstate, query->setOperations);
+}
+
+/*
+ * JumbleRangeTable: Jumble a range table
+ */
+static void
+JumbleRangeTable(OutlineJumbleState *jstate, List *rtable)
+{
+	ListCell   *lc;
+
+	foreach(lc, rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		APP_JUMB(rte->rtekind);
+		switch (rte->rtekind)
+		{
+			case RTE_RELATION:
+				APP_JUMB(rte->relid);
+				JumbleExpr(jstate, (Node *) rte->tablesample);
+				break;
+			case RTE_SUBQUERY:
+				JumbleQuery(jstate, rte->subquery);
+				break;
+			case RTE_JOIN:
+				APP_JUMB(rte->jointype);
+				break;
+			case RTE_FUNCTION:
+				JumbleExpr(jstate, (Node *) rte->functions);
+				break;
+			case RTE_TABLEFUNC:
+				JumbleExpr(jstate, (Node *) rte->tablefunc);
+				break;
+			case RTE_VALUES:
+				JumbleExpr(jstate, (Node *) rte->values_lists);
+				break;
+			case RTE_CTE:
+				APP_JUMB_STRING(rte->ctename);
+				APP_JUMB(rte->ctelevelsup);
+				break;
+			case RTE_NAMEDTUPLESTORE:
+				APP_JUMB_STRING(rte->enrname);
+				break;
+			case RTE_RESULT:
+				break;
+			default:
+				elog(ERROR, "unrecognized RTE kind: %d", (int) rte->rtekind);
+				break;
+		}
+	}
+}
+
+/*
+ * JumbleExpr: Jumble an expression tree
+ * Simplified version that handles the most common expression types.
+ */
+static void
+JumbleExpr(OutlineJumbleState *jstate, Node *node)
+{
+	ListCell   *temp;
+
+	if (node == NULL)
+		return;
+
+	/* Guard against stack overflow */
+	check_stack_depth();
+
+	APP_JUMB(node->type);
+
+	switch (nodeTag(node))
+	{
+		case T_Var:
+			{
+				Var		   *var = (Var *) node;
+				APP_JUMB(var->varno);
+				APP_JUMB(var->varattno);
+				APP_JUMB(var->varlevelsup);
+			}
+			break;
+		case T_Const:
+			{
+				Const	   *c = (Const *) node;
+				APP_JUMB(c->consttype);
+			}
+			break;
+		case T_Param:
+			{
+				Param	   *p = (Param *) node;
+				APP_JUMB(p->paramkind);
+				APP_JUMB(p->paramid);
+				APP_JUMB(p->paramtype);
+			}
+			break;
+		case T_Aggref:
+			{
+				Aggref	   *expr = (Aggref *) node;
+				APP_JUMB(expr->aggfnoid);
+				JumbleExpr(jstate, (Node *) expr->aggdirectargs);
+				JumbleExpr(jstate, (Node *) expr->args);
+				JumbleExpr(jstate, (Node *) expr->aggorder);
+				JumbleExpr(jstate, (Node *) expr->aggdistinct);
+				JumbleExpr(jstate, (Node *) expr->aggfilter);
+			}
+			break;
+		case T_WindowFunc:
+			{
+				WindowFunc *expr = (WindowFunc *) node;
+				APP_JUMB(expr->winfnoid);
+				APP_JUMB(expr->winref);
+				JumbleExpr(jstate, (Node *) expr->args);
+				JumbleExpr(jstate, (Node *) expr->aggfilter);
+			}
+			break;
+		case T_FuncExpr:
+			{
+				FuncExpr   *expr = (FuncExpr *) node;
+				APP_JUMB(expr->funcid);
+				JumbleExpr(jstate, (Node *) expr->args);
+			}
+			break;
+		case T_OpExpr:
+		case T_DistinctExpr:
+		case T_NullIfExpr:
+			{
+				OpExpr	   *expr = (OpExpr *) node;
+				APP_JUMB(expr->opno);
+				JumbleExpr(jstate, (Node *) expr->args);
+			}
+			break;
+		case T_ScalarArrayOpExpr:
+			{
+				ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
+				APP_JUMB(expr->opno);
+				APP_JUMB(expr->useOr);
+				JumbleExpr(jstate, (Node *) expr->args);
+			}
+			break;
+		case T_BoolExpr:
+			{
+				BoolExpr   *expr = (BoolExpr *) node;
+				APP_JUMB(expr->boolop);
+				JumbleExpr(jstate, (Node *) expr->args);
+			}
+			break;
+		case T_SubLink:
+			{
+				SubLink    *sublink = (SubLink *) node;
+				APP_JUMB(sublink->subLinkType);
+				APP_JUMB(sublink->subLinkId);
+				JumbleExpr(jstate, (Node *) sublink->testexpr);
+				JumbleQuery(jstate, castNode(Query, sublink->subselect));
+			}
+			break;
+		case T_List:
+			foreach(temp, (List *) node)
+			{
+				JumbleExpr(jstate, (Node *) lfirst(temp));
+			}
+			break;
+		case T_SortGroupClause:
+			{
+				SortGroupClause *sgc = (SortGroupClause *) node;
+				APP_JUMB(sgc->tleSortGroupRef);
+				APP_JUMB(sgc->eqop);
+				APP_JUMB(sgc->sortop);
+				APP_JUMB(sgc->nulls_first);
+			}
+			break;
+		case T_GroupingSet:
+			{
+				GroupingSet *gsnode = (GroupingSet *) node;
+				APP_JUMB(gsnode->kind);
+				JumbleExpr(jstate, (Node *) gsnode->content);
+			}
+			break;
+		case T_WindowClause:
+			{
+				WindowClause *wc = (WindowClause *) node;
+				APP_JUMB(wc->winref);
+				APP_JUMB(wc->frameOptions);
+				JumbleExpr(jstate, (Node *) wc->partitionClause);
+				JumbleExpr(jstate, (Node *) wc->orderClause);
+				JumbleExpr(jstate, wc->startOffset);
+				JumbleExpr(jstate, wc->endOffset);
+			}
+			break;
+		case T_CommonTableExpr:
+			{
+				CommonTableExpr *cte = (CommonTableExpr *) node;
+				APP_JUMB_STRING(cte->ctename);
+				JumbleQuery(jstate, castNode(Query, cte->ctequery));
+			}
+			break;
+		case T_SetOperationStmt:
+			{
+				SetOperationStmt *setop = (SetOperationStmt *) node;
+				APP_JUMB(setop->op);
+				APP_JUMB(setop->all);
+				JumbleExpr(jstate, setop->larg);
+				JumbleExpr(jstate, setop->rarg);
+			}
+			break;
+		case T_RangeTblRef:
+			{
+				RangeTblRef *rtr = (RangeTblRef *) node;
+				APP_JUMB(rtr->rtindex);
+			}
+			break;
+		case T_JoinExpr:
+			{
+				JoinExpr   *join = (JoinExpr *) node;
+				APP_JUMB(join->jointype);
+				APP_JUMB(join->isNatural);
+				APP_JUMB(join->rtindex);
+				JumbleExpr(jstate, join->larg);
+				JumbleExpr(jstate, join->rarg);
+				JumbleExpr(jstate, (Node *) join->usingClause);
+				JumbleExpr(jstate, join->quals);
+			}
+			break;
+		case T_FromExpr:
+			{
+				FromExpr   *from = (FromExpr *) node;
+				JumbleExpr(jstate, (Node *) from->fromlist);
+				JumbleExpr(jstate, from->quals);
+			}
+			break;
+		case T_OnConflictExpr:
+			{
+				OnConflictExpr *conf = (OnConflictExpr *) node;
+				APP_JUMB(conf->action);
+				JumbleExpr(jstate, (Node *) conf->arbiterElems);
+				JumbleExpr(jstate, conf->arbiterWhere);
+				JumbleExpr(jstate, (Node *) conf->onConflictSet);
+				JumbleExpr(jstate, conf->onConflictWhere);
+				APP_JUMB(conf->constraint);
+				JumbleExpr(jstate, (Node *) conf->exclRelTlist);
+			}
+			break;
+		case T_TargetEntry:
+			{
+				TargetEntry *tle = (TargetEntry *) node;
+				JumbleExpr(jstate, (Node *) tle->expr);
+				APP_JUMB(tle->ressortgroupref);
+			}
+			break;
+		default:
+			/* For unknown node types, just jumble the node type itself */
+			break;
+	}
+}
+
+/*
+ * compute_query_hash: Compute a unique hash for a Query structure
+ */
+static uint64
+compute_query_hash(Query *query)
+{
+	OutlineJumbleState jstate;
+	uint64		hash;
+
+	if (query == NULL)
+		return 0;
+
+	/* Set up workspace for query jumbling */
+	jstate.jumble = (unsigned char *) palloc(JUMBLE_SIZE);
+	jstate.jumble_len = 0;
+
+	/* Compute the jumble */
+	JumbleQuery(&jstate, query);
+
+	/* Compute final hash */
+	hash = DatumGetUInt64(hash_any_extended(jstate.jumble, jstate.jumble_len, 0));
+
+	/* Avoid returning zero (reserved for special cases) */
+	if (hash == UINT64CONST(0))
+		hash = UINT64CONST(1);
+
+	pfree(jstate.jumble);
+
+	return hash;
+}
+
+/*
+ * create_query_metadata_table: Create a new hash table for Query metadata
+ */
+static QueryMetadataHashTable *
+create_query_metadata_table(MemoryContext context)
+{
+	QueryMetadataHashTable *table;
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(context);
+
+	table = (QueryMetadataHashTable *) palloc0(sizeof(QueryMetadataHashTable));
+	table->memory_context = context;
+	table->entry_count = 0;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	return table;
+}
+
+/*
+ * destroy_query_metadata_table: Destroy a query metadata hash table
+ */
+static void
+destroy_query_metadata_table(QueryMetadataHashTable *table)
+{
+	if (table == NULL)
+		return;
+
+	/* Entries are allocated in table->memory_context, so no need to free individually */
+	pfree(table);
+}
+
+/*
+ * store_query_metadata: Store metadata for a Query in the hash table
+ */
+static void
+store_query_metadata(QueryMetadataHashTable *table, Query *query,
+					 const char *query_name, const char *query_hints, int query_index)
+{
+	uint64		hash;
+	int			bucket;
+	QueryMetadataEntry *entry;
+	MemoryContext oldcontext;
+
+	if (table == NULL || query == NULL)
+		return;
+
+	hash = compute_query_hash(query);
+	bucket = hash % QUERY_METADATA_HASH_SIZE;
+
+	oldcontext = MemoryContextSwitchTo(table->memory_context);
+
+	/* Create new entry */
+	entry = (QueryMetadataEntry *) palloc(sizeof(QueryMetadataEntry));
+	entry->query_hash = hash;
+	entry->stmt_location = query->stmt_location;
+	entry->query_name = query_name ? pstrdup(query_name) : NULL;
+	entry->query_hints = query_hints ? pstrdup(query_hints) : NULL;
+	entry->query_index = query_index;
+
+	/* Insert at head of bucket list */
+	entry->next = table->buckets[bucket];
+	table->buckets[bucket] = entry;
+	table->entry_count++;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	elog(DEBUG1, "Stored query metadata: hash=%lu, location=%d, name=%s, index=%d",
+		 hash, query->stmt_location, query_name ? query_name : "(null)", query_index);
+}
+
+/*
+ * lookup_query_metadata: Look up metadata for a Query in the hash table
+ */
+static QueryMetadataEntry *
+lookup_query_metadata(QueryMetadataHashTable *table, Query *query)
+{
+	uint64		hash;
+	int			bucket;
+	QueryMetadataEntry *entry;
+
+	if (table == NULL || query == NULL)
+		return NULL;
+
+	hash = compute_query_hash(query);
+	bucket = hash % QUERY_METADATA_HASH_SIZE;
+
+	/* Search the bucket for a matching entry */
+	for (entry = table->buckets[bucket]; entry != NULL; entry = entry->next)
+	{
+		if (entry->query_hash == hash && entry->stmt_location == query->stmt_location)
+			return entry;
+	}
+
+	return NULL;
+}
+
+/*
+ * get_query_name: Helper to get query name from current hash table
+ */
+static char *
+get_query_name(Query *query)
+{
+	QueryMetadataEntry *entry;
+
+	if (current_query_metadata == NULL)
+		return NULL;
+
+	entry = lookup_query_metadata(current_query_metadata, query);
+	return entry ? entry->query_name : NULL;
+}
+
+/*
+ * get_query_hints: Helper to get query hints from current hash table
+ */
+static char *
+get_query_hints(Query *query)
+{
+	QueryMetadataEntry *entry;
+
+	if (current_query_metadata == NULL)
+		return NULL;
+
+	entry = lookup_query_metadata(current_query_metadata, query);
+	return entry ? entry->query_hints : NULL;
+}
+
+/*
+ * ============================================================================
+ * End of Query Jumbling and Hash Table Implementation
+ * ============================================================================
+ */
 
 /*
  * Generate a unique name for a Query structure
