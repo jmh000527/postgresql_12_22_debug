@@ -116,6 +116,7 @@ typedef struct QueryHintPosition
 	int			hint_location;	/* Location in source where this hint begins */
 	int			hint_end;		/* Location where this hint ends */
 	char	   *hint_text;		/* Hint text extracted from comment */
+	bool		consumed;		/* true if this hint has been matched to a Query */
 } QueryHintPosition;
 
 /* Memory context for pg_outline data that persists across queries */
@@ -1989,6 +1990,7 @@ extract_inline_hints_with_positions(const char *query_string)
 			pos->hint_location = hint_begin_loc;
 			pos->hint_end = (p - query_string) + 2; /* Include closing */
 			pos->hint_text = hint_text;
+			pos->consumed = false;	/* Initially not matched to any Query */
 
 			hint_positions = lappend(hint_positions, pos);
 
@@ -2047,11 +2049,19 @@ strip_hints_from_query(const char *query_string)
  * Find the hint that corresponds to a Query at a specific location
  * Looks for a hint comment that appears just before the SELECT keyword
  * at or near the Query's stmt_location
+ *
+ * Enhanced matching logic inspired by pg_hint_plan:
+ * - A hint applies if it appears anywhere between the previous query's location and this query's location
+ * - We search for the CLOSEST unconsumed hint before the query's stmt_location
+ * - We allow hints up to 200 characters before a query (was 100, increased for robustness)
+ * - Once a hint is matched, it's marked as consumed to prevent duplicate matching
  */
 static char *
 find_hint_for_query_location(List *hint_positions, int stmt_location)
 {
 	ListCell   *lc;
+	QueryHintPosition *best_match = NULL;
+	int			best_distance = INT_MAX;
 
 	if (stmt_location < 0)
 		return NULL;
@@ -2060,15 +2070,37 @@ find_hint_for_query_location(List *hint_positions, int stmt_location)
 	{
 		QueryHintPosition *pos = (QueryHintPosition *) lfirst(lc);
 
+		/* Skip hints that have already been matched to another Query */
+		if (pos->consumed)
+			continue;
+
 		/*
-		 * A hint applies to a Query if it appears shortly before the Query's
-		 * location. We allow for some whitespace (up to 100 characters).
+		 * A hint applies to a Query if it appears before the Query's location.
+		 * We search for the closest unconsumed hint before the stmt_location.
+		 * Allow up to 200 characters of whitespace/newlines between hint and query.
 		 */
-		if (pos->hint_end <= stmt_location &&
-			stmt_location - pos->hint_end < 100)
+		if (pos->hint_end <= stmt_location)
 		{
-			return pos->hint_text;
+			int distance = stmt_location - pos->hint_end;
+
+			/* Allow more generous distance (up to 200 chars for complex formatting) */
+			if (distance < 200 && distance < best_distance)
+			{
+				best_match = pos;
+				best_distance = distance;
+			}
 		}
+	}
+
+	if (best_match)
+	{
+		/* Mark this hint as consumed so it won't be matched again */
+		best_match->consumed = true;
+
+		elog(DEBUG1, "Matched hint '%s' (at %d-%d) to Query at location %d (distance=%d)",
+			 best_match->hint_text, best_match->hint_location, best_match->hint_end,
+			 stmt_location, best_distance);
+		return best_match->hint_text;
 	}
 
 	return NULL;
@@ -2846,6 +2878,17 @@ assign_hints_to_queries(Query *query, List *hint_positions, const char *source_t
 	if (!query)
 		return;
 
+	/* Debug: Log the Query location and all hint positions */
+	elog(NOTICE, "DEBUG: Processing Query at stmt_location=%d, commandType=%d",
+		 query->stmt_location, query->commandType);
+
+	foreach(lc, hint_positions)
+	{
+		QueryHintPosition *pos = (QueryHintPosition *) lfirst(lc);
+		elog(NOTICE, "DEBUG:   Hint at location %d-%d: '%s'",
+			 pos->hint_location, pos->hint_end, pos->hint_text);
+	}
+
 	/* Find and assign hint for this Query */
 	hint = find_hint_for_query_location(hint_positions, query->stmt_location);
 	if (hint && current_query_metadata != NULL)
@@ -2858,16 +2901,20 @@ assign_hints_to_queries(Query *query, List *hint_positions, const char *source_t
 			if (entry->query_hints)
 				pfree(entry->query_hints);
 			entry->query_hints = pstrdup(hint);
-			elog(DEBUG1, "Assigned hint '%s' to Query at location %d",
+			elog(NOTICE, "DEBUG: Assigned hint '%s' to Query at location %d",
 				 hint, query->stmt_location);
 		}
 		else
 		{
 			/* Entry doesn't exist yet, create one with just hints */
 			store_query_metadata(current_query_metadata, query, NULL, hint, -1);
-			elog(DEBUG1, "Created metadata with hint '%s' for Query at location %d",
+			elog(NOTICE, "DEBUG: Created metadata with hint '%s' for Query at location %d",
 				 hint, query->stmt_location);
 		}
+	}
+	else if (query->stmt_location >= 0)
+	{
+		elog(NOTICE, "DEBUG: No hint found for Query at location %d", query->stmt_location);
 	}
 
 	/* Process subqueries in RTEs */
