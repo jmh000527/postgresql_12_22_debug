@@ -247,6 +247,7 @@ typedef struct QueryHintCollector
 } QueryHintCollector;
 
 static void collect_query_hints_recursive(Query *query, QueryHintCollector *collector);
+static void extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query, List **hints);
 
 
 
@@ -652,26 +653,8 @@ generate_outline_from_plan(PlannedStmt *plan, const char *query_string)
 		}
 		else
 		{
-			/* No hints in Query tree, extract from plan tree and prefix with query name */
-			extract_hints_from_plan_tree(plan->planTree, &hints, 0);
-
-			/* Get the main query name from the hash table */
-			query_name = get_query_name(current_outline->query);
-			if (!query_name)
-				query_name = "main";
-
-			/* Prefix each hint with [query_name] */
-			List *prefixed_hints = NIL;
-			foreach(lc, hints)
-			{
-				char *hint = (char *) lfirst(lc);
-				if (hint)
-				{
-					char *prefixed_hint = psprintf("[%s] %s", query_name, hint);
-					prefixed_hints = lappend(prefixed_hints, prefixed_hint);
-				}
-			}
-			hints = prefixed_hints;
+			/* No hints in Query tree, extract from plan tree with proper query names */
+			extract_hints_from_plan_with_query_names(plan, current_outline->query, &hints);
 		}
 	}
 	else
@@ -1077,6 +1060,79 @@ get_leading_hint(Plan *plan)
 	/* Generate Leading hint only for the top-level join */
 	/* This will be called from extract_hints_from_plan_tree */
 	return get_leading_hint_from_join(plan);
+}
+
+/*
+ * Extract hints from plan tree with proper query names
+ * This function maps plan nodes to their corresponding Query structures
+ * and prefixes hints with the appropriate query name ([main], [sublink_N], etc.)
+ */
+static void
+extract_hints_from_plan_with_query_names(PlannedStmt *plannedstmt, Query *query, List **hints)
+{
+	List	   *main_hints = NIL;
+	ListCell   *lc;
+	char	   *query_name;
+	int			sublink_index = 0;
+
+	if (!plannedstmt || !plannedstmt->planTree || !query)
+		return;
+
+	/* Extract hints from main plan tree */
+	extract_hints_from_plan_tree(plannedstmt->planTree, &main_hints, 0);
+
+	/* Get the main query name from metadata */
+	query_name = get_query_name(query);
+	if (!query_name)
+		query_name = "main";
+
+	/* Prefix main plan hints with main query name */
+	foreach(lc, main_hints)
+	{
+		char *hint = (char *) lfirst(lc);
+		if (hint)
+		{
+			char *prefixed_hint = psprintf("[%s] %s", query_name, hint);
+			*hints = lappend(*hints, prefixed_hint);
+		}
+	}
+
+	/* Process subplans (for SubLinks - scalar subqueries, IN, EXISTS, etc.) */
+	if (plannedstmt->subplans)
+	{
+		ListCell *subplan_lc;
+		int subplan_idx = 0;
+
+		foreach(subplan_lc, plannedstmt->subplans)
+		{
+			Plan *subplan = (Plan *) lfirst(subplan_lc);
+			List *subplan_hints = NIL;
+			char *sublink_name;
+
+			if (subplan == NULL)
+				continue;
+
+			/* Extract hints from this subplan */
+			extract_hints_from_plan_tree(subplan, &subplan_hints, 0);
+
+			/* Try to find the corresponding Query for this subplan
+			 * For now, we'll use sequential naming: sublink_0, sublink_1, etc.
+			 * This matches the order subplans are created during planning */
+			sublink_name = psprintf("sublink_%d", sublink_index);
+			sublink_index++;
+
+			/* Prefix subplan hints with sublink name */
+			foreach(lc, subplan_hints)
+			{
+				char *hint = (char *) lfirst(lc);
+				if (hint)
+				{
+					char *prefixed_hint = psprintf("[%s] %s", sublink_name, hint);
+					*hints = lappend(*hints, prefixed_hint);
+				}
+			}
+		}
+	}
 }
 
 /*
