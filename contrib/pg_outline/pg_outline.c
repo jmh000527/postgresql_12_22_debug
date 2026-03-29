@@ -82,6 +82,9 @@ static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static ExplainOneQuery_hook_type prev_ExplainOneQuery_hook = NULL;
 
+/* Recursion protection flag */
+static bool inside_outline_planner = false;
+
 /* Data structures for outline hints */
 typedef enum OutlineHintType
 {
@@ -361,6 +364,17 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	char	   *query_fingerprint = NULL;
 	char	   *stored_hints = NULL;
 
+	/* Prevent infinite recursion when SPI executes internal queries */
+	if (inside_outline_planner)
+	{
+		if (prev_planner_hook)
+			return prev_planner_hook(parse, cursorOptions, boundParams);
+		else
+			return standard_planner(parse, cursorOptions, boundParams);
+	}
+
+	inside_outline_planner = true;
+
 	/* Always assign query names before planning if pg_outline is enabled */
 	if (pg_outline_enabled && parse)
 	{
@@ -387,7 +401,12 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 			query_fingerprint = compute_query_fingerprint(normalized);
 			if (query_fingerprint)
 			{
+				elog(DEBUG1, "pg_outline: computed fingerprint: %s", query_fingerprint);
 				stored_hints = retrieve_outline_hints(query_fingerprint);
+				if (stored_hints)
+					elog(NOTICE, "pg_outline: retrieved hints (len=%d): '%s'", (int)strlen(stored_hints), stored_hints);
+				else
+					elog(DEBUG1, "pg_outline: retrieved hints: (null)");
 				if (stored_hints)
 				{
 					char *sql_with_hints;
@@ -403,6 +422,10 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 					}
 
 					/* TODO: Parse and apply hints before planning */
+				}
+				else
+				{
+					elog(DEBUG1, "pg_outline: no stored hints found for fingerprint %s", query_fingerprint);
 				}
 			}
 			pfree(normalized);
@@ -421,6 +444,7 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	/* Note: In auto mode, outline generation is only done for EXPLAIN statements
 	 * in the ExplainOneQuery hook. Normal queries don't generate outlines. */
 
+	inside_outline_planner = false;
 	return result;
 }
 
@@ -1566,7 +1590,7 @@ construct_sql_with_hints(const char *query_string, const char *hints_string)
 	initStringInfo(&result);
 
 	/* Add hints comment at the beginning */
-	appendStringInfo(&result, "%s\n", hints_string);
+	appendStringInfo(&result, "/*+\nBEGIN_OUTLINE_DATA\n%s\nEND_OUTLINE_DATA\n*/\n", hints_string);
 
 	/* Add the original query */
 	appendStringInfo(&result, "%s", query_string);
