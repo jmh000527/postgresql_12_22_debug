@@ -81,9 +81,13 @@ static planner_hook_type prev_planner_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static ExplainOneQuery_hook_type prev_ExplainOneQuery_hook = NULL;
+static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 
 /* Recursion protection flag */
 static bool inside_outline_planner = false;
+
+/* Active hints for current query - used during planning */
+static List *active_outline_hints = NIL;
 
 /* Data structures for outline hints */
 typedef enum OutlineHintType
@@ -217,6 +221,17 @@ static char *strip_hints_from_query(const char *query_string);
 static void assign_hints_to_queries(Query *query, List *hint_positions, const char *source_text);
 static char *find_hint_for_query_location(List *hint_positions, int stmt_location);
 
+/* Hint parsing and application for stored outlines */
+typedef struct ParsedHint
+{
+	char *query_name;  /* e.g., "main", "sublink_0" */
+	char *hint_text;   /* e.g., "SeqScan(t1)", "IndexScan(t2)" */
+} ParsedHint;
+
+static List *parse_stored_hints(const char *hints_string);
+static void apply_hints_to_query(Query *query, List *parsed_hints);
+static void outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte);
+
 /* Query naming support */
 typedef struct QueryNamingContext
 {
@@ -332,6 +347,9 @@ _PG_init(void)
 	prev_ExplainOneQuery_hook = ExplainOneQuery_hook;
 	ExplainOneQuery_hook = outline_ExplainOneQuery;
 
+	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
+	set_rel_pathlist_hook = outline_set_rel_pathlist;
+
 	/* Create memory context for outline data */
 	OutlineContext = AllocSetContextCreate(TopMemoryContext,
 										   "OutlineContext",
@@ -351,6 +369,7 @@ _PG_fini(void)
 	ExecutorStart_hook = prev_ExecutorStart;
 	ExecutorEnd_hook = prev_ExecutorEnd;
 	ExplainOneQuery_hook = prev_ExplainOneQuery_hook;
+	set_rel_pathlist_hook = prev_set_rel_pathlist_hook;
 
 	elog(LOG, "pg_outline extension unloaded");
 }
@@ -422,7 +441,13 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 						pfree(sql_with_hints);
 					}
 
-					/* TODO: Parse and apply hints before planning */
+					/* Parse and apply hints before planning */
+					active_outline_hints = parse_stored_hints(stored_hints);
+					if (active_outline_hints != NIL)
+					{
+						elog(DEBUG1, "pg_outline: parsed %d hints from stored outline", list_length(active_outline_hints));
+						apply_hints_to_query(parse, active_outline_hints);
+					}
 				}
 				else
 				{
@@ -438,6 +463,9 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		result = prev_planner_hook(parse, cursorOptions, boundParams);
 	else
 		result = standard_planner(parse, cursorOptions, boundParams);
+
+	/* Clean up active hints after planning */
+	active_outline_hints = NIL;
 
 	/* Save PlannedStmt for relation name resolution */
 	current_plannedstmt = result;
@@ -3975,4 +4003,249 @@ pg_outline_list(PG_FUNCTION_ARGS)
 	elog(NOTICE, "pg_outline_list: use SELECT * FROM pg_outline_list() for listing");
 
 	PG_RETURN_VOID();
+}
+
+/*
+ * parse_stored_hints - Parse stored hint string into structured hints
+ *
+ * Input format: "[query_name] hint_text\n[query_name2] hint_text2"
+ * Returns: List of ParsedHint structures
+ */
+static List *
+parse_stored_hints(const char *hints_string)
+{
+	List	   *result = NIL;
+	const char *p;
+	ParsedHint *parsed_hint;
+
+	if (!hints_string || hints_string[0] == '\0')
+		return NIL;
+
+	p = hints_string;
+	while (*p)
+	{
+		/* Skip whitespace */
+		while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+			p++;
+
+		if (!*p)
+			break;
+
+		/* Look for [query_name] */
+		if (*p == '[')
+		{
+			const char *name_start = p + 1;
+			const char *name_end = strchr(name_start, ']');
+
+			if (name_end)
+			{
+				size_t		name_len = name_end - name_start;
+				char	   *query_name;
+				const char *hint_start;
+				const char *hint_end;
+				char	   *hint_text;
+				size_t		hint_len;
+
+				query_name = (char *) palloc(name_len + 1);
+				memcpy(query_name, name_start, name_len);
+				query_name[name_len] = '\0';
+
+				/* Skip past ] and spaces */
+				p = name_end + 1;
+				while (*p && (*p == ' ' || *p == '\t'))
+					p++;
+
+				/* Extract hint text until newline or end of string */
+				hint_start = p;
+				while (*p && *p != '\n' && *p != '\r')
+					p++;
+
+				hint_len = p - hint_start;
+				hint_text = (char *) palloc(hint_len + 1);
+				memcpy(hint_text, hint_start, hint_len);
+				hint_text[hint_len] = '\0';
+
+				/* Create ParsedHint and add to list */
+				parsed_hint = (ParsedHint *) palloc(sizeof(ParsedHint));
+				parsed_hint->query_name = query_name;
+				parsed_hint->hint_text = hint_text;
+				result = lappend(result, parsed_hint);
+
+				elog(DEBUG2, "pg_outline: parsed hint [%s] %s", query_name, hint_text);
+			}
+			else
+			{
+				/* Skip to next line if malformed */
+				while (*p && *p != '\n')
+					p++;
+			}
+		}
+		else
+		{
+			/* Skip unrecognized content */
+			while (*p && *p != '\n')
+				p++;
+		}
+	}
+
+	return result;
+}
+
+/*
+ * apply_hints_to_query - Apply parsed hints to Query tree via metadata
+ *
+ * Associates each hint with its corresponding Query node by looking up
+ * the query name in the metadata hash table and storing the hint there.
+ */
+static void
+apply_hints_to_query(Query *query, List *parsed_hints)
+{
+	ListCell   *lc;
+
+	if (!query || !current_query_metadata || !parsed_hints)
+		return;
+
+	/* Iterate through all parsed hints */
+	foreach(lc, parsed_hints)
+	{
+		ParsedHint *hint = (ParsedHint *) lfirst(lc);
+		QueryMetadataEntry *entry;
+		int			bucket;
+		uint64		hash;
+		bool		found = false;
+
+		/* Try to find the Query with this name */
+		for (bucket = 0; bucket < QUERY_METADATA_HASH_SIZE; bucket++)
+		{
+			for (entry = current_query_metadata->buckets[bucket]; entry != NULL; entry = entry->next)
+			{
+				if (entry->query_name && strcmp(entry->query_name, hint->query_name) == 0)
+				{
+					/* Found matching query - store hint */
+					if (entry->query_hints)
+					{
+						/* Append to existing hints */
+						char	   *old_hints = entry->query_hints;
+						char	   *new_hints = psprintf("%s %s", old_hints, hint->hint_text);
+
+						pfree(old_hints);
+						entry->query_hints = new_hints;
+					}
+					else
+					{
+						entry->query_hints = pstrdup(hint->hint_text);
+					}
+					elog(DEBUG1, "pg_outline: applied hint to query '%s': %s",
+						 hint->query_name, hint->hint_text);
+					found = true;
+					break;
+				}
+			}
+			if (found)
+				break;
+		}
+
+		if (!found)
+		{
+			elog(DEBUG1, "pg_outline: could not find query named '%s' for hint application",
+				 hint->query_name);
+		}
+	}
+}
+
+/*
+ * outline_set_rel_pathlist - Hook to enforce scan method hints
+ *
+ * This hook is called when the planner is generating paths for a relation.
+ * We examine the active hints and filter out paths that don't match the hint.
+ */
+static void
+outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
+{
+	List	   *kept_paths = NIL;
+	ListCell   *lc;
+	char	   *rel_name;
+	char	   *query_hints;
+	bool		has_seqscan_hint = false;
+	bool		has_indexscan_hint = false;
+	bool		has_indexonlyscan_hint = false;
+
+	/* Call previous hook first if it exists */
+	if (prev_set_rel_pathlist_hook)
+		prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	/* Only apply hints if we have active hints */
+	if (active_outline_hints == NIL || !current_query_metadata)
+		return;
+
+	/* Only apply to base relations */
+	if (rel->reloptkind != RELOPT_BASEREL)
+		return;
+
+	/* Get relation name */
+	if (rte->rtekind == RTE_RELATION)
+	{
+		rel_name = get_rel_name(rte->relid);
+		if (!rel_name)
+			return;
+	}
+	else
+	{
+		return;  /* Not a regular table */
+	}
+
+	/* Get hints for the current query */
+	query_hints = get_query_hints(root->parse);
+	if (!query_hints)
+	{
+		pfree(rel_name);
+		return;
+	}
+
+	/* Check if this relation is mentioned in any hint */
+	if (strstr(query_hints, "SeqScan") && strstr(query_hints, rel_name))
+		has_seqscan_hint = true;
+	if (strstr(query_hints, "IndexScan") && strstr(query_hints, rel_name))
+		has_indexscan_hint = true;
+	if (strstr(query_hints, "IndexOnlyScan") && strstr(query_hints, rel_name))
+		has_indexonlyscan_hint = true;
+
+	/* If we have a specific scan hint for this relation, filter paths */
+	if (has_seqscan_hint || has_indexscan_hint || has_indexonlyscan_hint)
+	{
+		elog(DEBUG1, "pg_outline: filtering paths for relation '%s' based on hints", rel_name);
+
+		foreach(lc, rel->pathlist)
+		{
+			Path	   *path = (Path *) lfirst(lc);
+			bool		keep = false;
+
+			/* Keep paths that match the hint */
+			if (has_seqscan_hint && IsA(path, Path) && path->pathtype == T_SeqScan)
+				keep = true;
+			if (has_indexscan_hint && IsA(path, IndexPath))
+				keep = true;
+			if (has_indexonlyscan_hint && IsA(path, IndexPath))
+			{
+				IndexPath  *ipath = (IndexPath *) path;
+
+				/* Check if it's an index-only scan */
+				if (ipath->indexinfo && ipath->indexinfo->canreturn)
+					keep = true;
+			}
+
+			if (keep)
+				kept_paths = lappend(kept_paths, path);
+		}
+
+		/* If we filtered to some paths, use only those */
+		if (kept_paths != NIL)
+		{
+			elog(DEBUG1, "pg_outline: filtered from %d to %d paths for '%s'",
+				 list_length(rel->pathlist), list_length(kept_paths), rel_name);
+			rel->pathlist = kept_paths;
+		}
+	}
+
+	pfree(rel_name);
 }
