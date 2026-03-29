@@ -1,0 +1,30 @@
+Test Case: Query Normalization Consistency
+===========================================
+
+Problem:
+--------
+The same SQL query with different whitespace was producing different fingerprints,
+breaking outline matching in manual mode.
+
+Test Queries:
+-------------
+Query 1: "SELECT c1, (SELECT c3 FROM t2 WHERE t2.c2 = t1.c1 LIMIT 1) FROM t1 LIMIT 5;"
+Query 2: "  SELECT c1, (SELECT c3 FROM t2 WHERE t2.c2 = t1.c1 LIMIT 1) FROM t1 LIMIT 5;  "
+Query 3: "select   c1,   (select   c3   from   t2   where   t2.c2 = t1.c1   limit   1)   from   t1   limit   5;"
+
+Expected Result:
+---------------
+All three queries should normalize to the same string:
+"select c1,(select c3 from t2 where t2.c2=t1.c1 limit ?) from t1 limit ?"
+
+And thus produce the same MD5 fingerprint.
+
+Key Changes in normalize_query():
+---------------------------------
+1. last_was_space flag tracks whitespace state
+2. Leading spaces automatically trimmed (last_was_space starts true)
+3. Consecutive spaces collapsed to single space
+4. Trailing spaces explicitly trimmed
+5. Space before '?' placeholder added only when needed
+
+This ensures deterministic normalization regardless of input whitespace.
