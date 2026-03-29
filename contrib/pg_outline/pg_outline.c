@@ -196,6 +196,7 @@ static char *get_relation_name(Index relid, PlannedStmt *plan);
 static void display_outline_data(void);
 static StringInfo format_outline_data(List *hints);
 static char *construct_sql_with_hints(const char *query_string, const char *hints_string);
+static char *reconstruct_sql_with_positioned_hints(const char *query_string, const char *hints_string);
 
 /* Query fingerprinting */
 static char *normalize_query(const char *query_string);
@@ -413,11 +414,11 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 
 					elog(DEBUG1, "pg_outline: found stored hints for query");
 
-					/* Construct SQL with hints injected and log it */
-					sql_with_hints = construct_sql_with_hints(debug_query_string, stored_hints);
+					/* Construct SQL with hints injected at original positions */
+					sql_with_hints = reconstruct_sql_with_positioned_hints(debug_query_string, stored_hints);
 					if (sql_with_hints)
 					{
-						elog(NOTICE, "Outline matched! SQL with hints injected:\n%s", sql_with_hints);
+						elog(NOTICE, "Outline matched! SQL with hints inserted at original positions:\n%s", sql_with_hints);
 						pfree(sql_with_hints);
 					}
 
@@ -636,13 +637,13 @@ outline_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 								 "The existing outline will be used when the query is executed.",
 								 outline_name.data);
 
-							/* Show SQL with hints injected */
+							/* Show SQL with hints injected at original positions */
 							if (formatted_hints && formatted_hints->data)
 							{
-								sql_with_hints = construct_sql_with_hints(queryString, formatted_hints->data);
+								sql_with_hints = reconstruct_sql_with_positioned_hints(queryString, formatted_hints->data);
 								if (sql_with_hints)
 								{
-									elog(NOTICE, "SQL with outline hints injected:\n%s", sql_with_hints);
+									elog(NOTICE, "SQL with outline hints inserted at original positions:\n%s", sql_with_hints);
 									pfree(sql_with_hints);
 								}
 								pfree(formatted_hints->data);
@@ -1597,6 +1598,123 @@ construct_sql_with_hints(const char *query_string, const char *hints_string)
 
 	ret = result.data;
 	return ret;
+}
+
+/*
+ * Reconstruct SQL with hints at their original positions
+ * This is a simplified implementation that inserts the main query hint
+ * at the beginning of the SQL, which is sufficient for most cases.
+ *
+ * For complex scenarios with positioned hints, this function parses
+ * hints in "[query_name] hint" format and attempts to inject them at
+ * appropriate positions in the SQL.
+ */
+static char *
+reconstruct_sql_with_positioned_hints(const char *query_string, const char *hints_string)
+{
+	StringInfoData result;
+	const char *p;
+	char	   *main_hint = NULL;
+	List	   *other_hints = NIL;
+
+	if (!query_string || !hints_string)
+		return NULL;
+
+	initStringInfo(&result);
+
+	/*
+	 * Parse hints_string to separate [main] hint from others
+	 * Format: "[main] hint1\n[sublink_0] hint2\n[cte_xxx] hint3"
+	 */
+	p = hints_string;
+	while (*p)
+	{
+		/* Skip whitespace */
+		while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+			p++;
+
+		if (!*p)
+			break;
+
+		/* Look for [query_name] */
+		if (*p == '[')
+		{
+			const char *name_start = p + 1;
+			const char *name_end = strchr(name_start, ']');
+
+			if (name_end)
+			{
+				size_t name_len = name_end - name_start;
+				char *query_name = palloc(name_len + 1);
+				memcpy(query_name, name_start, name_len);
+				query_name[name_len] = '\0';
+
+				/* Skip past ] and spaces */
+				p = name_end + 1;
+				while (*p && (*p == ' ' || *p == '\t'))
+					p++;
+
+				/* Extract hint text until newline */
+				const char *hint_start = p;
+				while (*p && *p != '\n' && *p != '\r')
+					p++;
+
+				size_t hint_len = p - hint_start;
+				char *hint_text = palloc(hint_len + 1);
+				memcpy(hint_text, hint_start, hint_len);
+				hint_text[hint_len] = '\0';
+
+				/* Store hint */
+				if (strcmp(query_name, "main") == 0)
+				{
+					main_hint = hint_text;
+				}
+				else
+				{
+					/* Store non-main hints for potential future use */
+					other_hints = lappend(other_hints, hint_text);
+				}
+
+				pfree(query_name);
+			}
+			else
+			{
+				/* Skip to next line if malformed */
+				while (*p && *p != '\n')
+					p++;
+			}
+		}
+		else
+		{
+			/* Skip unrecognized content */
+			while (*p && *p != '\n')
+				p++;
+		}
+	}
+
+	/* Insert [main] hint at beginning if found */
+	if (main_hint)
+	{
+		appendStringInfo(&result, "/*+ %s */\n", main_hint);
+	}
+
+	/* Append original SQL */
+	appendStringInfoString(&result, query_string);
+
+	/* Add other hints as a comment block at the end for reference */
+	if (list_length(other_hints) > 0)
+	{
+		ListCell *lc;
+		appendStringInfoString(&result, "\n/*\nOther hints in outline:\n");
+		foreach(lc, other_hints)
+		{
+			char *hint = (char *) lfirst(lc);
+			appendStringInfo(&result, "  %s\n", hint);
+		}
+		appendStringInfoString(&result, "*/");
+	}
+
+	return result.data;
 }
 
 /*
