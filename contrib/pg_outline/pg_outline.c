@@ -1647,6 +1647,9 @@ normalize_query(const char *query_string)
 	bool		in_identifier = false;
 	bool		in_comment = false;
 	char		quote_char = '\0';
+	bool		last_was_space = true;  /* Start true to trim leading spaces */
+	char	   *result;
+	int			len;
 
 	if (!query_string)
 		return NULL;
@@ -1675,7 +1678,11 @@ normalize_query(const char *query_string)
 					continue;
 				}
 				in_string = false;
-				appendStringInfoString(&normalized, " ? ");
+				/* Add space before ? if needed */
+				if (!last_was_space && normalized.len > 0)
+					appendStringInfoChar(&normalized, ' ');
+				appendStringInfoChar(&normalized, '?');
+				last_was_space = false;
 			}
 			continue;
 		}
@@ -1684,6 +1691,7 @@ normalize_query(const char *query_string)
 		if (in_identifier)
 		{
 			appendStringInfoChar(&normalized, tolower(*p));
+			last_was_space = false;
 			if (*p == '"')
 			{
 				/* Check for escaped quote */
@@ -1711,6 +1719,7 @@ normalize_query(const char *query_string)
 		{
 			in_identifier = true;
 			appendStringInfoChar(&normalized, '"');
+			last_was_space = false;
 			continue;
 		}
 
@@ -1750,6 +1759,7 @@ normalize_query(const char *query_string)
 			{
 				/* Part of an identifier - keep it */
 				appendStringInfoChar(&normalized, *p);
+				last_was_space = false;
 				continue;
 			}
 
@@ -1769,30 +1779,47 @@ normalize_query(const char *query_string)
 				/* This is actually part of an identifier like "123table" - keep it all */
 				p = num_start;
 				appendStringInfoChar(&normalized, *p);
+				last_was_space = false;
 				continue;
 			}
 
 			/* Move back one character since the loop will increment p */
 			if (*p)
 				p--;
-			appendStringInfoString(&normalized, " ? ");
+
+			/* Add space before ? if needed */
+			if (!last_was_space && normalized.len > 0)
+				appendStringInfoChar(&normalized, ' ');
+			appendStringInfoChar(&normalized, '?');
+			last_was_space = false;
 			continue;
 		}
 
 		/* Normalize whitespace */
 		if (isspace(*p))
 		{
-			appendStringInfoChar(&normalized, ' ');
-			while (isspace(*(p + 1)))
-				p++;
+			/* Skip consecutive whitespace - only add one space */
+			if (!last_was_space && normalized.len > 0)
+			{
+				appendStringInfoChar(&normalized, ' ');
+				last_was_space = true;
+			}
 			continue;
 		}
 
 		/* Keep everything else (keywords, identifiers, operators) as lowercase */
 		appendStringInfoChar(&normalized, tolower(*p));
+		last_was_space = false;
 	}
 
-	return normalized.data;
+	/* Trim trailing whitespace */
+	result = normalized.data;
+	len = normalized.len;
+	while (len > 0 && isspace(result[len - 1]))
+		len--;
+	result[len] = '\0';
+
+	return result;
 }
 
 /*
