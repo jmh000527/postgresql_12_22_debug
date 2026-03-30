@@ -6,11 +6,13 @@
 
 ## Features
 
-- **Auto-generation of Hints**: Automatically generates hints from execution plans
+- **Auto-generation of Hints**: Automatically generates hints from execution plans with positioned hint reconstruction
+- **Hint Parsing and Application**: Complete hint parsing and application mechanism for true plan stabilization
 - **Plan Stabilization**: Store and reuse execution plans to ensure consistent query performance
 - **Outline Display**: Shows generated outline data after query execution
 - **Easy Management**: SQL functions to create, drop, enable, and disable outlines
-- **Hint Support**: Based on common hint types (scan methods, join methods, join order)
+- **Hint Support**: Supports common hint types (scan methods, join methods, join order)
+- **Path Filtering**: Enforces scan method hints through set_rel_pathlist_hook
 
 ## Installation
 
@@ -80,22 +82,26 @@ LIMIT 10;
 -- The extension will display generated outline data:
 /*+
 BEGIN_OUTLINE_DATA
-SeqScan(table)
-HashJoin(...)
+[main] SeqScan(test_table1)
+[main] IndexScan(test_table2)
+[main] HashJoin(test_table1 test_table2)
+[main] Leading((test_table1 test_table2))
 END_OUTLINE_DATA
 */
 ```
+
+**Note**: Generated hints now include `[query_name]` prefix for precise matching when applying hints to corresponding query nodes.
 
 ### Manual Outline Management
 
 You can manually create, manage, and apply outlines:
 
 ```sql
--- Create an outline
+-- Create an outline (with query_name prefix format)
 SELECT pg_outline_create(
     'my_outline',  -- outline name
     'SELECT * FROM test_table1 WHERE value > ?',  -- query pattern
-    'SeqScan(test_table1)'  -- hints (optional)
+    '[main] SeqScan(test_table1)'  -- hints (must include [query_name] prefix)
 );
 
 -- List all outlines
@@ -112,6 +118,41 @@ SELECT pg_outline_enable('my_outline');
 
 -- Drop an outline
 SELECT pg_outline_drop('my_outline');
+```
+
+### Outline Application and Plan Stabilization
+
+When SQL with the same pattern is executed again, pg_outline automatically applies stored hints to reproduce the original execution plan:
+
+```sql
+-- 1. First, capture the plan using auto mode
+SET pg_outline.mode = 'auto';
+EXPLAIN SELECT * FROM t1 WHERE id < 100;
+-- Record the generated hints
+
+-- 2. Manually create outline (or use pg_outline_create_from_sql)
+SELECT pg_outline_create(
+    'test_outline',
+    'SELECT * FROM t1 WHERE id < ?;',
+    '[main] SeqScan(t1)'
+);
+
+-- 3. Switch to manual mode and enable detailed logging
+SET pg_outline.mode = 'manual';
+SET client_min_messages = 'DEBUG1';
+
+-- 4. Execute query with same pattern, hints will be automatically applied
+SELECT * FROM t1 WHERE id < 100;
+-- Output will show:
+-- DEBUG: pg_outline: computed fingerprint: ...
+-- DEBUG: pg_outline: retrieved hints from stored outline
+-- DEBUG: pg_outline: parsed 1 hints from stored outline
+-- DEBUG: pg_outline: applied hint to query 'main': SeqScan(t1)
+-- DEBUG: pg_outline: filtering paths for relation 't1' based on hints
+
+-- 5. Verify the plan matches
+EXPLAIN SELECT * FROM t1 WHERE id < 100;
+-- Should show Seq Scan even if index scan might be better
 ```
 
 ## Hint Types
@@ -142,13 +183,13 @@ The extension supports various hint types similar to pg_hint_plan:
 
 ## Outline Data Format
 
-The generated outline data follows a format similar to OceanBase and Oracle:
+The generated outline data follows a format similar to OceanBase and Oracle, with query_name prefix:
 
 ```
 /*+
 BEGIN_OUTLINE_DATA
-<hint1>
-<hint2>
+[query_name] <hint1>
+[query_name] <hint2>
 ...
 END_OUTLINE_DATA
 */
@@ -159,13 +200,21 @@ Example:
 ```
 /*+
 BEGIN_OUTLINE_DATA
-SeqScan(test_table1)
-IndexScan(test_table2)
-HashJoin(...)
-Leading((test_table1 test_table2))
+[main] SeqScan(test_table1)
+[main] IndexScan(test_table2)
+[main] HashJoin(test_table1 test_table2)
+[main] Leading((test_table1 test_table2))
 END_OUTLINE_DATA
 */
 ```
+
+**Hint Format Explanation**:
+- `[query_name]`: Query name prefix to identify which query node the hint applies to
+  - `[main]`: Main query
+  - `[cte_<name>]`: CTE query
+  - `[subquery_N]`: Subquery
+  - `[sublink_N]`: SubLink subquery
+- `hint_text`: Specific hint content (scan methods, join methods, etc.)
 
 For complex multi-table joins:
 
@@ -203,43 +252,114 @@ The extension creates the following catalog structures:
 
 The extension uses PostgreSQL hooks to intercept query planning and execution:
 
-1. **Planner Hook**: Intercepts query planning to generate hints from the chosen plan
-2. **Executor Hooks**: Track query execution and display outline data
-3. **Plan Analysis**: Recursively analyzes the plan tree to extract relevant hints
-4. **Hint Storage**: Stores hints in catalog tables for later reuse
+1. **Planner Hook**: Intercepts query planning to generate hints from the chosen plan and apply stored hints before planning
+2. **Set Rel Pathlist Hook**: Filters scan paths during path generation to enforce scan method hints
+3. **Executor Hooks**: Track query execution and display outline data
+4. **Plan Analysis**: Recursively analyzes the plan tree to extract relevant hints with positioned hint reconstruction
+5. **Hint Storage**: Stores hints in catalog tables for later reuse
+6. **Hint Application**: Complete hint parsing and application flow, including:
+   - Parsing stored hint strings (`[query_name] hint_text` format)
+   - Associating hints with corresponding Query nodes via metadata hash table
+   - Filtering paths during planning to keep only hint-specified scan methods
 
 ## Comparison with Similar Tools
 
 ### vs. pg_hint_plan
 
-- `pg_hint_plan`: Focuses on applying manually specified hints
-- `pg_outline`: Automatically generates hints from execution plans and manages them as outlines
+- `pg_hint_plan`: Focuses on applying manually specified hints through SQL comment syntax
+- `pg_outline`: Automatically generates hints from execution plans and manages them as outlines, supporting plan capture and reproduction
+- Similarities: Both use similar hint syntax (SeqScan, IndexScan, Leading, etc.)
+- Differences: pg_outline adds `[query_name]` prefix to support precise hint application for complex queries
 
 ### vs. OceanBase Outline
 
 - Similar concept and API design
 - Adapted for PostgreSQL's planner and executor architecture
 - Compatible with PostgreSQL's standard query optimization
+- Implements complete outline generation, storage, and application workflow
 
 ## Limitations
 
 Current version limitations:
 
-1. Simplified hint generation (basic scan and join methods)
-2. Query pattern matching is exact (no parameterization yet)
-3. Limited to single-query outlines (no support for complex CTEs yet)
-4. Hint application not yet fully implemented
+1. Query pattern matching is exact (no parameterization yet)
+2. Join method hints application may require additional join_search_hook implementation
+3. Currently uses simple string matching to check hints, can be improved with a full hint parser
+4. If hints cannot be applied (e.g., table name mismatch), system falls back to normal planning
 
 ## Future Enhancements
 
 Planned improvements:
 
-- Full hint application using planner hooks
-- Query fingerprinting for better pattern matching
+- Query fingerprinting for better pattern matching (parameterization support)
+- Full join method hint application (requires join_search_hook)
 - Support for parallel query hints
 - Extended hint types (e.g., SET, ROWS hints)
 - Integration with pg_stat_statements for automatic outline creation
 - Outline import/export functionality
+- More sophisticated hint syntax parser
+- Cost adjustment as an alternative to path filtering
+- Hint conflict detection and warnings
+
+## Technical Implementation Details
+
+### Hint Parsing Flow
+
+pg_outline implements a complete hint parsing and application mechanism:
+
+1. **parse_stored_hints()**: Parses stored hint strings
+   - Input format: `[query_name] hint_text\n[query_name2] hint_text2`
+   - Output: List of ParsedHint structures, each containing query_name and hint_text
+
+2. **apply_hints_to_query()**: Associates parsed hints with Query nodes
+   - Looks up matching query_name in metadata hash table
+   - Stores hint_text in corresponding QueryMetadataEntry
+   - Supports merging multiple hints for the same query
+
+3. **outline_set_rel_pathlist()**: Filters paths during path generation
+   - Implements set_rel_pathlist_hook
+   - Gets query hints for current relation
+   - Checks for scan method hints for this table
+   - Filters rel->pathlist to keep only matching path types
+   - Supports SeqScan, IndexScan, IndexOnlyScan hints
+
+### Workflow
+
+**Generation Phase** (auto mode):
+1. User executes a query
+2. outline_planner hook intercepts planning process
+3. System generates execution plan
+4. Extracts hints from plan (with position information)
+5. Generates hint string in `[query_name] hint_text` format
+6. If display_hints is enabled, shows generated outline
+
+**Application Phase** (manual mode):
+1. User executes SQL with same pattern
+2. outline_planner computes query fingerprint
+3. Retrieves matching stored hints from pg_outline_data table
+4. Calls parse_stored_hints() to parse hint string into ParsedHint list
+5. Calls apply_hints_to_query() to associate hints with Query nodes
+6. Sets active_outline_hints global variable
+7. Calls standard_planner() to begin planning
+8. During planning, outline_set_rel_pathlist() hook is called
+9. Hook filters paths to keep only hint-specified scan methods
+10. Planner chooses from filtered paths (restricted to hint-specified methods)
+11. After planning completes, clears active_outline_hints
+12. Returns PlannedStmt (should match original plan)
+
+### Key Data Structures
+
+```c
+typedef struct ParsedHint
+{
+    char *query_name;  /* e.g., "main", "sublink_0" */
+    char *hint_text;   /* e.g., "SeqScan(t1)", "IndexScan(t2)" */
+} ParsedHint;
+```
+
+Global variables:
+- `active_outline_hints`: List of active hints for current query
+- `prev_set_rel_pathlist_hook`: Saved previous hook pointer
 
 ## Examples
 
@@ -287,19 +407,38 @@ ORDER BY o.order_date DESC;
 SELECT pg_outline_create(
     'report_query_dev',
     'SELECT * FROM large_table1 t1 JOIN large_table2 t2 ON ...',
-    'HashJoin(large_table1 large_table2)'
+    '[main] HashJoin(large_table1 large_table2)'
 );
 
 -- Production environment: use different plan
 SELECT pg_outline_create(
     'report_query_prod',
     'SELECT * FROM large_table1 t1 JOIN large_table2 t2 ON ...',
-    'MergeJoin(large_table1 large_table2) IndexScan(large_table1)'
+    '[main] MergeJoin(large_table1 large_table2) [main] IndexScan(large_table1)'
 );
 
 -- Switch between environments
 SELECT pg_outline_enable('report_query_prod');
 SELECT pg_outline_disable('report_query_dev');
+```
+
+### Example 3: Debugging Hint Application
+
+```sql
+-- Enable detailed logging to see hint application process
+SET client_min_messages = 'DEBUG1';
+SET pg_outline.mode = 'manual';
+
+-- Execute query
+SELECT * FROM t1 WHERE id < 100;
+
+-- Log output example:
+-- DEBUG: pg_outline: computed fingerprint: 1234567890
+-- DEBUG: pg_outline: retrieved hints from stored outline: [main] SeqScan(t1)
+-- DEBUG: pg_outline: parsed 1 hints from stored outline
+-- DEBUG: pg_outline: applied hint to query 'main': SeqScan(t1)
+-- DEBUG: pg_outline: filtering paths for relation 't1' based on hints
+-- DEBUG: pg_outline: filtered from 3 to 1 paths for 't1'
 ```
 
 ## Troubleshooting
@@ -336,6 +475,31 @@ SELECT * FROM pg_outline_enabled WHERE outline_name = 'your_outline';
 
 -- Verify query pattern matches
 -- Note: Current version requires exact match
+
+-- Enable detailed logging to see application process
+SET client_min_messages = 'DEBUG1';
+
+-- Check hint format is correct (must include [query_name] prefix)
+SELECT outline_name, hint_string FROM pg_outline_data
+WHERE outline_name = 'your_outline';
+
+-- Ensure hint format is: [main] SeqScan(table) not SeqScan(table)
+```
+
+### Hints Not Taking Effect
+
+If hints are applied but plan doesn't change:
+
+1. **Check table name**: Table name in hint must exactly match table name in query
+2. **Check hint type**: Ensure hint type (SeqScan, IndexScan, etc.) is applicable for the table
+3. **Review logs**: DEBUG1 level logs show path filtering process
+4. **Verify path exists**: If hint-specified path doesn't exist (e.g., IndexScan with no index), system falls back to normal planning
+
+```sql
+-- View available paths
+SET enable_seqscan = off;  -- Disable sequential scan
+EXPLAIN SELECT * FROM t1 WHERE id < 100;  -- Check if index scan path exists
+SET enable_seqscan = on;   -- Restore setting
 ```
 
 ## Contributing
