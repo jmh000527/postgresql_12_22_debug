@@ -1,0 +1,4 @@
+comment = 'Outline planner hints using pg_hint_plan syntax'
+default_version = '1.0'
+module_pathname = '$libdir/pg_hint_plan'
+relocatable = false
