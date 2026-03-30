@@ -4,7 +4,7 @@
 \echo Use "CREATE EXTENSION pg_outline" to load this file. \quit
 
 -- Create schema
-CREATE SCHEMA IF NOT EXISTS pg_outline;
+CREATE SCHEMA pg_outline;
 
 -- Set search path for the extension
 SET search_path = pg_outline, pg_catalog;

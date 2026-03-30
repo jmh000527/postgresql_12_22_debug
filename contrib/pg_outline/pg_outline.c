@@ -535,7 +535,7 @@ extract_hints_for_query(const char *hints, const char *query_name)
  * - Simple: "SeqScan(t1) HashJoin(t1 t2)"
  * - With prefixes: "[main]SeqScan(t1) [cte_data]IndexScan(t2)"
  *
- * This function parses the SQL and inserts /*+ ... */ comments at the appropriate locations.
+ * This function parses the SQL and inserts hint comments at the appropriate locations.
  */
 static char *
 inject_hints_into_sql(const char *query_text, const char *hints)
