@@ -112,6 +112,17 @@ RETURNS TABLE(outline_name TEXT, hints TEXT)
 AS 'MODULE_PATHNAME', 'pg_outline_match_query'
 LANGUAGE C STRICT;
 
+-- Function: Inject hints into SQL text
+-- Takes query text and hint string, returns SQL with hints inserted as /*+ ... */ comments
+-- Supports multi-query hints with [query_name] prefix format
+CREATE FUNCTION pg_outline.inject_hints(
+    p_query_text TEXT,
+    p_hints TEXT
+)
+RETURNS TEXT
+AS 'MODULE_PATHNAME', 'pg_outline_inject_hints'
+LANGUAGE C STRICT;
+
 -- Function: Get outline statistics
 CREATE FUNCTION pg_outline.get_statistics()
 RETURNS TABLE(

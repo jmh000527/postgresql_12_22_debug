@@ -79,6 +79,7 @@ static char *extract_inline_hints(const char *query_text);
 static char *normalize_query(const char *query_text);
 static char *lookup_outline_hints(const char *query_text, const char *schema_name);
 static void parse_and_apply_hints(Query *query, const char *hints);
+static char *inject_hints_into_sql(const char *query_text, const char *hints);
 
 /*
  * Module load callback
@@ -433,6 +434,186 @@ outline_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 }
 
 /*
+ * Inject hints into SQL text
+ * Supports multi-query hints with [query_name] prefixes
+ *
+ * Format of hints:
+ * - Simple: "SeqScan(t1) HashJoin(t1 t2)"
+ * - With prefixes: "[main]SeqScan(t1) [cte_data]IndexScan(t2)"
+ *
+ * This function parses the SQL and inserts /*+ ... */ comments at the appropriate locations.
+ */
+static char *
+inject_hints_into_sql(const char *query_text, const char *hints)
+{
+    StringInfoData result;
+    const char *ptr;
+    const char *hint_ptr;
+    StringInfoData current_query_hints;
+
+    if (!query_text || !hints)
+        return pstrdup(query_text ? query_text : "");
+
+    initStringInfo(&result);
+    initStringInfo(&current_query_hints);
+
+    /* Simple implementation: inject hints right after first SELECT */
+    ptr = query_text;
+
+    /* Skip leading whitespace and comments */
+    while (*ptr && (isspace((unsigned char) *ptr) || *ptr == '-' || *ptr == '/'))
+    {
+        if (*ptr == '-' && *(ptr + 1) == '-')
+        {
+            /* Skip line comment */
+            while (*ptr && *ptr != '\n')
+            {
+                appendStringInfoChar(&result, *ptr);
+                ptr++;
+            }
+        }
+        else if (*ptr == '/' && *(ptr + 1) == '*')
+        {
+            /* Skip block comment */
+            appendStringInfoChar(&result, *ptr++);
+            appendStringInfoChar(&result, *ptr++);
+            while (*ptr && !(*ptr == '*' && *(ptr + 1) == '/'))
+            {
+                appendStringInfoChar(&result, *ptr);
+                ptr++;
+            }
+            if (*ptr == '*')
+            {
+                appendStringInfoChar(&result, *ptr++);
+                appendStringInfoChar(&result, *ptr++);
+            }
+        }
+        else
+        {
+            appendStringInfoChar(&result, *ptr);
+            ptr++;
+        }
+    }
+
+    /* Check if this is a WITH clause (CTE) */
+    if (strncasecmp(ptr, "WITH", 4) == 0 && isspace((unsigned char) ptr[4]))
+    {
+        /* Copy "WITH " */
+        appendStringInfoString(&result, "WITH ");
+        ptr += 4;
+        while (*ptr && isspace((unsigned char) *ptr))
+        {
+            appendStringInfoChar(&result, *ptr);
+            ptr++;
+        }
+
+        /* TODO: For CTE support, we need to parse individual CTEs and inject hints */
+        /* For now, just copy the rest */
+        appendStringInfoString(&result, ptr);
+    }
+    else if (strncasecmp(ptr, "SELECT", 6) == 0)
+    {
+        /* Found SELECT, inject hints here */
+        appendStringInfoString(&result, "SELECT /*+ ");
+
+        /* Parse hints to extract [main] or appropriate prefix */
+        hint_ptr = hints;
+        while (*hint_ptr)
+        {
+            /* Skip whitespace */
+            while (*hint_ptr && isspace((unsigned char) *hint_ptr))
+                hint_ptr++;
+
+            if (*hint_ptr == '\0')
+                break;
+
+            /* Check for [query_name] prefix */
+            if (*hint_ptr == '[')
+            {
+                /* Extract query name */
+                const char *bracket_end = strchr(hint_ptr, ']');
+                if (bracket_end)
+                {
+                    char *query_name = pnstrdup(hint_ptr + 1, bracket_end - hint_ptr - 1);
+
+                    /* For now, only inject [main] hints into main SELECT */
+                    if (strcmp(query_name, "main") == 0)
+                    {
+                        /* Skip past the bracket */
+                        hint_ptr = bracket_end + 1;
+
+                        /* Copy hints until next bracket or end */
+                        while (*hint_ptr && *hint_ptr != '[')
+                        {
+                            if (!isspace((unsigned char) *hint_ptr) ||
+                                (current_query_hints.len > 0 &&
+                                 current_query_hints.data[current_query_hints.len - 1] != ' '))
+                            {
+                                appendStringInfoChar(&current_query_hints, *hint_ptr);
+                            }
+                            hint_ptr++;
+                        }
+                    }
+                    else
+                    {
+                        /* Skip this hint section - it's for a different query part */
+                        hint_ptr = bracket_end + 1;
+                        while (*hint_ptr && *hint_ptr != '[')
+                            hint_ptr++;
+                    }
+
+                    pfree(query_name);
+                }
+                else
+                {
+                    hint_ptr++;
+                }
+            }
+            else
+            {
+                /* No prefix, treat as main query hint */
+                while (*hint_ptr && *hint_ptr != '[')
+                {
+                    if (!isspace((unsigned char) *hint_ptr) ||
+                        (current_query_hints.len > 0 &&
+                         current_query_hints.data[current_query_hints.len - 1] != ' '))
+                    {
+                        appendStringInfoChar(&current_query_hints, *hint_ptr);
+                    }
+                    hint_ptr++;
+                }
+            }
+        }
+
+        /* Add the extracted hints */
+        if (current_query_hints.len > 0)
+        {
+            appendStringInfoString(&result, current_query_hints.data);
+        }
+        else
+        {
+            /* No [main] hints, use all hints without prefix */
+            appendStringInfoString(&result, hints);
+        }
+
+        appendStringInfoString(&result, " */ ");
+
+        /* Copy rest of SELECT */
+        ptr += 6;
+        appendStringInfoString(&result, ptr);
+    }
+    else
+    {
+        /* Not a query we can handle, just return original */
+        appendStringInfoString(&result, ptr);
+    }
+
+    pfree(current_query_hints.data);
+
+    return result.data;
+}
+
+/*
  * SQL-callable functions
  */
 
@@ -616,4 +797,22 @@ pg_outline_match_query(PG_FUNCTION_ARGS)
     /* TODO: Implement query matching */
     elog(ERROR, "pg_outline_match_query: not yet implemented");
     PG_RETURN_NULL();
+}
+
+/* Inject hints into SQL text and return the modified SQL */
+PG_FUNCTION_INFO_V1(pg_outline_inject_hints);
+Datum
+pg_outline_inject_hints(PG_FUNCTION_ARGS)
+{
+    text *query_text = PG_GETARG_TEXT_PP(0);
+    text *hints_text = PG_GETARG_TEXT_PP(1);
+
+    char *query = text_to_cstring(query_text);
+    char *hints = text_to_cstring(hints_text);
+    char *result;
+
+    /* Inject hints into SQL */
+    result = inject_hints_into_sql(query, hints);
+
+    PG_RETURN_TEXT_P(cstring_to_text(result));
 }
