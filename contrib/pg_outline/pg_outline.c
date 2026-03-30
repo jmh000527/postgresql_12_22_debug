@@ -528,6 +528,106 @@ extract_hints_for_query(const char *hints, const char *query_name)
 }
 
 /*
+ * Helper: Check if query already has hint comment
+ */
+static bool
+has_existing_hints(const char *query_text)
+{
+    const char *ptr = query_text;
+    bool in_string = false;
+    char string_delim = '\0';
+
+    while (*ptr)
+    {
+        /* Handle string literals */
+        if (!in_string && (*ptr == '\'' || *ptr == '"'))
+        {
+            in_string = true;
+            string_delim = *ptr;
+            ptr++;
+            continue;
+        }
+
+        if (in_string)
+        {
+            if (*ptr == string_delim)
+            {
+                /* Check for escaped quote */
+                if (*(ptr + 1) == string_delim)
+                {
+                    ptr += 2;
+                    continue;
+                }
+                in_string = false;
+                string_delim = '\0';
+            }
+            ptr++;
+            continue;
+        }
+
+        /* Look for hint comment pattern outside strings */
+        if (*ptr == '/' && *(ptr + 1) == '*' && *(ptr + 2) == '+')
+        {
+            return true;
+        }
+
+        ptr++;
+    }
+
+    return false;
+}
+
+/*
+ * Helper: Skip string literal and return new position
+ */
+static const char *
+skip_string_literal(const char *ptr, StringInfoData *result)
+{
+    char string_delim = *ptr;
+
+    appendStringInfoChar(result, *ptr);
+    ptr++;
+
+    while (*ptr)
+    {
+        if (*ptr == string_delim)
+        {
+            appendStringInfoChar(result, *ptr);
+            ptr++;
+
+            /* Check for escaped quote (double quote) */
+            if (*ptr == string_delim)
+            {
+                appendStringInfoChar(result, *ptr);
+                ptr++;
+                continue;
+            }
+
+            /* End of string */
+            break;
+        }
+        else if (*ptr == '\\' && *(ptr + 1))
+        {
+            /* Escape sequence */
+            appendStringInfoChar(result, *ptr);
+            ptr++;
+            if (*ptr)
+            {
+                appendStringInfoChar(result, *ptr);
+                ptr++;
+            }
+        }
+        else
+        {
+            appendStringInfoChar(result, *ptr);
+            ptr++;
+        }
+    }
+
+    return ptr;
+}
+
+/*
  * Inject hints into SQL text
  * Supports multi-query hints with [query_name] prefixes
  *
@@ -543,11 +643,16 @@ inject_hints_into_sql(const char *query_text, const char *hints)
     StringInfoData result;
     const char *ptr;
     char *main_hints;
-    int cte_index = 0;
     int paren_depth = 0;
 
     if (!query_text || !hints)
         return pstrdup(query_text ? query_text : "");
+
+    /* Check if hints already exist - if so, return original query */
+    if (has_existing_hints(query_text))
+    {
+        return pstrdup(query_text);
+    }
 
     initStringInfo(&result);
 
@@ -616,10 +721,110 @@ inject_hints_into_sql(const char *query_text, const char *hints)
             if (*ptr == '\0')
                 break;
 
-            /* Check if this starts a CTE name */
-            if (isalpha((unsigned char) *ptr) || *ptr == '_')
+            /* Check if this starts a CTE name (quoted or unquoted) */
+            if (*ptr == '"')
             {
+                /* Quoted identifier */
+                const char *name_start = ptr + 1;
+                appendStringInfoChar(&result, *ptr);
+                ptr++;
+
+                /* Find end quote */
+                while (*ptr && *ptr != '"')
+                {
+                    appendStringInfoChar(&result, *ptr);
+                    ptr++;
+                }
+
                 /* Extract CTE name */
+                char *cte_name = pnstrdup(name_start, ptr - name_start);
+                char *cte_query_name = psprintf("cte_%s", cte_name);
+                char *cte_hints = extract_hints_for_query(hints, cte_query_name);
+
+                if (*ptr == '"')
+                {
+                    appendStringInfoChar(&result, *ptr);
+                    ptr++;
+                }
+
+                /* Skip whitespace and expect AS */
+                while (*ptr && isspace((unsigned char) *ptr))
+                {
+                    appendStringInfoChar(&result, *ptr);
+                    ptr++;
+                }
+
+                if (strncasecmp(ptr, "AS", 2) == 0)
+                {
+                    appendStringInfoString(&result, "AS");
+                    ptr += 2;
+
+                    /* Skip whitespace */
+                    while (*ptr && isspace((unsigned char) *ptr))
+                    {
+                        appendStringInfoChar(&result, *ptr);
+                        ptr++;
+                    }
+
+                    /* Expect '(' */
+                    if (*ptr == '(')
+                    {
+                        appendStringInfoChar(&result, *ptr);
+                        ptr++;
+                        paren_depth = 1;
+
+                        /* Skip whitespace */
+                        while (*ptr && isspace((unsigned char) *ptr))
+                        {
+                            appendStringInfoChar(&result, *ptr);
+                            ptr++;
+                        }
+
+                        /* Look for SELECT to inject hints */
+                        if (strncasecmp(ptr, "SELECT", 6) == 0)
+                        {
+                            if (cte_hints && strlen(cte_hints) > 0)
+                            {
+                                appendStringInfoString(&result, "SELECT /*+ ");
+                                appendStringInfoString(&result, cte_hints);
+                                appendStringInfoString(&result, " */ ");
+                                ptr += 6;
+                            }
+                            else
+                            {
+                                appendStringInfoString(&result, "SELECT");
+                                ptr += 6;
+                            }
+                        }
+
+                        /* Copy rest of CTE until closing paren, handling strings */
+                        while (*ptr && paren_depth > 0)
+                        {
+                            /* Handle string literals */
+                            if (*ptr == '\'' || *ptr == '"')
+                            {
+                                ptr = skip_string_literal(ptr, &result);
+                                continue;
+                            }
+
+                            if (*ptr == '(')
+                                paren_depth++;
+                            else if (*ptr == ')')
+                                paren_depth--;
+
+                            appendStringInfoChar(&result, *ptr);
+                            ptr++;
+                        }
+                    }
+                }
+
+                pfree(cte_name);
+                pfree(cte_query_name);
+                pfree(cte_hints);
+            }
+            else if (isalpha((unsigned char) *ptr) || *ptr == '_')
+            {
+                /* Unquoted identifier - Extract CTE name */
                 const char *name_start = ptr;
                 while (*ptr && (isalnum((unsigned char) *ptr) || *ptr == '_'))
                 {
@@ -682,9 +887,16 @@ inject_hints_into_sql(const char *query_text, const char *hints)
                             }
                         }
 
-                        /* Copy rest of CTE until closing paren */
+                        /* Copy rest of CTE until closing paren, handling strings */
                         while (*ptr && paren_depth > 0)
                         {
+                            /* Handle string literals */
+                            if (*ptr == '\'' || *ptr == '"')
+                            {
+                                ptr = skip_string_literal(ptr, &result);
+                                continue;
+                            }
+
                             if (*ptr == '(')
                                 paren_depth++;
                             else if (*ptr == ')')
@@ -699,6 +911,12 @@ inject_hints_into_sql(const char *query_text, const char *hints)
                 pfree(cte_name);
                 pfree(cte_query_name);
                 pfree(cte_hints);
+            }
+            else
+            {
+                /* Unknown character, skip it */
+                appendStringInfoChar(&result, *ptr);
+                ptr++;
             }
 
             /* Skip whitespace */
