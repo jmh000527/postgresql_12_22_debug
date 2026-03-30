@@ -282,17 +282,15 @@ Leading(((t1 t2) t3) t4)
 
 当前版本的限制:
 
-1. 查询模式匹配是精确的(尚未参数化)
-2. Join method hints 应用可能需要额外的 join_search_hook 实现
-3. 当前使用简单的字符串匹配检查 hints，未来可以改进为完整的 hint 解析器
-4. 如果 hint 无法应用（如表名不匹配），系统会回退到正常规划
+1. Leading hint 强制执行是部分的 - hints 可以被检测和记录，但完整的连接顺序强制执行需要复杂的嵌套语法解析
+2. 当前使用简单的字符串匹配检查 hints，未来可以改进为完整的 hint 解析器
+3. 如果 hint 无法应用（如表名不匹配），系统会回退到正常规划
 
 ## 未来改进
 
 计划中的改进:
 
-- 查询指纹识别以实现更好的模式匹配（参数化支持）
-- 完整的 Join method hint 应用（需要 join_search_hook）
+- 完整的 Leading hint 强制执行（需要复杂的嵌套语法解析和自定义连接树构建）
 - 支持并行查询 hints
 - 扩展的 hint 类型(例如 SET、ROWS hints)
 - 与 pg_stat_statements 集成以自动创建 outline
@@ -301,27 +299,65 @@ Leading(((t1 t2) t3) t4)
 - Cost 调整作为路径过滤的替代方案
 - Hint 冲突检测和警告
 
+## 已完成功能 (Version 1.0)
+
+以下功能已经完全实现:
+
+1. **查询参数化** ✓
+   - 自动替换字面值（数字和字符串）为 `?` 占位符
+   - 允许不同字面值的查询匹配同一个 outline
+   - 示例: `SELECT * FROM t1 WHERE id < 100` 和 `SELECT * FROM t1 WHERE id < 500` 匹配同一个模式 `select * from t1 where id < ?`
+
+2. **多表连接 Hints** ✓
+   - 支持包含多个关系的连接 hints: `HashJoin(t1 t2 t3)`
+   - `extract_relations_from_join_hint()` 函数解析空格分隔的表名
+   - 实现对复杂多路连接的连接方法控制
+
+3. **Leading Hint 钩子集成** ✓
+   - 注册了 `join_search_hook` 以拦截连接顺序规划
+   - `outline_join_search()` 函数检测 `Leading((t1 t2) t3)` 格式的 Leading hints
+   - 为未来完整连接顺序强制执行奠定基础
+   - 当前记录检测到的 hints 用于调试
+
 ## 技术实现细节
 
 ### Hint 解析流程
 
 pg_outline 实现了完整的 hint 解析和应用机制:
 
-1. **parse_stored_hints()**: 解析存储的 hint 字符串
+1. **normalize_query()**: 参数化查询以实现模式匹配
+   - 将所有字符串字面值替换为 `?` 占位符
+   - 将所有数字字面值替换为 `?` 占位符
+   - 保留标识符、关键字和结构
+   - 允许不同字面值的查询匹配同一个模式
+   - 示例: `SELECT * FROM t1 WHERE id < 100` → `select * from t1 where id < ?`
+
+2. **extract_relations_from_join_hint()**: 解析多表连接 hints
+   - 输入: `HashJoin(t1 t2 t3)` 或 `NestLoop(orders items)`
+   - 输出: 关系名列表: ["t1", "t2", "t3"]
+   - 用于验证和应用连接方法 hints
+
+3. **parse_stored_hints()**: 解析存储的 hint 字符串
    - 输入格式: `[query_name] hint_text\n[query_name2] hint_text2`
    - 输出: ParsedHint 结构列表，每个包含 query_name 和 hint_text
 
-2. **apply_hints_to_query()**: 将解析的 hints 关联到 Query 节点
+4. **apply_hints_to_query()**: 将解析的 hints 关联到 Query 节点
    - 通过 metadata hash table 查找匹配的 query_name
    - 将 hint_text 存储到对应的 QueryMetadataEntry
    - 支持多个 hints 合并到同一个查询
 
-3. **outline_set_rel_pathlist()**: 在路径生成阶段过滤路径
-   - 实现 set_rel_pathlist_hook 钩子
-   - 获取当前 relation 的 query hints
-   - 检查是否有针对此表的扫描方法 hint
-   - 过滤 rel->pathlist，只保留匹配的路径类型
+5. **outline_set_rel_pathlist()**: 在路径生成阶段过滤路径
+   - 实现 set_rel_pathlist_hook
+   - 获取当前关系的查询 hints
+   - 检查此表的扫描方法 hints
+   - 过滤 rel->pathlist 只保留匹配的路径类型
    - 支持 SeqScan、IndexScan、IndexOnlyScan hints
+
+6. **outline_join_search()**: 检测连接顺序的 Leading hints
+   - 实现 join_search_hook
+   - 解析 Leading hint 格式: `Leading((t1 t2) t3)`
+   - 记录检测到的 hints 用于调试
+   - 为未来完整连接顺序强制执行奠定基础
 
 ### 工作流程
 
@@ -335,17 +371,19 @@ pg_outline 实现了完整的 hint 解析和应用机制:
 
 **应用阶段** (manual 模式):
 1. 用户执行相同模式的 SQL
-2. outline_planner 计算查询指纹（fingerprint）
-3. 从 pg_outline_data 表检索匹配的 stored hints
-4. 调用 parse_stored_hints() 解析 hint 字符串为 ParsedHint 列表
-5. 调用 apply_hints_to_query() 将 hints 关联到 Query 节点
-6. 设置 active_outline_hints 全局变量
-7. 调用 standard_planner() 开始规划
-8. 规划过程中，outline_set_rel_pathlist() 钩子被调用
-9. 钩子过滤路径，只保留 hint 指定的扫描方法
-10. 规划器从过滤后的路径中选择（被限制为 hint 指定的方法）
-11. 规划完成后清理 active_outline_hints
-12. 返回 PlannedStmt（应该匹配原始计划）
+2. outline_planner 使用 normalize_query() 标准化查询（参数化字面值）
+3. 从标准化的查询计算查询指纹（fingerprint）
+4. 从 pg_outline_data 表检索匹配的 stored hints
+5. 调用 parse_stored_hints() 解析 hint 字符串为 ParsedHint 列表
+6. 调用 apply_hints_to_query() 将 hints 关联到 Query 节点
+7. 设置 active_outline_hints 全局变量
+8. 调用 standard_planner() 开始规划
+9. 规划期间，outline_set_rel_pathlist() 钩子被调用处理扫描 hints
+10. 规划期间，outline_join_search() 钩子被调用处理连接顺序 hints
+11. 钩子过滤路径，只保留 hint 指定的方法
+12. 规划器从过滤后的路径中选择（被限制为 hint 指定的方法）
+13. 规划完成后，清理 active_outline_hints
+14. 返回 PlannedStmt（应该匹配原始计划）
 
 ### 关键数据结构
 
@@ -359,7 +397,8 @@ typedef struct ParsedHint
 
 全局变量:
 - `active_outline_hints`: 当前查询的活动 hints 列表
-- `prev_set_rel_pathlist_hook`: 保存的前一个钩子指针
+- `prev_set_rel_pathlist_hook`: 保存的前一个 set_rel_pathlist_hook 指针
+- `prev_join_search_hook`: 保存的前一个 join_search_hook 指针
 
 ## 示例
 

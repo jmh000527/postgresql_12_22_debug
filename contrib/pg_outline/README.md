@@ -282,17 +282,15 @@ The extension uses PostgreSQL hooks to intercept query planning and execution:
 
 Current version limitations:
 
-1. Query pattern matching is exact (no parameterization yet)
-2. Join method hints application may require additional join_search_hook implementation
-3. Currently uses simple string matching to check hints, can be improved with a full hint parser
-4. If hints cannot be applied (e.g., table name mismatch), system falls back to normal planning
+1. Leading hint enforcement is partial - hints are detected and logged but full join order enforcement requires complex nested syntax parsing
+2. Currently uses simple string matching to check hints, can be improved with a full hint parser
+3. If hints cannot be applied (e.g., table name mismatch), system falls back to normal planning
 
 ## Future Enhancements
 
 Planned improvements:
 
-- Query fingerprinting for better pattern matching (parameterization support)
-- Full join method hint application (requires join_search_hook)
+- Full Leading hint enforcement (requires complex nested syntax parsing and custom join tree building)
 - Support for parallel query hints
 - Extended hint types (e.g., SET, ROWS hints)
 - Integration with pg_stat_statements for automatic outline creation
@@ -301,27 +299,65 @@ Planned improvements:
 - Cost adjustment as an alternative to path filtering
 - Hint conflict detection and warnings
 
+## Completed Features (Version 1.0)
+
+The following features have been fully implemented:
+
+1. **Query Parameterization** ✓
+   - Automatic replacement of literal values (numbers and strings) with `?` placeholders
+   - Allows queries with different literal values to match the same outline
+   - Example: `SELECT * FROM t1 WHERE id < 100` and `SELECT * FROM t1 WHERE id < 500` match the same pattern `select * from t1 where id < ?`
+
+2. **Multi-relation Join Hints** ✓
+   - Support for join hints with multiple relations: `HashJoin(t1 t2 t3)`
+   - `extract_relations_from_join_hint()` function parses space-separated table names
+   - Enables control of join methods for complex multi-way joins
+
+3. **Leading Hint Hook Integration** ✓
+   - Registered `join_search_hook` to intercept join order planning
+   - `outline_join_search()` function detects Leading hints in format `Leading((t1 t2) t3)`
+   - Foundation for future full join order enforcement
+   - Currently logs detected hints for debugging
+
 ## Technical Implementation Details
 
 ### Hint Parsing Flow
 
 pg_outline implements a complete hint parsing and application mechanism:
 
-1. **parse_stored_hints()**: Parses stored hint strings
+1. **normalize_query()**: Parameterizes queries for pattern matching
+   - Replaces all string literals with `?` placeholder
+   - Replaces all numeric literals with `?` placeholder
+   - Preserves identifiers, keywords, and structure
+   - Enables queries with different literals to match same pattern
+   - Example: `SELECT * FROM t1 WHERE id < 100` → `select * from t1 where id < ?`
+
+2. **extract_relations_from_join_hint()**: Parses multi-relation join hints
+   - Input: `HashJoin(t1 t2 t3)` or `NestLoop(orders items)`
+   - Output: List of relation names: ["t1", "t2", "t3"]
+   - Used for validating and applying join method hints
+
+3. **parse_stored_hints()**: Parses stored hint strings
    - Input format: `[query_name] hint_text\n[query_name2] hint_text2`
    - Output: List of ParsedHint structures, each containing query_name and hint_text
 
-2. **apply_hints_to_query()**: Associates parsed hints with Query nodes
+4. **apply_hints_to_query()**: Associates parsed hints with Query nodes
    - Looks up matching query_name in metadata hash table
    - Stores hint_text in corresponding QueryMetadataEntry
    - Supports merging multiple hints for the same query
 
-3. **outline_set_rel_pathlist()**: Filters paths during path generation
+5. **outline_set_rel_pathlist()**: Filters paths during path generation
    - Implements set_rel_pathlist_hook
    - Gets query hints for current relation
    - Checks for scan method hints for this table
    - Filters rel->pathlist to keep only matching path types
    - Supports SeqScan, IndexScan, IndexOnlyScan hints
+
+6. **outline_join_search()**: Detects Leading hints for join order
+   - Implements join_search_hook
+   - Parses Leading hint format: `Leading((t1 t2) t3)`
+   - Logs detected hints for debugging
+   - Foundation for future full join order enforcement
 
 ### Workflow
 
@@ -335,17 +371,19 @@ pg_outline implements a complete hint parsing and application mechanism:
 
 **Application Phase** (manual mode):
 1. User executes SQL with same pattern
-2. outline_planner computes query fingerprint
-3. Retrieves matching stored hints from pg_outline_data table
-4. Calls parse_stored_hints() to parse hint string into ParsedHint list
-5. Calls apply_hints_to_query() to associate hints with Query nodes
-6. Sets active_outline_hints global variable
-7. Calls standard_planner() to begin planning
-8. During planning, outline_set_rel_pathlist() hook is called
-9. Hook filters paths to keep only hint-specified scan methods
-10. Planner chooses from filtered paths (restricted to hint-specified methods)
-11. After planning completes, clears active_outline_hints
-12. Returns PlannedStmt (should match original plan)
+2. outline_planner normalizes query using normalize_query() (parameterizes literals)
+3. Computes query fingerprint from normalized query
+4. Retrieves matching stored hints from pg_outline_data table
+5. Calls parse_stored_hints() to parse hint string into ParsedHint list
+6. Calls apply_hints_to_query() to associate hints with Query nodes
+7. Sets active_outline_hints global variable
+8. Calls standard_planner() to begin planning
+9. During planning, outline_set_rel_pathlist() hook is called for scan hints
+10. During planning, outline_join_search() hook is called for join order hints
+11. Hooks filter paths to keep only hint-specified methods
+12. Planner chooses from filtered paths (restricted to hint-specified methods)
+13. After planning completes, clears active_outline_hints
+14. Returns PlannedStmt (should match original plan)
 
 ### Key Data Structures
 
@@ -359,11 +397,57 @@ typedef struct ParsedHint
 
 Global variables:
 - `active_outline_hints`: List of active hints for current query
-- `prev_set_rel_pathlist_hook`: Saved previous hook pointer
+- `prev_set_rel_pathlist_hook`: Saved previous set_rel_pathlist_hook pointer
+- `prev_join_search_hook`: Saved previous join_search_hook pointer
 
 ## Examples
 
-### Example 1: Stabilize a Complex Query
+### Example 1: Query Parameterization - Same Outline for Different Literals
+
+```sql
+-- Enable auto mode to capture plan
+SET pg_outline.mode = 'auto';
+SET pg_outline.display_hints = true;
+
+-- Run query with literal value 100
+EXPLAIN SELECT * FROM t1 WHERE id < 100;
+-- System generates outline with parameterized pattern
+
+-- Manually create outline (or system auto-generates it)
+SELECT pg_outline_create(
+    'my_query_outline',
+    'select * from t1 where id < ?',  -- Parameterized pattern
+    '[main] SeqScan(t1)'
+);
+
+-- Switch to manual mode
+SET pg_outline.mode = 'manual';
+
+-- Run query with different literal value (500)
+-- This will match the same outline!
+EXPLAIN SELECT * FROM t1 WHERE id < 500;
+-- Uses the stored outline because both queries normalize to "select * from t1 where id < ?"
+
+-- Run query with another different value (1000)
+EXPLAIN SELECT * FROM t1 WHERE id < 1000;
+-- Also matches the same outline!
+```
+
+### Example 2: Multi-relation Join Hints
+
+```sql
+-- Create outline with 3-way join hint
+SELECT pg_outline_create(
+    'three_way_join',
+    'select * from t1 join t2 on t1.id = t2.t1_id join t3 on t2.id = t3.t2_id where t1.value > ?',
+    '[main] HashJoin(t1 t2 t3) [main] SeqScan(t1) [main] IndexScan(t2)'
+);
+
+-- The HashJoin(t1 t2 t3) hint tells pg_outline that all three tables
+-- should be joined using hash join method
+```
+
+### Example 3: Stabilize a Complex Query
 
 ```sql
 -- Create test tables
