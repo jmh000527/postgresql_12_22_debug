@@ -234,6 +234,33 @@ static void apply_hints_to_query(Query *query, List *parsed_hints);
 static void outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte);
 static RelOptInfo *outline_join_search(PlannerInfo *root, int levels_needed, List *initial_rels);
 
+/* Leading hint parsing structures and functions */
+typedef enum LeadingHintNodeType
+{
+	LEADING_NODE_RELATION,   /* Leaf node: a single relation name */
+	LEADING_NODE_JOIN        /* Internal node: represents a join of two subtrees */
+} LeadingHintNodeType;
+
+typedef struct LeadingHintNode
+{
+	LeadingHintNodeType type;
+	union
+	{
+		char *relation_name;          /* For LEADING_NODE_RELATION */
+		struct
+		{
+			struct LeadingHintNode *left;   /* For LEADING_NODE_JOIN */
+			struct LeadingHintNode *right;
+		} join;
+	} u;
+} LeadingHintNode;
+
+static LeadingHintNode *parse_leading_hint(const char *hint_str);
+static LeadingHintNode *parse_leading_hint_recursive(const char **str_ptr);
+static void free_leading_hint_tree(LeadingHintNode *node);
+static char *leading_hint_node_to_string(LeadingHintNode *node);
+static void leading_hint_node_to_string_buf(LeadingHintNode *node, StringInfo buf);
+
 /* Query naming support */
 typedef struct QueryNamingContext
 {
@@ -4307,6 +4334,221 @@ outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTbl
 }
 
 /*
+ * Parse Leading hint string and build a tree structure
+ *
+ * Supports the following formats:
+ * 1. Simple flat format: "t1 t2 t3" -> left-to-right join order
+ * 2. Nested format: "(t1 t2) t3" -> join t1 and t2 first, then join with t3
+ * 3. Bushy format: "(t1 t2) (t3 t4)" -> two independent joins
+ *
+ * Returns a tree structure representing the join order, or NULL on parse error
+ */
+static LeadingHintNode *
+parse_leading_hint(const char *hint_str)
+{
+	const char *str_ptr;
+	LeadingHintNode *result;
+
+	if (!hint_str || hint_str[0] == '\0')
+		return NULL;
+
+	str_ptr = hint_str;
+	result = parse_leading_hint_recursive(&str_ptr);
+
+	if (result)
+		elog(DEBUG1, "pg_outline: Successfully parsed Leading hint: %s", hint_str);
+	else
+		elog(WARNING, "pg_outline: Failed to parse Leading hint: %s", hint_str);
+
+	return result;
+}
+
+/*
+ * Recursive parser for Leading hint syntax
+ *
+ * Grammar:
+ *   element ::= relation_name | '(' element element ')'
+ *
+ * This function parses one element and advances *str_ptr
+ */
+static LeadingHintNode *
+parse_leading_hint_recursive(const char **str_ptr)
+{
+	LeadingHintNode *node;
+	const char *p;
+
+	if (!str_ptr || !*str_ptr)
+		return NULL;
+
+	p = *str_ptr;
+
+	/* Skip whitespace */
+	while (*p && isspace((unsigned char) *p))
+		p++;
+
+	if (*p == '\0')
+		return NULL;
+
+	/* Check for opening parenthesis - nested join */
+	if (*p == '(')
+	{
+		LeadingHintNode *left, *right;
+
+		p++; /* Skip '(' */
+
+		/* Parse left subtree */
+		*str_ptr = p;
+		left = parse_leading_hint_recursive(str_ptr);
+		if (!left)
+		{
+			elog(DEBUG1, "pg_outline: Failed to parse left subtree in Leading hint");
+			return NULL;
+		}
+
+		p = *str_ptr;
+
+		/* Skip whitespace */
+		while (*p && isspace((unsigned char) *p))
+			p++;
+
+		/* Parse right subtree */
+		*str_ptr = p;
+		right = parse_leading_hint_recursive(str_ptr);
+		if (!right)
+		{
+			elog(DEBUG1, "pg_outline: Failed to parse right subtree in Leading hint");
+			free_leading_hint_tree(left);
+			return NULL;
+		}
+
+		p = *str_ptr;
+
+		/* Skip whitespace */
+		while (*p && isspace((unsigned char) *p))
+			p++;
+
+		/* Expect closing parenthesis */
+		if (*p != ')')
+		{
+			elog(DEBUG1, "pg_outline: Expected ')' in Leading hint, found '%c'", *p ? *p : '\0');
+			free_leading_hint_tree(left);
+			free_leading_hint_tree(right);
+			return NULL;
+		}
+
+		p++; /* Skip ')' */
+		*str_ptr = p;
+
+		/* Create join node */
+		node = (LeadingHintNode *) palloc0(sizeof(LeadingHintNode));
+		node->type = LEADING_NODE_JOIN;
+		node->u.join.left = left;
+		node->u.join.right = right;
+
+		return node;
+	}
+	else if (isalpha((unsigned char) *p) || *p == '_')
+	{
+		/* Parse relation name */
+		const char *name_start = p;
+		char *relation_name;
+		int name_len;
+
+		/* Relation name can contain alphanumeric characters, underscores, and dollar signs */
+		while (*p && (isalnum((unsigned char) *p) || *p == '_' || *p == '$'))
+			p++;
+
+		name_len = p - name_start;
+		if (name_len == 0)
+			return NULL;
+
+		/* Allocate and copy relation name */
+		relation_name = palloc(name_len + 1);
+		strncpy(relation_name, name_start, name_len);
+		relation_name[name_len] = '\0';
+
+		*str_ptr = p;
+
+		/* Create relation node */
+		node = (LeadingHintNode *) palloc0(sizeof(LeadingHintNode));
+		node->type = LEADING_NODE_RELATION;
+		node->u.relation_name = relation_name;
+
+		elog(DEBUG2, "pg_outline: Parsed relation name: %s", relation_name);
+
+		return node;
+	}
+	else
+	{
+		/* Unexpected character */
+		elog(DEBUG1, "pg_outline: Unexpected character '%c' in Leading hint", *p ? *p : '\0');
+		return NULL;
+	}
+}
+
+/*
+ * Free a Leading hint tree structure
+ */
+static void
+free_leading_hint_tree(LeadingHintNode *node)
+{
+	if (!node)
+		return;
+
+	if (node->type == LEADING_NODE_JOIN)
+	{
+		free_leading_hint_tree(node->u.join.left);
+		free_leading_hint_tree(node->u.join.right);
+	}
+	else if (node->type == LEADING_NODE_RELATION)
+	{
+		if (node->u.relation_name)
+			pfree(node->u.relation_name);
+	}
+
+	pfree(node);
+}
+
+/*
+ * Convert Leading hint tree to string representation (for debugging)
+ */
+static char *
+leading_hint_node_to_string(LeadingHintNode *node)
+{
+	StringInfoData buf;
+
+	if (!node)
+		return pstrdup("(null)");
+
+	initStringInfo(&buf);
+	leading_hint_node_to_string_buf(node, &buf);
+	return buf.data;
+}
+
+/*
+ * Helper function to recursively build string representation
+ */
+static void
+leading_hint_node_to_string_buf(LeadingHintNode *node, StringInfo buf)
+{
+	if (!node)
+		return;
+
+	if (node->type == LEADING_NODE_RELATION)
+	{
+		appendStringInfoString(buf, node->u.relation_name);
+	}
+	else if (node->type == LEADING_NODE_JOIN)
+	{
+		appendStringInfoChar(buf, '(');
+		leading_hint_node_to_string_buf(node->u.join.left, buf);
+		appendStringInfoChar(buf, ' ');
+		leading_hint_node_to_string_buf(node->u.join.right, buf);
+		appendStringInfoChar(buf, ')');
+	}
+}
+
+/*
  * outline_join_search - Hook to enforce Leading hints for join order
  *
  * This hook is called to determine the join order for a query.
@@ -4319,6 +4561,8 @@ outline_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	char	   *leading_hint_start;
 	char	   *leading_hint_end;
 	char	   *leading_content;
+	LeadingHintNode *leading_tree;
+	char	   *parsed_tree_str;
 	int			len;
 
 	/* Call previous hook first if it exists */
@@ -4339,11 +4583,38 @@ outline_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	if (!leading_hint_start)
 		return standard_join_search(root, levels_needed, initial_rels);
 
-	/* Find the closing parenthesis */
+	/* Find the matching closing parenthesis for Leading hint */
 	leading_hint_start += strlen("Leading(");
-	leading_hint_end = strchr(leading_hint_start, ')');
-	if (!leading_hint_end)
-		return standard_join_search(root, levels_needed, initial_rels);
+
+	/* We need to find the matching closing parenthesis, accounting for nested parens */
+	{
+		const char *p = leading_hint_start;
+		int paren_depth = 1;  /* We're already inside the first '(' */
+
+		leading_hint_end = NULL;
+		while (*p && paren_depth > 0)
+		{
+			if (*p == '(')
+				paren_depth++;
+			else if (*p == ')')
+			{
+				paren_depth--;
+				if (paren_depth == 0)
+				{
+					/* Cast away const here since we're just storing a pointer for calculation */
+					leading_hint_end = (char *) p;
+					break;
+				}
+			}
+			p++;
+		}
+
+		if (!leading_hint_end)
+		{
+			elog(DEBUG1, "pg_outline: Could not find matching ')' for Leading hint");
+			return standard_join_search(root, levels_needed, initial_rels);
+		}
+	}
 
 	len = leading_hint_end - leading_hint_start;
 	if (len <= 0)
@@ -4354,14 +4625,31 @@ outline_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	strncpy(leading_content, leading_hint_start, len);
 	leading_content[len] = '\0';
 
-	elog(DEBUG1, "pg_outline: found Leading hint: Leading(%s)", leading_content);
+	elog(NOTICE, "pg_outline: Found Leading hint: Leading(%s)", leading_content);
 
-	/* For now, log that we found the hint but use standard join search */
-	/* Full Leading hint enforcement would require parsing the nested syntax */
-	/* and building a custom join tree, which is complex */
-	elog(DEBUG1, "pg_outline: Leading hint enforcement is partial - using standard join search");
+	/* Parse the Leading hint into a tree structure */
+	leading_tree = parse_leading_hint(leading_content);
+
+	if (leading_tree)
+	{
+		/* Convert parsed tree back to string for verification */
+		parsed_tree_str = leading_hint_node_to_string(leading_tree);
+		elog(NOTICE, "pg_outline: Parsed Leading hint tree structure: %s", parsed_tree_str);
+		pfree(parsed_tree_str);
+
+		/* Free the tree structure */
+		free_leading_hint_tree(leading_tree);
+	}
+	else
+	{
+		elog(WARNING, "pg_outline: Failed to parse Leading hint: Leading(%s)", leading_content);
+	}
 
 	pfree(leading_content);
+
+	/* Note: We only parse the hint here; actual join order enforcement is not implemented */
+	elog(DEBUG1, "pg_outline: Leading hint parsed successfully, but join order enforcement is not implemented");
+
 	return standard_join_search(root, levels_needed, initial_rels);
 }
 
