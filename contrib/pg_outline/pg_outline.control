@@ -1,0 +1,5 @@
+# pg_outline extension
+comment = 'Plan stabilization through execution plan outline hints'
+default_version = '1.0'
+module_pathname = '$libdir/pg_outline'
+relocatable = true
