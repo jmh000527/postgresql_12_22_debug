@@ -1,0 +1,17 @@
+SELECT pg_outline_create('smoke', 'SELECT 1', 'main', 'SeqScan(t)'); -- query_name ignored here
+ pg_outline_create 
+-------------------
+ 
+(1 row)
+
+SELECT outline_name, query_name, hints FROM pg_outline_list() ORDER BY outline_name, query_name;
+ outline_name | query_name |   hints    
+--------------+------------+------------
+ smoke        | main       | SeqScan(t)
+(1 row)
+
+SELECT pg_outline_delete('smoke');
+ pg_outline_delete 
+-------------------
+ 
+(1 row)

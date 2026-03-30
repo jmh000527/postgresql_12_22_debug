@@ -29,6 +29,7 @@ SUBDIRS = \
 		oid2name	\
 		pageinspect	\
 		passwordcheck	\
+		pg_hint_plan	\
 		pg_buffercache	\
 		pg_freespacemap \
 		pg_prewarm	\
@@ -48,6 +49,7 @@ SUBDIRS = \
 		tsm_system_rows \
 		tsm_system_time \
 		unaccent	\
+		pg_outline	\
 		vacuumlo
 
 ifeq ($(with_openssl),yes)
