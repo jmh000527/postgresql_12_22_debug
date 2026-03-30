@@ -1711,22 +1711,69 @@ construct_sql_with_hints(const char *query_string, const char *hints_string)
 	return ret;
 }
 
+/* Structure to hold query name and hint pairs */
+typedef struct QueryHintPair
+{
+	char *query_name;
+	char *hint_text;
+} QueryHintPair;
+
+/*
+ * Find next SELECT keyword in SQL string
+ * Returns position after SELECT keyword, or NULL if not found
+ */
+static const char *
+find_next_select_keyword(const char *sql)
+{
+	const char *p = sql;
+
+	while (*p)
+	{
+		/* Skip whitespace */
+		while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+			p++;
+
+		if (!*p)
+			break;
+
+		/* Check for SELECT keyword (case-insensitive) */
+		if ((*p == 'S' || *p == 's') &&
+			(strncasecmp(p, "SELECT", 6) == 0))
+		{
+			/* Make sure it's a complete word */
+			if (!isalnum((unsigned char)p[6]) && p[6] != '_')
+			{
+				return p + 6;  /* Position after "SELECT" */
+			}
+		}
+
+		/* Skip current character */
+		p++;
+	}
+
+	return NULL;
+}
+
 /*
  * Reconstruct SQL with hints at their original positions
- * This is a simplified implementation that inserts the main query hint
- * at the beginning of the SQL, which is sufficient for most cases.
  *
- * For complex scenarios with positioned hints, this function parses
- * hints in "[query_name] hint" format and attempts to inject them at
- * appropriate positions in the SQL.
+ * This function parses hints in "[query_name] hint" format and injects them
+ * at appropriate positions in the SQL:
+ * - [main] hints go after the main SELECT keyword
+ * - [sublink_N] hints go after the SELECT keyword in the Nth subquery
  */
 static char *
 reconstruct_sql_with_positioned_hints(const char *query_string, const char *hints_string)
 {
 	StringInfoData result;
 	const char *p;
+	List	   *hint_pairs = NIL;
 	char	   *main_hint = NULL;
-	List	   *other_hints = NIL;
+	List	   *sublink_hints = NIL;
+	int			sublink_count = 0;
+	const char *sql_ptr;
+	const char *select_pos;
+	int			current_sublink = 0;
 
 	if (!query_string || !hints_string)
 		return NULL;
@@ -1734,8 +1781,8 @@ reconstruct_sql_with_positioned_hints(const char *query_string, const char *hint
 	initStringInfo(&result);
 
 	/*
-	 * Parse hints_string to separate [main] hint from others
-	 * Format: "[main] hint1\n[sublink_0] hint2\n[cte_xxx] hint3"
+	 * Parse hints_string to extract all [query_name] hint pairs
+	 * Format: "[main] hint1 [sublink_0] hint2 [cte_xxx] hint3"
 	 */
 	p = hints_string;
 	while (*p)
@@ -1750,13 +1797,23 @@ reconstruct_sql_with_positioned_hints(const char *query_string, const char *hint
 		/* Look for [query_name] */
 		if (*p == '[')
 		{
-			const char *name_start = p + 1;
-			const char *name_end = strchr(name_start, ']');
+			const char *name_start;
+			const char *name_end;
+			size_t name_len;
+			char *query_name;
+			const char *hint_start;
+			const char *hint_end;
+			size_t hint_len;
+			char *hint_text;
+			QueryHintPair *pair;
+
+			name_start = p + 1;
+			name_end = strchr(name_start, ']');
 
 			if (name_end)
 			{
-				size_t name_len = name_end - name_start;
-				char *query_name = palloc(name_len + 1);
+				name_len = name_end - name_start;
+				query_name = palloc(name_len + 1);
 				memcpy(query_name, name_start, name_len);
 				query_name[name_len] = '\0';
 
@@ -1765,28 +1822,39 @@ reconstruct_sql_with_positioned_hints(const char *query_string, const char *hint
 				while (*p && (*p == ' ' || *p == '\t'))
 					p++;
 
-				/* Extract hint text until newline */
-				const char *hint_start = p;
-				while (*p && *p != '\n' && *p != '\r')
+				/* Extract hint text until next [ or end */
+				hint_start = p;
+				while (*p && *p != '[')
 					p++;
 
-				size_t hint_len = p - hint_start;
-				char *hint_text = palloc(hint_len + 1);
+				/* Trim trailing whitespace from hint */
+				hint_end = p;
+				while (hint_end > hint_start &&
+					   (*(hint_end-1) == ' ' || *(hint_end-1) == '\t' ||
+					    *(hint_end-1) == '\n' || *(hint_end-1) == '\r'))
+					hint_end--;
+
+				hint_len = hint_end - hint_start;
+				hint_text = palloc(hint_len + 1);
 				memcpy(hint_text, hint_start, hint_len);
 				hint_text[hint_len] = '\0';
 
-				/* Store hint */
+				/* Store hint pair */
+				pair = palloc(sizeof(QueryHintPair));
+				pair->query_name = query_name;
+				pair->hint_text = hint_text;
+				hint_pairs = lappend(hint_pairs, pair);
+
+				/* Categorize hints */
 				if (strcmp(query_name, "main") == 0)
 				{
 					main_hint = hint_text;
 				}
-				else
+				else if (strncmp(query_name, "sublink_", 8) == 0)
 				{
-					/* Store non-main hints for potential future use */
-					other_hints = lappend(other_hints, hint_text);
+					sublink_hints = lappend(sublink_hints, pair);
+					sublink_count++;
 				}
-
-				pfree(query_name);
 			}
 			else
 			{
@@ -1798,79 +1866,127 @@ reconstruct_sql_with_positioned_hints(const char *query_string, const char *hint
 		else
 		{
 			/* Skip unrecognized content */
-			while (*p && *p != '\n')
-				p++;
+			p++;
 		}
 	}
 
-	/* Insert [main] hint after SELECT keyword if found */
-	if (main_hint)
+	/*
+	 * Now reconstruct SQL with hints inserted at appropriate positions
+	 * Strategy:
+	 * 1. Find main SELECT and insert main hint
+	 * 2. For each subquery found, insert corresponding sublink hint
+	 */
+	sql_ptr = query_string;
+
+	/* Find and process main SELECT */
+	select_pos = find_next_select_keyword(sql_ptr);
+
+	if (select_pos && main_hint)
 	{
-		const char *select_pos;
-		const char *sql_ptr = query_string;
-		bool found_select = false;
+		/* Copy up to and including main SELECT */
+		appendBinaryStringInfo(&result, query_string, select_pos - query_string);
 
-		/* Find SELECT keyword (case-insensitive) */
-		while (*sql_ptr)
+		/* Insert main hint */
+		appendStringInfo(&result, " /*+ %s */", main_hint);
+
+		/* Update pointer to continue after main SELECT */
+		sql_ptr = select_pos;
+	}
+	else if (!select_pos)
+	{
+		/* No SELECT found, just copy original */
+		appendStringInfoString(&result, query_string);
+		return result.data;
+	}
+
+	/* Now process the rest of the SQL, looking for subqueries */
+	while (*sql_ptr)
+	{
+		/* Look for opening parenthesis that might start a subquery */
+		if (*sql_ptr == '(')
 		{
-			/* Skip whitespace and comments */
-			while (*sql_ptr && (*sql_ptr == ' ' || *sql_ptr == '\t' || *sql_ptr == '\n' || *sql_ptr == '\r'))
-				sql_ptr++;
+			const char *after_paren;
+			const char *sub_select;
 
-			/* Check for SELECT keyword (case-insensitive) */
-			if ((*sql_ptr == 'S' || *sql_ptr == 's') &&
-				(strncasecmp(sql_ptr, "SELECT", 6) == 0 || strncasecmp(sql_ptr, "select", 6) == 0))
+			/* Copy the opening parenthesis */
+			appendStringInfoChar(&result, *sql_ptr);
+			sql_ptr++;
+
+			/* Save current position to check for SELECT */
+			after_paren = sql_ptr;
+
+			/* Look ahead to see if there's a SELECT after this paren */
+			sub_select = find_next_select_keyword(after_paren);
+
+			/* Check if this SELECT is within this parenthesis level */
+			if (sub_select)
 			{
-				/* Make sure it's a complete word (not part of another identifier) */
-				if (!isalnum((unsigned char)sql_ptr[6]) && sql_ptr[6] != '_')
+				const char *check_ptr;
+				int paren_count;
+				bool select_at_this_level;
+
+				/* Count parentheses to ensure SELECT is at current level */
+				check_ptr = after_paren;
+				paren_count = 0;
+				select_at_this_level = true;
+
+				while (check_ptr < sub_select)
 				{
-					select_pos = sql_ptr + 6;  /* Position after "SELECT" */
-					found_select = true;
-					break;
+					if (*check_ptr == '(')
+						paren_count++;
+					else if (*check_ptr == ')')
+					{
+						/* Found closing paren before SELECT - no SELECT at this level */
+						select_at_this_level = false;
+						break;
+					}
+					check_ptr++;
+				}
+
+				if (select_at_this_level && current_sublink < sublink_count)
+				{
+					QueryHintPair *pair;
+
+					/* Copy up to and including the SELECT keyword */
+					appendBinaryStringInfo(&result, after_paren, sub_select - after_paren);
+
+					/* Insert sublink hint */
+					pair = (QueryHintPair *) list_nth(sublink_hints, current_sublink);
+					appendStringInfo(&result, " /*+ %s */", pair->hint_text);
+
+					/* Update pointer */
+					sql_ptr = sub_select;
+					current_sublink++;
+					continue;
 				}
 			}
-
-			/* Skip to next potential position */
-			if (*sql_ptr)
-				sql_ptr++;
-		}
-
-		if (found_select)
-		{
-			/* Copy everything up to and including SELECT */
-			appendBinaryStringInfo(&result, query_string, select_pos - query_string);
-
-			/* Insert hint comment after SELECT */
-			appendStringInfo(&result, " /*+ %s */", main_hint);
-
-			/* Copy the rest of the SQL */
-			appendStringInfoString(&result, select_pos);
+			/* If no SELECT found or not at this level, continue normal copying */
 		}
 		else
 		{
-			/* Fallback: if SELECT not found, put hint at beginning */
-			appendStringInfo(&result, "/*+ %s */\n", main_hint);
-			appendStringInfoString(&result, query_string);
+			/* Copy current character */
+			appendStringInfoChar(&result, *sql_ptr);
+			sql_ptr++;
 		}
-	}
-	else
-	{
-		/* No hint, just return original SQL */
-		appendStringInfoString(&result, query_string);
 	}
 
-	/* Add other hints as a comment block at the end for reference */
-	if (list_length(other_hints) > 0)
+	/* Clean up */
+	if (hint_pairs)
 	{
 		ListCell *lc;
-		appendStringInfoString(&result, "\n/*\nOther hints in outline:\n");
-		foreach(lc, other_hints)
+		foreach(lc, hint_pairs)
 		{
-			char *hint = (char *) lfirst(lc);
-			appendStringInfo(&result, "  %s\n", hint);
+			QueryHintPair *pair = (QueryHintPair *) lfirst(lc);
+			if (pair->query_name)
+				pfree(pair->query_name);
+			if (pair->hint_text && pair->hint_text != main_hint)
+				pfree(pair->hint_text);
+			pfree(pair);
 		}
-		appendStringInfoString(&result, "*/");
+		list_free(hint_pairs);
 	}
+	if (sublink_hints)
+		list_free(sublink_hints);
 
 	return result.data;
 }
