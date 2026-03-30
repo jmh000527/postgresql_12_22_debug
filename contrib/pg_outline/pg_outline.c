@@ -1979,7 +1979,7 @@ reconstruct_sql_with_positioned_hints(const char *query_string, const char *hint
 			QueryHintPair *pair = (QueryHintPair *) lfirst(lc);
 			if (pair->query_name)
 				pfree(pair->query_name);
-			if (pair->hint_text && pair->hint_text != main_hint)
+			if (pair->hint_text)
 				pfree(pair->hint_text);
 			pfree(pair);
 		}
