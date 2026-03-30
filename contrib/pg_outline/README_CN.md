@@ -6,11 +6,13 @@
 
 ## 功能特性
 
-- **自动生成 Hints**: 从执行计划自动生成提示
-- **计划固定**: 存储并重用执行计划,确保查询性能的一致性
+- **自动生成 Hints**: 从执行计划自动生成提示，支持带位置信息的 hint 重构
+- **Hint 解析与应用**: 完整的 hint 解析和应用机制，实现真正的计划固定
+- **计划固定**: 存储并重用执行计划，确保查询性能的一致性
 - **Outline 显示**: 在查询执行后显示生成的 outline 数据
 - **便捷管理**: 提供 SQL 函数来创建、删除、启用和禁用 outlines
-- **Hint 支持**: 基于常见的 hint 类型(扫描方法、连接方法、连接顺序)
+- **Hint 支持**: 支持扫描方法、连接方法、连接顺序等常见 hint 类型
+- **路径过滤**: 通过 set_rel_pathlist_hook 强制执行扫描方法 hints
 
 ## 安装
 
@@ -62,7 +64,7 @@ SET pg_outline.mode = 'auto';
 
 ### 自动 Outline 生成
 
-当 `pg_outline.mode` 设置为 'auto' 时,扩展会自动为每个查询生成 outline 数据:
+当 `pg_outline.mode` 设置为 'auto' 时，扩展会自动为每个查询生成 outline 数据:
 
 ```sql
 -- 启用自动模式
@@ -80,22 +82,26 @@ LIMIT 10;
 -- 扩展会显示生成的 outline 数据:
 /*+
 BEGIN_OUTLINE_DATA
-SeqScan(table)
-HashJoin(...)
+[main] SeqScan(test_table1)
+[main] IndexScan(test_table2)
+[main] HashJoin(test_table1 test_table2)
+[main] Leading((test_table1 test_table2))
 END_OUTLINE_DATA
 */
 ```
+
+**注意**: 生成的 hints 现在包含 `[query_name]` 前缀，用于在应用时精确匹配到对应的查询节点。
 
 ### 手动 Outline 管理
 
 您可以手动创建、管理和应用 outlines:
 
 ```sql
--- 创建 outline
+-- 创建 outline（使用带 query_name 前缀的格式）
 SELECT pg_outline_create(
     'my_outline',  -- outline 名称
     'SELECT * FROM test_table1 WHERE value > ?',  -- 查询模式
-    'SeqScan(test_table1)'  -- hints (可选)
+    '[main] SeqScan(test_table1)'  -- hints (必须包含 [query_name] 前缀)
 );
 
 -- 列出所有 outlines
@@ -112,6 +118,41 @@ SELECT pg_outline_enable('my_outline');
 
 -- 删除 outline
 SELECT pg_outline_drop('my_outline');
+```
+
+### Outline 应用与计划固定
+
+当相同模式的 SQL 再次执行时，pg_outline 会自动应用存储的 hints，重现原始执行计划:
+
+```sql
+-- 1. 首先，使用 auto 模式捕获计划
+SET pg_outline.mode = 'auto';
+EXPLAIN SELECT * FROM t1 WHERE id < 100;
+-- 记录生成的 hints
+
+-- 2. 手动创建 outline（或使用 pg_outline_create_from_sql）
+SELECT pg_outline_create(
+    'test_outline',
+    'SELECT * FROM t1 WHERE id < ?;',
+    '[main] SeqScan(t1)'
+);
+
+-- 3. 切换到 manual 模式并启用详细日志
+SET pg_outline.mode = 'manual';
+SET client_min_messages = 'DEBUG1';
+
+-- 4. 执行相同模式的查询，hints 将自动应用
+SELECT * FROM t1 WHERE id < 100;
+-- 输出会显示:
+-- DEBUG: pg_outline: computed fingerprint: ...
+-- DEBUG: pg_outline: retrieved hints from stored outline
+-- DEBUG: pg_outline: parsed 1 hints from stored outline
+-- DEBUG: pg_outline: applied hint to query 'main': SeqScan(t1)
+-- DEBUG: pg_outline: filtering paths for relation 't1' based on hints
+
+-- 5. 验证计划是否匹配
+EXPLAIN SELECT * FROM t1 WHERE id < 100;
+-- 应该显示 Seq Scan，即使索引扫描可能更优
 ```
 
 ## Hint 类型
@@ -142,13 +183,13 @@ SELECT pg_outline_drop('my_outline');
 
 ## Outline 数据格式
 
-生成的 outline 数据遵循类似 OceanBase 和 Oracle 的格式:
+生成的 outline 数据遵循类似 OceanBase 和 Oracle 的格式，并包含 query_name 前缀:
 
 ```
 /*+
 BEGIN_OUTLINE_DATA
-<hint1>
-<hint2>
+[query_name] <hint1>
+[query_name] <hint2>
 ...
 END_OUTLINE_DATA
 */
@@ -159,13 +200,21 @@ END_OUTLINE_DATA
 ```
 /*+
 BEGIN_OUTLINE_DATA
-SeqScan(test_table1)
-IndexScan(test_table2)
-HashJoin(...)
-Leading((test_table1 test_table2))
+[main] SeqScan(test_table1)
+[main] IndexScan(test_table2)
+[main] HashJoin(test_table1 test_table2)
+[main] Leading((test_table1 test_table2))
 END_OUTLINE_DATA
 */
 ```
+
+**Hint 格式说明**:
+- `[query_name]`: 查询名称前缀，用于标识 hint 应用到哪个查询节点
+  - `[main]`: 主查询
+  - `[cte_<name>]`: CTE 查询
+  - `[subquery_N]`: 子查询
+  - `[sublink_N]`: SubLink 子查询
+- `hint_text`: 具体的 hint 内容（扫描方法、连接方法等）
 
 对于复杂的多表连接:
 
@@ -203,43 +252,114 @@ Leading(((t1 t2) t3) t4)
 
 扩展使用 PostgreSQL hooks 来拦截查询规划和执行:
 
-1. **Planner Hook**: 拦截查询规划,从选择的计划中生成 hints
-2. **Executor Hooks**: 跟踪查询执行并显示 outline 数据
-3. **计划分析**: 递归分析计划树以提取相关 hints
-4. **Hint 存储**: 将 hints 存储在系统表中以供后续重用
+1. **Planner Hook**: 拦截查询规划，从选择的计划中生成 hints，并在规划前应用存储的 hints
+2. **Set Rel Pathlist Hook**: 在生成路径阶段过滤扫描路径，强制执行扫描方法 hints
+3. **Executor Hooks**: 跟踪查询执行并显示 outline 数据
+4. **计划分析**: 递归分析计划树以提取相关 hints，支持带位置信息的 hint 重构
+5. **Hint 存储**: 将 hints 存储在系统表中以供后续重用
+6. **Hint 应用**: 完整的 hint 解析和应用流程，包括：
+   - 解析存储的 hint 字符串（`[query_name] hint_text` 格式）
+   - 通过 metadata hash table 将 hints 关联到对应的 Query 节点
+   - 在规划阶段过滤路径，只保留 hint 指定的扫描方法
 
 ## 与类似工具的比较
 
 ### vs. pg_hint_plan
 
-- `pg_hint_plan`: 专注于应用手动指定的 hints
-- `pg_outline`: 自动从执行计划生成 hints 并作为 outlines 管理
+- `pg_hint_plan`: 专注于应用手动指定的 hints，通过 SQL 注释语法
+- `pg_outline`: 自动从执行计划生成 hints 并作为 outlines 管理，支持计划捕获和重现
+- 相似点: 都使用类似的 hint 语法（SeqScan、IndexScan、Leading 等）
+- 不同点: pg_outline 增加了 `[query_name]` 前缀以支持复杂查询的精确 hint 应用
 
 ### vs. OceanBase Outline
 
 - 类似的概念和 API 设计
 - 适配 PostgreSQL 的规划器和执行器架构
 - 兼容 PostgreSQL 的标准查询优化
+- 实现了完整的 outline 生成、存储和应用流程
 
 ## 限制
 
 当前版本的限制:
 
-1. 简化的 hint 生成(基本的扫描和连接方法)
-2. 查询模式匹配是精确的(尚未参数化)
-3. 仅限于单查询 outlines(尚不支持复杂的 CTE)
-4. Hint 应用尚未完全实现
+1. 查询模式匹配是精确的(尚未参数化)
+2. Join method hints 应用可能需要额外的 join_search_hook 实现
+3. 当前使用简单的字符串匹配检查 hints，未来可以改进为完整的 hint 解析器
+4. 如果 hint 无法应用（如表名不匹配），系统会回退到正常规划
 
 ## 未来改进
 
 计划中的改进:
 
-- 使用 planner hooks 完整实现 hint 应用
-- 查询指纹识别以实现更好的模式匹配
+- 查询指纹识别以实现更好的模式匹配（参数化支持）
+- 完整的 Join method hint 应用（需要 join_search_hook）
 - 支持并行查询 hints
 - 扩展的 hint 类型(例如 SET、ROWS hints)
 - 与 pg_stat_statements 集成以自动创建 outline
 - Outline 导入/导出功能
+- 更复杂的 hint 语法解析器
+- Cost 调整作为路径过滤的替代方案
+- Hint 冲突检测和警告
+
+## 技术实现细节
+
+### Hint 解析流程
+
+pg_outline 实现了完整的 hint 解析和应用机制:
+
+1. **parse_stored_hints()**: 解析存储的 hint 字符串
+   - 输入格式: `[query_name] hint_text\n[query_name2] hint_text2`
+   - 输出: ParsedHint 结构列表，每个包含 query_name 和 hint_text
+
+2. **apply_hints_to_query()**: 将解析的 hints 关联到 Query 节点
+   - 通过 metadata hash table 查找匹配的 query_name
+   - 将 hint_text 存储到对应的 QueryMetadataEntry
+   - 支持多个 hints 合并到同一个查询
+
+3. **outline_set_rel_pathlist()**: 在路径生成阶段过滤路径
+   - 实现 set_rel_pathlist_hook 钩子
+   - 获取当前 relation 的 query hints
+   - 检查是否有针对此表的扫描方法 hint
+   - 过滤 rel->pathlist，只保留匹配的路径类型
+   - 支持 SeqScan、IndexScan、IndexOnlyScan hints
+
+### 工作流程
+
+**生成阶段** (auto 模式):
+1. 用户执行查询
+2. outline_planner 钩子拦截规划过程
+3. 系统生成执行计划
+4. 从计划中提取 hints（带位置信息）
+5. 以 `[query_name] hint_text` 格式生成 hint 字符串
+6. 如果启用了 display_hints，显示生成的 outline
+
+**应用阶段** (manual 模式):
+1. 用户执行相同模式的 SQL
+2. outline_planner 计算查询指纹（fingerprint）
+3. 从 pg_outline_data 表检索匹配的 stored hints
+4. 调用 parse_stored_hints() 解析 hint 字符串为 ParsedHint 列表
+5. 调用 apply_hints_to_query() 将 hints 关联到 Query 节点
+6. 设置 active_outline_hints 全局变量
+7. 调用 standard_planner() 开始规划
+8. 规划过程中，outline_set_rel_pathlist() 钩子被调用
+9. 钩子过滤路径，只保留 hint 指定的扫描方法
+10. 规划器从过滤后的路径中选择（被限制为 hint 指定的方法）
+11. 规划完成后清理 active_outline_hints
+12. 返回 PlannedStmt（应该匹配原始计划）
+
+### 关键数据结构
+
+```c
+typedef struct ParsedHint
+{
+    char *query_name;  /* e.g., "main", "sublink_0" */
+    char *hint_text;   /* e.g., "SeqScan(t1)", "IndexScan(t2)" */
+} ParsedHint;
+```
+
+全局变量:
+- `active_outline_hints`: 当前查询的活动 hints 列表
+- `prev_set_rel_pathlist_hook`: 保存的前一个钩子指针
 
 ## 示例
 
@@ -287,19 +407,38 @@ ORDER BY o.order_date DESC;
 SELECT pg_outline_create(
     'report_query_dev',
     'SELECT * FROM large_table1 t1 JOIN large_table2 t2 ON ...',
-    'HashJoin(large_table1 large_table2)'
+    '[main] HashJoin(large_table1 large_table2)'
 );
 
 -- 生产环境: 使用不同的计划
 SELECT pg_outline_create(
     'report_query_prod',
     'SELECT * FROM large_table1 t1 JOIN large_table2 t2 ON ...',
-    'MergeJoin(large_table1 large_table2) IndexScan(large_table1)'
+    '[main] MergeJoin(large_table1 large_table2) [main] IndexScan(large_table1)'
 );
 
 -- 在不同环境间切换
 SELECT pg_outline_enable('report_query_prod');
 SELECT pg_outline_disable('report_query_dev');
+```
+
+### 示例 3: 调试 Hint 应用
+
+```sql
+-- 启用详细日志以查看 hint 应用过程
+SET client_min_messages = 'DEBUG1';
+SET pg_outline.mode = 'manual';
+
+-- 执行查询
+SELECT * FROM t1 WHERE id < 100;
+
+-- 日志输出示例:
+-- DEBUG: pg_outline: computed fingerprint: 1234567890
+-- DEBUG: pg_outline: retrieved hints from stored outline: [main] SeqScan(t1)
+-- DEBUG: pg_outline: parsed 1 hints from stored outline
+-- DEBUG: pg_outline: applied hint to query 'main': SeqScan(t1)
+-- DEBUG: pg_outline: filtering paths for relation 't1' based on hints
+-- DEBUG: pg_outline: filtered from 3 to 1 paths for 't1'
 ```
 
 ## 故障排除
@@ -336,6 +475,31 @@ SELECT * FROM pg_outline_enabled WHERE outline_name = 'your_outline';
 
 -- 验证查询模式是否匹配
 -- 注意: 当前版本需要精确匹配
+
+-- 启用详细日志以查看应用过程
+SET client_min_messages = 'DEBUG1';
+
+-- 检查 hint 格式是否正确（必须包含 [query_name] 前缀）
+SELECT outline_name, hint_string FROM pg_outline_data
+WHERE outline_name = 'your_outline';
+
+-- 确保 hint 格式为: [main] SeqScan(table) 而不是 SeqScan(table)
+```
+
+### Hints 未生效
+
+如果 hints 已应用但计划没有改变:
+
+1. **检查表名是否正确**: Hint 中的表名必须与查询中的表名完全匹配
+2. **检查 hint 类型**: 确保 hint 类型（SeqScan、IndexScan 等）适用于该表
+3. **查看日志**: DEBUG1 级别的日志会显示路径过滤过程
+4. **验证路径存在**: 如果 hint 指定的路径不存在（如没有索引时使用 IndexScan），系统会回退到正常规划
+
+```sql
+-- 查看可用的路径
+SET enable_seqscan = off;  -- 禁用顺序扫描
+EXPLAIN SELECT * FROM t1 WHERE id < 100;  -- 查看是否有索引扫描路径
+SET enable_seqscan = on;   -- 恢复设置
 ```
 
 ## 贡献
