@@ -1,0 +1,6 @@
+# pg_outline extension
+comment = 'Plan hint management using outlines'
+default_version = '1.0'
+module_pathname = '$libdir/pg_outline'
+relocatable = false
+schema = pg_outline
