@@ -91,6 +91,56 @@ SHOW pg_outline.match_mode;
 -- Test inline hints (just verify syntax doesn't break)
 SELECT /*+ SeqScan(pg_class) */ relname FROM pg_class WHERE relname = 'pg_type';
 
+-- Test hint injection function
+-- Test 1: Simple SELECT with simple hints
+SELECT pg_outline.inject_hints(
+    'SELECT * FROM users WHERE id = 1',
+    'SeqScan(users)'
+);
+
+-- Test 2: Simple SELECT with [main] prefix
+SELECT pg_outline.inject_hints(
+    'SELECT * FROM users WHERE id = 1',
+    '[main]IndexScan(users user_idx)'
+);
+
+-- Test 3: WITH clause (CTE) with multi-query hints
+SELECT pg_outline.inject_hints(
+    'WITH data AS (SELECT * FROM users) SELECT * FROM data',
+    '[cte_data]SeqScan(users) [main]HashJoin(data)'
+);
+
+-- Test 4: Multiple CTEs with different hints
+SELECT pg_outline.inject_hints(
+    'WITH cte1 AS (SELECT * FROM t1), cte2 AS (SELECT * FROM t2) SELECT * FROM cte1 JOIN cte2 ON cte1.id = cte2.id',
+    '[cte_cte1]IndexScan(t1) [cte_cte2]SeqScan(t2) [main]HashJoin(cte1 cte2)'
+);
+
+-- Test 5: Mixed prefix and non-prefix hints
+SELECT pg_outline.inject_hints(
+    'SELECT * FROM orders',
+    'SeqScan(orders) Leading(orders customers)'
+);
+
+-- Test 6: Only CTE hints, no main hints
+SELECT pg_outline.inject_hints(
+    'WITH active_users AS (SELECT * FROM users WHERE active = true) SELECT * FROM active_users',
+    '[cte_active_users]IndexScan(users active_idx)'
+);
+
+-- Test 7: Empty hints
+SELECT pg_outline.inject_hints(
+    'SELECT * FROM users',
+    ''
+);
+
+-- Test 8: Complex query with existing comments
+SELECT pg_outline.inject_hints(
+    '-- This is a comment
+SELECT * FROM users',
+    'SeqScan(users)'
+);
+
 -- Cleanup
 DROP EXTENSION pg_outline CASCADE;
 

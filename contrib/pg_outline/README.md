@@ -35,6 +35,7 @@
    - `pg_outline.disable_outline()`: Disable an outline
    - `pg_outline.create_outline_from_plan()`: Generate outline from execution plan
    - `pg_outline.match_query()`: Match query and return applicable hints
+   - `pg_outline.inject_hints()`: Inject hints into SQL text with multi-query support
 
 ### Hint Application Flow
 
@@ -169,6 +170,41 @@ SET pg_outline.match_mode = 'normalized';
 -- Fingerprint matching - matches query structure (planned feature)
 SET pg_outline.match_mode = 'fingerprint';
 ```
+
+### Injecting Hints into SQL
+
+The `pg_outline.inject_hints()` function allows you to reconstruct SQL with hints inserted as inline comments. This is useful for:
+- Visualizing which hints would be applied to a query
+- Generating SQL with hints for external tools
+- Debugging hint application
+- Exporting queries with their optimizations
+
+```sql
+-- Simple query with hints
+SELECT pg_outline.inject_hints(
+    'SELECT * FROM users WHERE id = 1',
+    'SeqScan(users)'
+);
+-- Result: SELECT /*+ SeqScan(users) */ * FROM users WHERE id = 1
+
+-- Multi-query with [query_name] prefixes
+SELECT pg_outline.inject_hints(
+    'WITH active_users AS (SELECT * FROM users WHERE active = true) SELECT * FROM active_users',
+    '[cte_active_users]IndexScan(users active_idx) [main]SeqScan(active_users)'
+);
+-- Result: WITH active_users AS (SELECT /*+ IndexScan(users active_idx) */ * FROM users WHERE active = true) SELECT /*+ SeqScan(active_users) */ * FROM active_users
+
+-- Multiple CTEs with different hints
+SELECT pg_outline.inject_hints(
+    'WITH cte1 AS (SELECT * FROM t1), cte2 AS (SELECT * FROM t2) SELECT * FROM cte1 JOIN cte2 ON cte1.id = cte2.id',
+    '[cte_cte1]IndexScan(t1) [cte_cte2]SeqScan(t2) [main]HashJoin(cte1 cte2)'
+);
+```
+
+**Multi-Query Hint Syntax:**
+- `[main]` - Hints for the main/outer query
+- `[cte_name]` - Hints for a specific CTE (e.g., `[cte_active_users]`)
+- No prefix - Treated as hints for the main query
 
 ## Supported Hints
 

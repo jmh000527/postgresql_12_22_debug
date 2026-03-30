@@ -434,6 +434,100 @@ outline_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 }
 
 /*
+ * Helper: Extract hints for a specific query name from hint string
+ */
+static char *
+extract_hints_for_query(const char *hints, const char *query_name)
+{
+    StringInfoData result;
+    const char *ptr = hints;
+    bool found_match = false;
+
+    initStringInfo(&result);
+
+    while (*ptr)
+    {
+        /* Skip whitespace */
+        while (*ptr && isspace((unsigned char) *ptr))
+            ptr++;
+
+        if (*ptr == '\0')
+            break;
+
+        /* Check for [query_name] prefix */
+        if (*ptr == '[')
+        {
+            const char *bracket_end = strchr(ptr, ']');
+            if (bracket_end)
+            {
+                char *curr_query_name = pnstrdup(ptr + 1, bracket_end - ptr - 1);
+
+                /* Check if this matches our target query name */
+                if (strcmp(curr_query_name, query_name) == 0)
+                {
+                    /* Found matching query name, extract hints */
+                    ptr = bracket_end + 1;
+
+                    /* Copy hints until next bracket or end */
+                    while (*ptr && *ptr != '[')
+                    {
+                        if (!isspace((unsigned char) *ptr) ||
+                            (result.len > 0 && result.data[result.len - 1] != ' '))
+                        {
+                            appendStringInfoChar(&result, *ptr);
+                        }
+                        ptr++;
+                    }
+                    found_match = true;
+                }
+                else
+                {
+                    /* Not our query, skip this section */
+                    ptr = bracket_end + 1;
+                    while (*ptr && *ptr != '[')
+                        ptr++;
+                }
+
+                pfree(curr_query_name);
+            }
+            else
+            {
+                ptr++;
+            }
+        }
+        else
+        {
+            /* No prefix - if looking for "main", use these hints */
+            if (strcmp(query_name, "main") == 0 && !found_match)
+            {
+                while (*ptr && *ptr != '[')
+                {
+                    if (!isspace((unsigned char) *ptr) ||
+                        (result.len > 0 && result.data[result.len - 1] != ' '))
+                    {
+                        appendStringInfoChar(&result, *ptr);
+                    }
+                    ptr++;
+                }
+                found_match = true;
+            }
+            else
+            {
+                /* Skip unprefixed hints if not looking for main */
+                while (*ptr && *ptr != '[')
+                    ptr++;
+            }
+        }
+    }
+
+    /* Trim trailing whitespace */
+    while (result.len > 0 && isspace((unsigned char) result.data[result.len - 1]))
+        result.data[--result.len] = '\0';
+
+    return result.data;
+}
+
+/*
  * Inject hints into SQL text
  * Supports multi-query hints with [query_name] prefixes
  *
@@ -448,16 +542,18 @@ inject_hints_into_sql(const char *query_text, const char *hints)
 {
     StringInfoData result;
     const char *ptr;
-    const char *hint_ptr;
-    StringInfoData current_query_hints;
+    char *main_hints;
+    int cte_index = 0;
+    int paren_depth = 0;
 
     if (!query_text || !hints)
         return pstrdup(query_text ? query_text : "");
 
     initStringInfo(&result);
-    initStringInfo(&current_query_hints);
 
-    /* Simple implementation: inject hints right after first SELECT */
+    /* Extract hints for main query */
+    main_hints = extract_hints_for_query(hints, "main");
+
     ptr = query_text;
 
     /* Skip leading whitespace and comments */
@@ -507,99 +603,167 @@ inject_hints_into_sql(const char *query_text, const char *hints)
             ptr++;
         }
 
-        /* TODO: For CTE support, we need to parse individual CTEs and inject hints */
-        /* For now, just copy the rest */
+        /* Parse CTEs and inject hints */
+        while (*ptr)
+        {
+            /* Skip whitespace */
+            while (*ptr && isspace((unsigned char) *ptr))
+            {
+                appendStringInfoChar(&result, *ptr);
+                ptr++;
+            }
+
+            if (*ptr == '\0')
+                break;
+
+            /* Check if this starts a CTE name */
+            if (isalpha((unsigned char) *ptr) || *ptr == '_')
+            {
+                /* Extract CTE name */
+                const char *name_start = ptr;
+                while (*ptr && (isalnum((unsigned char) *ptr) || *ptr == '_'))
+                {
+                    appendStringInfoChar(&result, *ptr);
+                    ptr++;
+                }
+
+                /* Save CTE name for hint lookup */
+                char *cte_name = pnstrdup(name_start, ptr - name_start);
+                char *cte_query_name = psprintf("cte_%s", cte_name);
+                char *cte_hints = extract_hints_for_query(hints, cte_query_name);
+
+                /* Skip whitespace and expect AS */
+                while (*ptr && isspace((unsigned char) *ptr))
+                {
+                    appendStringInfoChar(&result, *ptr);
+                    ptr++;
+                }
+
+                if (strncasecmp(ptr, "AS", 2) == 0)
+                {
+                    appendStringInfoString(&result, "AS");
+                    ptr += 2;
+
+                    /* Skip whitespace */
+                    while (*ptr && isspace((unsigned char) *ptr))
+                    {
+                        appendStringInfoChar(&result, *ptr);
+                        ptr++;
+                    }
+
+                    /* Expect '(' */
+                    if (*ptr == '(')
+                    {
+                        appendStringInfoChar(&result, *ptr);
+                        ptr++;
+                        paren_depth = 1;
+
+                        /* Skip whitespace */
+                        while (*ptr && isspace((unsigned char) *ptr))
+                        {
+                            appendStringInfoChar(&result, *ptr);
+                            ptr++;
+                        }
+
+                        /* Look for SELECT to inject hints */
+                        if (strncasecmp(ptr, "SELECT", 6) == 0)
+                        {
+                            if (cte_hints && strlen(cte_hints) > 0)
+                            {
+                                appendStringInfoString(&result, "SELECT /*+ ");
+                                appendStringInfoString(&result, cte_hints);
+                                appendStringInfoString(&result, " */ ");
+                                ptr += 6;
+                            }
+                            else
+                            {
+                                appendStringInfoString(&result, "SELECT");
+                                ptr += 6;
+                            }
+                        }
+
+                        /* Copy rest of CTE until closing paren */
+                        while (*ptr && paren_depth > 0)
+                        {
+                            if (*ptr == '(')
+                                paren_depth++;
+                            else if (*ptr == ')')
+                                paren_depth--;
+
+                            appendStringInfoChar(&result, *ptr);
+                            ptr++;
+                        }
+                    }
+                }
+
+                pfree(cte_name);
+                pfree(cte_query_name);
+                pfree(cte_hints);
+            }
+
+            /* Skip whitespace */
+            while (*ptr && isspace((unsigned char) *ptr))
+            {
+                appendStringInfoChar(&result, *ptr);
+                ptr++;
+            }
+
+            /* Check for comma (more CTEs) or main query */
+            if (*ptr == ',')
+            {
+                appendStringInfoChar(&result, *ptr);
+                ptr++;
+            }
+            else
+            {
+                /* End of CTEs, main query follows */
+                break;
+            }
+        }
+
+        /* Now handle main SELECT after CTEs */
+        while (*ptr && isspace((unsigned char) *ptr))
+        {
+            appendStringInfoChar(&result, *ptr);
+            ptr++;
+        }
+
+        if (strncasecmp(ptr, "SELECT", 6) == 0)
+        {
+            if (main_hints && strlen(main_hints) > 0)
+            {
+                appendStringInfoString(&result, "SELECT /*+ ");
+                appendStringInfoString(&result, main_hints);
+                appendStringInfoString(&result, " */ ");
+                ptr += 6;
+            }
+            else
+            {
+                appendStringInfoString(&result, "SELECT");
+                ptr += 6;
+            }
+        }
+
+        /* Copy rest of query */
         appendStringInfoString(&result, ptr);
     }
     else if (strncasecmp(ptr, "SELECT", 6) == 0)
     {
-        /* Found SELECT, inject hints here */
-        appendStringInfoString(&result, "SELECT /*+ ");
-
-        /* Parse hints to extract [main] or appropriate prefix */
-        hint_ptr = hints;
-        while (*hint_ptr)
+        /* Simple SELECT without WITH clause */
+        if (main_hints && strlen(main_hints) > 0)
         {
-            /* Skip whitespace */
-            while (*hint_ptr && isspace((unsigned char) *hint_ptr))
-                hint_ptr++;
-
-            if (*hint_ptr == '\0')
-                break;
-
-            /* Check for [query_name] prefix */
-            if (*hint_ptr == '[')
-            {
-                /* Extract query name */
-                const char *bracket_end = strchr(hint_ptr, ']');
-                if (bracket_end)
-                {
-                    char *query_name = pnstrdup(hint_ptr + 1, bracket_end - hint_ptr - 1);
-
-                    /* For now, only inject [main] hints into main SELECT */
-                    if (strcmp(query_name, "main") == 0)
-                    {
-                        /* Skip past the bracket */
-                        hint_ptr = bracket_end + 1;
-
-                        /* Copy hints until next bracket or end */
-                        while (*hint_ptr && *hint_ptr != '[')
-                        {
-                            if (!isspace((unsigned char) *hint_ptr) ||
-                                (current_query_hints.len > 0 &&
-                                 current_query_hints.data[current_query_hints.len - 1] != ' '))
-                            {
-                                appendStringInfoChar(&current_query_hints, *hint_ptr);
-                            }
-                            hint_ptr++;
-                        }
-                    }
-                    else
-                    {
-                        /* Skip this hint section - it's for a different query part */
-                        hint_ptr = bracket_end + 1;
-                        while (*hint_ptr && *hint_ptr != '[')
-                            hint_ptr++;
-                    }
-
-                    pfree(query_name);
-                }
-                else
-                {
-                    hint_ptr++;
-                }
-            }
-            else
-            {
-                /* No prefix, treat as main query hint */
-                while (*hint_ptr && *hint_ptr != '[')
-                {
-                    if (!isspace((unsigned char) *hint_ptr) ||
-                        (current_query_hints.len > 0 &&
-                         current_query_hints.data[current_query_hints.len - 1] != ' '))
-                    {
-                        appendStringInfoChar(&current_query_hints, *hint_ptr);
-                    }
-                    hint_ptr++;
-                }
-            }
-        }
-
-        /* Add the extracted hints */
-        if (current_query_hints.len > 0)
-        {
-            appendStringInfoString(&result, current_query_hints.data);
+            appendStringInfoString(&result, "SELECT /*+ ");
+            appendStringInfoString(&result, main_hints);
+            appendStringInfoString(&result, " */ ");
+            ptr += 6;
         }
         else
         {
-            /* No [main] hints, use all hints without prefix */
-            appendStringInfoString(&result, hints);
+            appendStringInfoString(&result, "SELECT");
+            ptr += 6;
         }
 
-        appendStringInfoString(&result, " */ ");
-
-        /* Copy rest of SELECT */
-        ptr += 6;
+        /* Copy rest of query */
         appendStringInfoString(&result, ptr);
     }
     else
@@ -608,7 +772,7 @@ inject_hints_into_sql(const char *query_text, const char *hints)
         appendStringInfoString(&result, ptr);
     }
 
-    pfree(current_query_hints.data);
+    pfree(main_hints);
 
     return result.data;
 }
