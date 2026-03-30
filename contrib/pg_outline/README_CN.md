@@ -282,7 +282,7 @@ Leading(((t1 t2) t3) t4)
 
 当前版本的限制:
 
-1. Leading hint 强制执行是部分的 - hints 可以被检测和记录，但完整的连接顺序强制执行需要复杂的嵌套语法解析
+1. Leading hint 解析已完成，但连接顺序强制执行尚未实现 - 解析器可以正确识别连接顺序结构，但不会覆盖规划器的决策
 2. 当前使用简单的字符串匹配检查 hints，未来可以改进为完整的 hint 解析器
 3. 如果 hint 无法应用（如表名不匹配），系统会回退到正常规划
 
@@ -290,7 +290,7 @@ Leading(((t1 t2) t3) t4)
 
 计划中的改进:
 
-- 完整的 Leading hint 强制执行（需要复杂的嵌套语法解析和自定义连接树构建）
+- 完整的 Leading hint 强制执行（需要构建自定义 RelOptInfo 连接树以覆盖规划器的连接顺序）
 - 支持并行查询 hints
 - 扩展的 hint 类型(例如 SET、ROWS hints)
 - 与 pg_stat_statements 集成以自动创建 outline
@@ -313,11 +313,16 @@ Leading(((t1 t2) t3) t4)
    - `extract_relations_from_join_hint()` 函数解析空格分隔的表名
    - 实现对复杂多路连接的连接方法控制
 
-3. **Leading Hint 钩子集成** ✓
-   - 注册了 `join_search_hook` 以拦截连接顺序规划
-   - `outline_join_search()` 函数检测 `Leading((t1 t2) t3)` 格式的 Leading hints
-   - 为未来完整连接顺序强制执行奠定基础
-   - 当前记录检测到的 hints 用于调试
+3. **Leading Hint 解析** ✓
+   - 嵌套 Leading hint 语法的完整解析器
+   - 支持简单平铺格式: `Leading(t1 t2 t3)`
+   - 支持嵌套格式: `Leading((t1 t2) t3)`
+   - 支持 bushy 连接格式: `Leading((t1 t2) (t3 t4))`
+   - 支持复杂嵌套: `Leading(((t1 t2) t3) t4)`
+   - 递归下降解析器从 hint 字符串构建树结构
+   - 树到字符串转换用于验证
+   - 使用 palloc/pfree 进行适当的内存管理
+   - **注意**: 解析器已完成；连接顺序强制执行尚未实现
 
 ## 技术实现细节
 

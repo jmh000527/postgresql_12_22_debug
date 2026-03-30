@@ -282,7 +282,7 @@ The extension uses PostgreSQL hooks to intercept query planning and execution:
 
 Current version limitations:
 
-1. Leading hint enforcement is partial - hints are detected and logged but full join order enforcement requires complex nested syntax parsing
+1. Leading hint parsing is complete, but join order enforcement is not implemented - the parser correctly identifies join order structure but does not override planner decisions
 2. Currently uses simple string matching to check hints, can be improved with a full hint parser
 3. If hints cannot be applied (e.g., table name mismatch), system falls back to normal planning
 
@@ -290,7 +290,7 @@ Current version limitations:
 
 Planned improvements:
 
-- Full Leading hint enforcement (requires complex nested syntax parsing and custom join tree building)
+- Full Leading hint enforcement (requires custom RelOptInfo join tree building to override planner's join order)
 - Support for parallel query hints
 - Extended hint types (e.g., SET, ROWS hints)
 - Integration with pg_stat_statements for automatic outline creation
@@ -313,11 +313,16 @@ The following features have been fully implemented:
    - `extract_relations_from_join_hint()` function parses space-separated table names
    - Enables control of join methods for complex multi-way joins
 
-3. **Leading Hint Hook Integration** ✓
-   - Registered `join_search_hook` to intercept join order planning
-   - `outline_join_search()` function detects Leading hints in format `Leading((t1 t2) t3)`
-   - Foundation for future full join order enforcement
-   - Currently logs detected hints for debugging
+3. **Leading Hint Parsing** ✓
+   - Complete parser for nested Leading hint syntax
+   - Supports simple flat format: `Leading(t1 t2 t3)`
+   - Supports nested format: `Leading((t1 t2) t3)`
+   - Supports bushy join format: `Leading((t1 t2) (t3 t4))`
+   - Supports complex nested: `Leading(((t1 t2) t3) t4)`
+   - Recursive descent parser builds tree structure from hint string
+   - Tree-to-string conversion for verification
+   - Proper memory management with palloc/pfree
+   - **Note**: Parser is complete; join order enforcement is not yet implemented
 
 ## Technical Implementation Details
 
@@ -353,11 +358,19 @@ pg_outline implements a complete hint parsing and application mechanism:
    - Filters rel->pathlist to keep only matching path types
    - Supports SeqScan, IndexScan, IndexOnlyScan hints
 
-6. **outline_join_search()**: Detects Leading hints for join order
+6. **parse_leading_hint()**: Parses Leading hint into tree structure
+   - Recursive descent parser for nested parentheses syntax
+   - Builds LeadingHintNode tree representing join order
+   - Supports all Leading hint formats (flat, nested, bushy)
+   - Grammar: `element ::= relation_name | '(' element element ')'`
+   - Returns tree structure or NULL on parse error
+
+7. **outline_join_search()**: Detects and parses Leading hints
    - Implements join_search_hook
-   - Parses Leading hint format: `Leading((t1 t2) t3)`
-   - Logs detected hints for debugging
-   - Foundation for future full join order enforcement
+   - Extracts Leading hint string with proper parenthesis matching
+   - Calls parse_leading_hint() to build tree structure
+   - Logs parsed tree structure for verification (NOTICE level)
+   - Parser complete; join order enforcement not yet implemented
 
 ### Workflow
 
@@ -393,7 +406,26 @@ typedef struct ParsedHint
     char *query_name;  /* e.g., "main", "sublink_0" */
     char *hint_text;   /* e.g., "SeqScan(t1)", "IndexScan(t2)" */
 } ParsedHint;
+
+typedef struct LeadingHintNode
+{
+    LeadingHintNodeType type;  /* LEADING_NODE_RELATION or LEADING_NODE_JOIN */
+    union
+    {
+        char *relation_name;           /* For leaf nodes (relations) */
+        struct
+        {
+            struct LeadingHintNode *left;   /* For join nodes */
+            struct LeadingHintNode *right;
+        } join;
+    } u;
+} LeadingHintNode;
 ```
+
+**LeadingHintNode** represents the parsed Leading hint as a tree:
+- Leaf nodes (LEADING_NODE_RELATION) contain relation names
+- Internal nodes (LEADING_NODE_JOIN) represent join operations with left and right children
+- Example: `Leading((t1 t2) t3)` creates tree: JOIN(JOIN(t1, t2), t3)
 
 Global variables:
 - `active_outline_hints`: List of active hints for current query
