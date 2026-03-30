@@ -6,7 +6,7 @@
  * Based on OceanBase outline functionality, this extension provides:
  * - Persistent storage of query hints
  * - Automatic hint application during planning
- * - Inline hint support (/*+ ... */ syntax)
+ * - Inline hint support with comment syntax
  * - Auto-generation of outlines from execution plans
  * - Per-query hints for complex queries (CTEs, subqueries, SubLinks)
  *
@@ -27,6 +27,7 @@
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -77,21 +78,7 @@ static void outline_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 static char *extract_inline_hints(const char *query_text);
 static char *normalize_query(const char *query_text);
 static char *lookup_outline_hints(const char *query_text, const char *schema_name);
-static void apply_hints_to_query(Query *query, const char *hints);
 static void parse_and_apply_hints(Query *query, const char *hints);
-
-/*---- Hint parsing ----*/
-typedef struct HintState
-{
-    char *hints_str;
-    List *scan_hints;
-    List *join_hints;
-    List *leading_hints;
-    bool has_hints;
-} HintState;
-
-static HintState *create_hint_state(const char *hints);
-static void free_hint_state(HintState *state);
 
 /*
  * Module load callback
@@ -219,9 +206,7 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
         query_text = "";
 
     /* Get current schema */
-    schema_name = get_namespace_name(RelnameGetRelid("pg_class")
-                                     ? PG_CATALOG_NAMESPACE
-                                     : get_namespace_oid("public", false));
+    schema_name = get_namespace_name(get_namespace_oid("public", true));
 
     /* Step 1: Extract inline hints from query text */
     hints = extract_inline_hints(query_text);
@@ -252,7 +237,7 @@ outline_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 
 /*
  * Extract inline hints from query text
- * Supports /*+ hint1 hint2 ... */ syntax
+ * Supports hint comments in the format: comment-start plus hint1 hint2 ... comment-end
  */
 static char *
 extract_inline_hints(const char *query_text)
@@ -263,12 +248,12 @@ extract_inline_hints(const char *query_text)
     if (!query_text)
         return NULL;
 
-    /* Look for /*+ ... */ pattern */
+    /* Look for hint pattern: comment-start-plus ... comment-end */
     start = strstr(query_text, "/*+");
     if (!start)
         return NULL;
 
-    start += 3; /* Skip /*+ */
+    start += 3; /* Skip the opening pattern */
     end = strstr(start, "*/");
     if (!end)
         return NULL;
