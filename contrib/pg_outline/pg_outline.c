@@ -78,14 +78,16 @@ static char *pg_outline_mode = "auto";  /* auto, manual, off */
 
 /* Saved hook values */
 static planner_hook_type prev_planner_hook = NULL;
+static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static ExplainOneQuery_hook_type prev_ExplainOneQuery_hook = NULL;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 static join_search_hook_type prev_join_search_hook = NULL;
 
-/* Recursion protection flag */
+/* Recursion protection flags */
 static bool inside_outline_planner = false;
+static bool sql_already_rewritten = false;
 
 /* Active hints for current query - used during planning */
 static List *active_outline_hints = NIL;
@@ -180,6 +182,7 @@ static QueryMetadataHashTable *current_query_metadata = NULL;
 void		_PG_init(void);
 void		_PG_fini(void);
 
+static void outline_post_parse_analyze(ParseState *pstate, Query *query);
 static PlannedStmt *outline_planner(Query *parse, int cursorOptions,
 									ParamListInfo boundParams);
 static void outline_ExecutorStart(QueryDesc *queryDesc, int eflags);
@@ -231,6 +234,8 @@ typedef struct ParsedHint
 
 static List *parse_stored_hints(const char *hints_string);
 static void apply_hints_to_query(Query *query, List *parsed_hints);
+static void apply_hints_to_sublinks(Query *query, List *parsed_hints);
+static bool apply_sublink_hints_walker(Node *node, List **parsed_hints_ptr);
 static void outline_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte);
 static RelOptInfo *outline_join_search(PlannerInfo *root, int levels_needed, List *initial_rels);
 
@@ -364,6 +369,9 @@ _PG_init(void)
 							   NULL);
 
 	/* Install hooks */
+	prev_post_parse_analyze_hook = post_parse_analyze_hook;
+	post_parse_analyze_hook = outline_post_parse_analyze;
+
 	prev_planner_hook = planner_hook;
 	planner_hook = outline_planner;
 
@@ -397,6 +405,7 @@ void
 _PG_fini(void)
 {
 	/* Restore hooks */
+	post_parse_analyze_hook = prev_post_parse_analyze_hook;
 	planner_hook = prev_planner_hook;
 	ExecutorStart_hook = prev_ExecutorStart;
 	ExecutorEnd_hook = prev_ExecutorEnd;
@@ -405,6 +414,93 @@ _PG_fini(void)
 	join_search_hook = prev_join_search_hook;
 
 	elog(LOG, "pg_outline extension unloaded");
+}
+
+/*
+ * Post-parse-analyze hook: intercept queries after parsing to inject hints
+ * BEFORE optimization, so sublinks remain intact
+ */
+static void
+outline_post_parse_analyze(ParseState *pstate, Query *query)
+{
+	char *query_fingerprint = NULL;
+	char *stored_hints = NULL;
+	char *sql_with_hints = NULL;
+
+	/* Call previous hook if exists */
+	if (prev_post_parse_analyze_hook)
+		prev_post_parse_analyze_hook(pstate, query);
+
+	/* Skip if:
+	 * - pg_outline is disabled
+	 * - not in manual mode
+	 * - no query string available
+	 * - SQL was already rewritten (to avoid infinite recursion)
+	 * - this is a utility command (not SELECT/INSERT/UPDATE/DELETE)
+	 */
+	if (!pg_outline_enabled ||
+	    strcmp(pg_outline_mode, "manual") != 0 ||
+	    !debug_query_string ||
+	    sql_already_rewritten ||
+	    query->commandType == CMD_UTILITY)
+	{
+		return;
+	}
+
+	/* Compute query fingerprint to check for stored outline */
+	{
+		char *normalized = normalize_query(debug_query_string);
+		if (normalized)
+		{
+			query_fingerprint = compute_query_fingerprint(normalized);
+			pfree(normalized);
+		}
+	}
+
+	if (!query_fingerprint)
+		return;
+
+	/* Check if we have a stored outline for this query */
+	stored_hints = retrieve_outline_hints(query_fingerprint);
+
+	if (!stored_hints)
+	{
+		elog(DEBUG1, "pg_outline: no stored outline found for fingerprint %s", query_fingerprint);
+		return;
+	}
+
+	elog(DEBUG1, "pg_outline: found stored outline, applying hints to query tree");
+
+	/* Reconstruct SQL with hints for display purposes */
+	sql_with_hints = reconstruct_sql_with_positioned_hints(debug_query_string, stored_hints);
+	if (sql_with_hints)
+	{
+		/* Display the rewritten SQL for user visibility */
+		elog(NOTICE, "pg_outline: Outline matched! Hints will be applied. Equivalent SQL with positioned hints:\n%s", sql_with_hints);
+		pfree(sql_with_hints);
+	}
+
+	/* Parse stored hints into structured format */
+	{
+		List *parsed_hints = parse_stored_hints(stored_hints);
+
+		if (parsed_hints != NIL)
+		{
+			elog(DEBUG1, "pg_outline: parsed %d hints from stored outline", list_length(parsed_hints));
+
+			/* Apply hints to the query tree, including sublinks */
+			apply_hints_to_sublinks(query, parsed_hints);
+
+			/* Store parsed hints globally for planner_hook to use */
+			active_outline_hints = parsed_hints;
+
+			elog(DEBUG1, "pg_outline: successfully applied hints to query tree (including sublinks)");
+		}
+		else
+		{
+			elog(DEBUG1, "pg_outline: no hints parsed from stored outline");
+		}
+	}
 }
 
 /*
@@ -4397,6 +4493,81 @@ apply_hints_to_query(Query *query, List *parsed_hints)
 				 hint->query_name);
 		}
 	}
+}
+
+/*
+ * apply_hints_to_sublinks - Traverse Query tree and apply hints to SubLinks
+ *
+ * This function walks the entire Query tree looking for SubLink nodes (subqueries)
+ * and applies the appropriate hints to them BEFORE the planner pulls them up.
+ */
+static void
+apply_hints_to_sublinks(Query *query, List *parsed_hints)
+{
+	if (!query || !parsed_hints)
+		return;
+
+	elog(DEBUG1, "pg_outline: traversing query tree to apply hints to sublinks");
+
+	/* First, ensure query names are assigned if not already done */
+	if (current_query_metadata == NULL)
+		current_query_metadata = create_query_metadata_table(TopMemoryContext);
+
+	{
+		QueryNamingContext naming_context;
+		memset(&naming_context, 0, sizeof(QueryNamingContext));
+		assign_query_names(query, &naming_context, NULL, NULL);
+	}
+
+	/* Now apply hints to the main query and all its subqueries */
+	apply_hints_to_query(query, parsed_hints);
+
+	/* Walk the query tree to find and process all SubLinks */
+	(void) query_tree_walker(query, apply_sublink_hints_walker, (void *) &parsed_hints, 0);
+
+	elog(DEBUG1, "pg_outline: finished applying hints to sublinks");
+}
+
+/*
+ * apply_sublink_hints_walker - Walker function to find SubLinks and apply hints
+ */
+static bool
+apply_sublink_hints_walker(Node *node, List **parsed_hints_ptr)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink *sublink = (SubLink *) node;
+		Query *subselect = (Query *) sublink->subselect;
+
+		if (subselect && IsA(subselect, Query))
+		{
+			elog(DEBUG2, "pg_outline: found SubLink, applying hints to subquery");
+
+			/* Apply hints to this subquery */
+			apply_hints_to_query(subselect, *parsed_hints_ptr);
+
+			/* Recursively process subqueries within this subquery */
+			return query_tree_walker(subselect, apply_sublink_hints_walker,
+									(void *) parsed_hints_ptr, 0);
+		}
+	}
+	else if (IsA(node, Query))
+	{
+		Query *subquery = (Query *) node;
+
+		/* Apply hints to this subquery */
+		apply_hints_to_query(subquery, *parsed_hints_ptr);
+
+		/* Recurse into the subquery */
+		return query_tree_walker(subquery, apply_sublink_hints_walker,
+								(void *) parsed_hints_ptr, 0);
+	}
+
+	/* Continue walking */
+	return expression_tree_walker(node, apply_sublink_hints_walker, (void *) parsed_hints_ptr);
 }
 
 /*
