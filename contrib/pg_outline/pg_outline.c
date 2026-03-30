@@ -437,15 +437,20 @@ outline_post_parse_analyze(ParseState *pstate, Query *query)
 	 * - no query string available
 	 * - SQL was already rewritten (to avoid infinite recursion)
 	 * - this is a utility command (not SELECT/INSERT/UPDATE/DELETE)
+	 * - we're already inside the planner hook
 	 */
 	if (!pg_outline_enabled ||
 	    strcmp(pg_outline_mode, "manual") != 0 ||
 	    !debug_query_string ||
 	    sql_already_rewritten ||
+	    inside_outline_planner ||
 	    query->commandType == CMD_UTILITY)
 	{
 		return;
 	}
+
+	/* Set flag to prevent recursion when SPI queries are executed */
+	sql_already_rewritten = true;
 
 	/* Compute query fingerprint to check for stored outline */
 	{
@@ -458,7 +463,10 @@ outline_post_parse_analyze(ParseState *pstate, Query *query)
 	}
 
 	if (!query_fingerprint)
+	{
+		sql_already_rewritten = false;
 		return;
+	}
 
 	/* Check if we have a stored outline for this query */
 	stored_hints = retrieve_outline_hints(query_fingerprint);
@@ -466,6 +474,7 @@ outline_post_parse_analyze(ParseState *pstate, Query *query)
 	if (!stored_hints)
 	{
 		elog(DEBUG1, "pg_outline: no stored outline found for fingerprint %s", query_fingerprint);
+		sql_already_rewritten = false;
 		return;
 	}
 
@@ -501,6 +510,9 @@ outline_post_parse_analyze(ParseState *pstate, Query *query)
 			elog(DEBUG1, "pg_outline: no hints parsed from stored outline");
 		}
 	}
+
+	/* Reset flag after processing */
+	sql_already_rewritten = false;
 }
 
 /*
