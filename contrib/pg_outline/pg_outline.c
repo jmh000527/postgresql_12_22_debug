@@ -1803,14 +1803,61 @@ reconstruct_sql_with_positioned_hints(const char *query_string, const char *hint
 		}
 	}
 
-	/* Insert [main] hint at beginning if found */
+	/* Insert [main] hint after SELECT keyword if found */
 	if (main_hint)
 	{
-		appendStringInfo(&result, "/*+ %s */\n", main_hint);
-	}
+		const char *select_pos;
+		const char *sql_ptr = query_string;
+		bool found_select = false;
 
-	/* Append original SQL */
-	appendStringInfoString(&result, query_string);
+		/* Find SELECT keyword (case-insensitive) */
+		while (*sql_ptr)
+		{
+			/* Skip whitespace and comments */
+			while (*sql_ptr && (*sql_ptr == ' ' || *sql_ptr == '\t' || *sql_ptr == '\n' || *sql_ptr == '\r'))
+				sql_ptr++;
+
+			/* Check for SELECT keyword (case-insensitive) */
+			if ((*sql_ptr == 'S' || *sql_ptr == 's') &&
+				(strncasecmp(sql_ptr, "SELECT", 6) == 0 || strncasecmp(sql_ptr, "select", 6) == 0))
+			{
+				/* Make sure it's a complete word (not part of another identifier) */
+				if (!isalnum((unsigned char)sql_ptr[6]) && sql_ptr[6] != '_')
+				{
+					select_pos = sql_ptr + 6;  /* Position after "SELECT" */
+					found_select = true;
+					break;
+				}
+			}
+
+			/* Skip to next potential position */
+			if (*sql_ptr)
+				sql_ptr++;
+		}
+
+		if (found_select)
+		{
+			/* Copy everything up to and including SELECT */
+			appendBinaryStringInfo(&result, query_string, select_pos - query_string);
+
+			/* Insert hint comment after SELECT */
+			appendStringInfo(&result, " /*+ %s */", main_hint);
+
+			/* Copy the rest of the SQL */
+			appendStringInfoString(&result, select_pos);
+		}
+		else
+		{
+			/* Fallback: if SELECT not found, put hint at beginning */
+			appendStringInfo(&result, "/*+ %s */\n", main_hint);
+			appendStringInfoString(&result, query_string);
+		}
+	}
+	else
+	{
+		/* No hint, just return original SQL */
+		appendStringInfoString(&result, query_string);
+	}
 
 	/* Add other hints as a comment block at the end for reference */
 	if (list_length(other_hints) > 0)
