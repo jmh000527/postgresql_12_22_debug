@@ -14,6 +14,7 @@
 
 #include "access/hash.h"
 #include "parser/scanner.h"
+#include "normalize_query.h"
 
 static void AppendJumble(pgssJumbleState *jstate,
 			 const unsigned char *item, Size size);

@@ -56,7 +56,12 @@
 #include "pg_outline.h"
 
 /* partially copied from pg_stat_statements */
+
 #include "normalize_query.h"
+
+static void JumbleQuery(pgssJumbleState *jstate, Query *query);
+static char *generate_normalized_query(pgssJumbleState *jstate, const char *query,
+									  int query_loc, int *query_len_p, int encoding);
 
 /* PostgreSQL */
 #include "access/htup_details.h"

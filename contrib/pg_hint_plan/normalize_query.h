@@ -29,10 +29,12 @@ typedef struct pgssJumbleState
 
 #define JUMBLE_SIZE		1024
 
+#ifdef PG_HINT_PLAN_NORMALIZE_API
 extern char *generate_normalized_query(pgssJumbleState *jstate,
 									   const char *query,
 									   int query_loc, int *query_len_p,
 									   int encoding);
 extern void JumbleQuery(pgssJumbleState *jstate, Query *query);
+#endif
 
 #endif	/* NORMALIZE_QUERY_H */

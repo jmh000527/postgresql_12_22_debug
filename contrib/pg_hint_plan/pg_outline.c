@@ -1,3 +1,4 @@
+#define PG_HINT_PLAN_NORMALIZE_API
 #include "postgres.h"
 
 #include "access/htup_details.h"
@@ -51,9 +52,7 @@ static HTAB *outline_hint_map = NULL;
 static Query *current_stmt_root = NULL;
 static char *current_normalized_query = NULL;
 
-static void pg_outline_post_parse(ParseState *pstate, Query *query);
 static void assign_query_names(Query *query, QueryNamingContext *context);
-static bool assign_query_names_walker(Node *node, QueryNamingContext *context);
 static bool assign_query_names_sublink_walker(Node *node, QueryNamingContext *context);
 static void reset_outline_state(void);
 static void ensure_state(void);
@@ -305,9 +304,11 @@ load_outline_hints(void)
 	SPI_finish();
 }
 
-static void
+void
 pg_outline_post_parse(ParseState *pstate, Query *query)
 {
+	QueryNamingContext ctx;
+
 	if (!pg_outline_enable)
 		return;
 
@@ -324,7 +325,6 @@ pg_outline_post_parse(ParseState *pstate, Query *query)
 
 	/* Build name map */
 	store_query_name(query, "main", outline_name_map);
-	QueryNamingContext ctx;
 	ctx.subquery_index = 0;
 	ctx.sublink_index = 0;
 	ctx.name_map = outline_name_map;

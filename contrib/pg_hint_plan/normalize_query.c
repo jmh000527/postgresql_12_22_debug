@@ -1,6 +1,8 @@
+#define PG_HINT_PLAN_NORMALIZE_API
 #include "postgres.h"
 
 #include "mb/pg_wchar.h"
+#include "lib/stringinfo.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/scansup.h"
 

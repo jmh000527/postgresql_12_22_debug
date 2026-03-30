@@ -1,7 +1,5 @@
 -- pg_outline extension
 
-CREATE SCHEMA IF NOT EXISTS pg_catalog;
-
 CREATE TABLE pg_catalog.pg_outline_query_hints
 (
     outline_name      text    NOT NULL,
